@@ -25,10 +25,10 @@ data class IosTypography(
 val DefaultIosTypography = IosTypography(
     largeTitle = TextStyle(
         fontFamily = FontFamily.SansSerif,
-        fontSize = 34.sp,
-        lineHeight = 41.sp,
+        fontSize = 21.sp,
+        lineHeight = 26.sp,
         fontWeight = FontWeight.Bold,
-        letterSpacing = 0.37.sp,
+        letterSpacing = 0.sp,
     ),
     title3 = TextStyle(
         fontFamily = FontFamily.SansSerif,

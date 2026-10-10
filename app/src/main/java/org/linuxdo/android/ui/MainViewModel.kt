@@ -253,6 +253,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val categories = _categories.asStateFlow()
     private val _categoryTopics = MutableStateFlow<Map<Int, TopicListUiState>>(emptyMap())
     val categoryTopics = _categoryTopics.asStateFlow()
+    private val _userTopicStates = MutableStateFlow<Map<String, TopicListUiState>>(emptyMap())
+    val userTopicStates = _userTopicStates.asStateFlow()
     private val _search = MutableStateFlow(SearchUiState())
     val search = _search.asStateFlow()
     private val _profile = MutableStateFlow<Map<ProfileSection, ProfileUiState>>(emptyMap())
@@ -1038,15 +1040,36 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         valid.forEach { queue.add(it) }
     }
 
+    private fun knownPostsCount(topicId: Long): Int {
+        _details.value[topicId]?.let { detail ->
+            val fromDetail = maxOf(
+                detail.topic?.postsCount ?: 0,
+                detail.topic?.postStream?.stream?.size ?: 0,
+                detail.posts.maxOfOrNull { it.postNumber } ?: 0,
+            )
+            if (fromDetail > 0) return fromDetail
+        }
+        _state.value.latest.items.firstOrNull { it.topic.id == topicId }?.topic?.postsCount?.takeIf { it > 0 }?.let { return it }
+        _feedStates.value.values.firstNotNullOfOrNull { list ->
+            list.items.firstOrNull { it.topic.id == topicId }?.topic?.postsCount?.takeIf { it > 0 }
+        }?.let { return it }
+        _categoryTopics.value.values.firstNotNullOfOrNull { list ->
+            list.items.firstOrNull { it.topic.id == topicId }?.topic?.postsCount?.takeIf { it > 0 }
+        }?.let { return it }
+        _search.value.results.items.firstOrNull { it.topic.id == topicId }?.topic?.postsCount?.takeIf { it > 0 }?.let { return it }
+        return 0
+    }
+
     /**
-     * 本地记下"这帖看过了",并就地把列表里的未读蓝点摘掉。
+     * 本地记下"这帖看过了"(连同当前总楼层数),就地把普通列表里的未读蓝点摘掉,
+     * 并将该帖从首页「未读」列表中就地移除。
      *
      * 纯净模式下服务端压根不知道我们读过,所以不能等 unseen 从服务端变化 ——
-     * 只有本地这份持久化集合能保证下拉刷新、切分类、重启后蓝点都不再反弹。
+     * 只有本地这份持久化集合能保证下拉刷新、切分类、重启后蓝点与已读帖都不再反弹。
      */
-    private fun markTopicSeen(topicId: Long) {
-        if (!container.reading.markSeen(topicId)) return
-        fun clear(list: TopicListUiState): TopicListUiState {
+    private fun markTopicSeen(topicId: Long, postsCount: Int = knownPostsCount(topicId)) {
+        val changed = container.reading.markSeen(topicId, postsCount)
+        fun clearUnseen(list: TopicListUiState): TopicListUiState {
             val patched = list.items.map { item ->
                 if (item.topic.id == topicId && item.topic.unseen) {
                     item.copy(topic = item.topic.copy(unseen = false))
@@ -1054,9 +1077,26 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
             return if (patched != list.items) list.copy(items = patched) else list
         }
-        _state.update { it.copy(latest = clear(it.latest)) }
-        _categoryTopics.update { states -> states.mapValues { (_, list) -> clear(list) } }
-        _search.update { it.copy(results = clear(it.results)) }
+        fun removeReadFromUnread(list: TopicListUiState): TopicListUiState {
+            val filtered = list.items.filterNot { it.topic.id == topicId }
+            return if (filtered.size != list.items.size) list.copy(items = filtered) else list
+        }
+        _feedStates.update { states ->
+            states.mapValues { (feed, list) ->
+                if (feed == HomeFeedType.Unread) removeReadFromUnread(list) else clearUnseen(list)
+            }
+        }
+        _state.update { state ->
+            val updatedLatest = if (state.homeFeed == HomeFeedType.Unread) {
+                removeReadFromUnread(state.latest)
+            } else {
+                clearUnseen(state.latest)
+            }
+            if (updatedLatest != state.latest) state.copy(latest = updatedLatest) else state
+        }
+        if (!changed) return
+        _categoryTopics.update { states -> states.mapValues { (_, list) -> clearUnseen(list) } }
+        _search.update { it.copy(results = clearUnseen(it.results)) }
     }
 
     /**
@@ -1193,8 +1233,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         more: Boolean,
     ): ProfileUiState {
         val cursor = if (more) previous.content.nextCursor else 0
+        val excludeIds = if (more && section == ProfileSection.Notifications) {
+            previous.content.entries.map { it.id }.toSet()
+        } else emptySet()
         val unreadNow = unreadBaseline(section, filter)
-        val result = repository.fetchProfile(username, section, cursor, filter)
+        val result = repository.fetchProfile(username, section, cursor, filter, excludeIds)
         val entries = if (more) (previous.content.entries + result.entries).distinctBy { it.id } else result.entries
         return ProfileUiState(
             // 防死循环的守卫看的是游标有没有往前走,而不是条目有没有变多 ——
@@ -1241,10 +1284,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      *
      * 四个分类共用 `_profile` 里同一个槽位(键是 ProfileSection),所以这里额外用
      * notificationCache 按分类留一份。命中且仍新鲜就直接贴回去 —— 点标签立刻有内容,
-     * 不用再等一轮网络。
+     * 不用再等一轮网络。再次点击当前已选中的分类标签时强制刷新。
      */
     fun setNotificationFilter(filter: NotificationFilter) {
-        if (_notificationFilter.value == filter) return
+        if (_notificationFilter.value == filter) {
+            loadProfile(ProfileSection.Notifications, refresh = true)
+            return
+        }
         pageJobs["profile:${ProfileSection.Notifications}"]?.cancel()
         _notificationFilter.value = filter
         val cached = notificationCache[filter]
@@ -1306,6 +1352,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         error = null,
                     ))
                 }
+                markTopicSeen(
+                    id,
+                    maxOf(
+                        freshTopic.postsCount,
+                        freshTopic.postStream.stream.size,
+                        mergedPosts.maxOfOrNull { it.postNumber } ?: 0,
+                    ),
+                )
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Exception) {
@@ -1375,6 +1429,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                             error = if (missing) "通知对应楼层 #$postNumber 已删除或不可访问" else null,
                             emojiUrls = emojis, windowStartId = topic.postStream.posts.minByOrNull { it.postNumber }?.id))
                     }
+                    markTopicSeen(
+                        id,
+                        maxOf(
+                            topic.postsCount,
+                            topic.postStream.stream.size,
+                            posts.maxOfOrNull { it.postNumber } ?: 0,
+                        ),
+                    )
                 }
             } catch (error: CancellationException) {
                 throw error
@@ -2092,6 +2154,36 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun loadUserTopics(username: String, isBookmark: Boolean, refresh: Boolean = false, more: Boolean = false) {
+        val key = "${if (isBookmark) "bookmark" else "created"}:$username"
+        val current = _userTopicStates.value[key]
+        if (pageJobs[key]?.isActive == true) return
+        if (!refresh && !more && current != null) return
+        val previous = current ?: TopicListUiState()
+        if (more && !previous.hasMore) return
+        val page = if (more) previous.page + 1 else 0
+        pageJobs[key] = viewModelScope.launch {
+            _userTopicStates.update { it + (key to previous.copy(
+                refreshing = refresh, loadingMore = more, initialLoading = previous.items.isEmpty(), error = null,
+            )) }
+            try {
+                val result = if (isBookmark) repository.fetchUserBookmarks(username, page) else repository.fetchUserCreatedTopics(username, page)
+                val items = if (more) (previous.items + result.items).distinctBy { it.topic.id } else result.items
+                _userTopicStates.update { it + (key to TopicListUiState(items, page,
+                    result.hasMore && (!more || items.size > previous.items.size), initialLoading = false)) }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                _userTopicStates.update { it + (key to previous.copy(initialLoading = false, error = error.message ?: "加载失败")) }
+                handlePageFailure(error) { loadUserTopics(username, isBookmark, refresh = !more, more = more) }
+            } finally {
+                _userTopicStates.update { states -> states[key]?.let {
+                    states + (key to it.copy(initialLoading = false, refreshing = false, loadingMore = false))
+                } ?: states }
+            }
+        }
+    }
+
     fun updateSearch(query: String) {
         searchJob?.cancel()
         val trimmed = query.trim()
@@ -2407,6 +2499,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _details.value = emptyMap()
         _categories.value = CategoriesUiState()
         _categoryTopics.value = emptyMap()
+        _userTopicStates.value = emptyMap()
         _search.value = SearchUiState()
         _profile.value = emptyMap()
         notificationCache.clear()

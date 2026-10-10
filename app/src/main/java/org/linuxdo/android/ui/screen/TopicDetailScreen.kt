@@ -30,7 +30,9 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.zIndex
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
@@ -41,11 +43,13 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.scale
+import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.LinkAnnotation
 import androidx.compose.ui.text.Placeholder
@@ -56,6 +60,7 @@ import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.withLink
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
@@ -82,6 +87,7 @@ import android.os.Environment
 import android.provider.MediaStore
 import android.webkit.MimeTypeMap
 import android.widget.Toast
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
@@ -121,6 +127,12 @@ import org.linuxdo.android.ui.html.InlineText
 
 private val LocalOpenTopic = compositionLocalOf<((Long, String, Int?) -> Unit)?> { null }
 
+private data class BoostTarget(
+    val postId: Long,
+    val postNumber: Int,
+    val username: String,
+)
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun TopicDetailScreen(
@@ -155,6 +167,7 @@ fun TopicDetailScreen(
     initialPostNumber: Int? = null,
     trailing: @Composable () -> Unit = {},
     onPostsVisible: (List<Int>) -> Unit = {},
+    onOverlayActive: (Boolean) -> Unit = {},
 ) {
     val list = rememberLazyListState()
     val pullState = rememberPullToRefreshState()
@@ -166,6 +179,14 @@ fun TopicDetailScreen(
     var highlightedPost by remember { mutableStateOf<Long?>(null) }
     var manageTarget by remember { mutableStateOf<Post?>(null) }
     var deleteTarget by remember { mutableStateOf<Post?>(null) }
+    var boostTarget by remember { mutableStateOf<BoostTarget?>(null) }
+    var boostDraft by rememberSaveable { mutableStateOf("") }
+    LaunchedEffect(composer.open, boostTarget != null) {
+        onOverlayActive(composer.open || boostTarget != null)
+    }
+    DisposableEffect(Unit) {
+        onDispose { onOverlayActive(false) }
+    }
     val topicAuthorUsername = remember(state.posts) {
         state.posts.firstOrNull { it.postNumber == 1 }?.username
     }
@@ -366,7 +387,7 @@ fun TopicDetailScreen(
                     pending = post.id in state.reactingPosts,
                     error = state.reactionErrors[post.id],
                     onReact = { onReact(post.id, it) },
-                    onBoost = { onBoost(post.id, it) },
+                    onOpenBoost = { boostTarget = BoostTarget(post.id, post.postNumber, post.username) },
                     onDeleteBoost = { onDeleteBoost(post.id, it) },
                     onRefresh = { onRefreshPost(post.id) },
                     onSolution = { onSolution(post.id) },
@@ -447,7 +468,7 @@ fun TopicDetailScreen(
                         pending = post.id in state.reactingPosts,
                         error = state.reactionErrors[post.id],
                         onReact = { onReact(post.id, it) },
-                        onBoost = { onBoost(post.id, it) },
+                        onOpenBoost = { boostTarget = BoostTarget(post.id, post.postNumber, post.username) },
                         onDeleteBoost = { onDeleteBoost(post.id, it) },
                         onRefresh = { onRefreshPost(post.id) },
                         highlighted = highlightedPost == post.id,
@@ -559,106 +580,128 @@ fun TopicDetailScreen(
     }
 
     CompositionLocalProvider(LocalOpenTopic provides onOpenTopic) {
-        Column(Modifier.fillMaxSize().background(IosTheme.colors.groupedBackground)) {
-            IosNavBar(title = state.topic?.title ?: title, onBack = onBack, trailing = trailing)
-            PullToRefreshBox(
-                isRefreshing = state.refreshing,
-                onRefresh = onRefresh,
-                state = pullState,
-                modifier = Modifier.weight(1f),
-                indicator = {
-                    val fraction = pullState.distanceFraction
-                    if (state.refreshing || fraction > 0f) {
-                        Box(
-                            Modifier
-                                .align(Alignment.TopCenter)
-                                .padding(top = 12.dp)
-                                .graphicsLayer {
-                                    alpha = if (state.refreshing) 1f else min(1f, fraction * 1.4f)
-                                },
-                        ) {
-                            IosActivityIndicator(diameter = 22.dp)
-                        }
-                    }
-                },
-            ) {
-                Box(Modifier.fillMaxSize()) {
-                    LazyColumn(
-                        state = list,
-                        modifier = Modifier.fillMaxSize(),
-                        contentPadding = PaddingValues(bottom = 76.dp),
-                    ) {
-                        item("title") {
-                            Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                                Text(state.topic?.title ?: title, style = IosTheme.type.title3)
-                                state.category?.let { CategoryTag(it) }
+        Box(Modifier.fillMaxSize()) {
+            Column(Modifier.fillMaxSize().background(IosTheme.colors.groupedBackground)) {
+                IosNavBar(title = state.topic?.title ?: title, onBack = onBack, trailing = trailing)
+                PullToRefreshBox(
+                    isRefreshing = state.refreshing,
+                    onRefresh = onRefresh,
+                    state = pullState,
+                    modifier = Modifier.weight(1f),
+                    indicator = {
+                        val fraction = pullState.distanceFraction
+                        if (state.refreshing || fraction > 0f) {
+                            Box(
+                                Modifier
+                                    .align(Alignment.TopCenter)
+                                    .padding(top = 12.dp)
+                                    .graphicsLayer {
+                                        alpha = if (state.refreshing) 1f else min(1f, fraction * 1.4f)
+                                    },
+                            ) {
+                                IosActivityIndicator(diameter = 22.dp)
                             }
                         }
-                        if (showTopError) state.error?.let { message ->
-                            item("top-error") { ErrorNotice(message, onRetry) }
-                        }
-                        items(headRows, key = { it.post.id }) { row -> RenderPostEntry(row) }
-                        if (showOrderBar) item("order-bar") {
-                            CommentOrderBar(
-                                total = replyTotal,
-                                descending = state.descending,
-                                busy = state.loading || state.refreshing,
-                                onToggle = onToggleOrder,
-                            )
-                        }
-                        if (state.previousIds.isNotEmpty()) item("load-previous") {
-                            PreviousSliceGap(
-                                hiddenCount = state.previousIds.size,
-                                loading = state.loading,
-                                onClick = triggerLoadPrevious,
-                            )
-                        }
-                        items(bodyRows, key = { it.post.id }) { row -> RenderPostEntry(row) }
-                        if (state.loading && (state.posts.isEmpty() || state.remaining.isNotEmpty())) {
-                            item("loading") { IosLoadingBox() }
-                        }
-                        if (!showTopError) state.error?.let { message -> item("error") { ErrorNotice(message, onRetry) } }
-                        if (!state.loading && state.topic != null && state.posts.isEmpty() && state.error == null) {
-                            item("empty") { EmptyNotice() }
-                        }
-                        if (state.posts.isNotEmpty() && state.remaining.isEmpty() && !state.loading && state.error == null) {
-                            item("end") {
-                                Text(
-                                    text = when {
-                                        state.descending -> "已显示到最早的回复"
-                                        state.previousIds.isEmpty() -> "已显示全部可见楼层"
-                                        else -> "已到话题末尾"
-                                    },
-                                    color = IosTheme.colors.secondaryLabel,
-                                    style = IosTheme.type.footnote,
-                                    modifier = Modifier.padding(20.dp),
+                    },
+                ) {
+                    Box(Modifier.fillMaxSize()) {
+                        LazyColumn(
+                            state = list,
+                            modifier = Modifier.fillMaxSize(),
+                            contentPadding = PaddingValues(bottom = 76.dp),
+                        ) {
+                            item("title") {
+                                Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    Text(state.topic?.title ?: title, style = IosTheme.type.title3)
+                                    state.category?.let { CategoryTag(it) }
+                                }
+                            }
+                            if (showTopError) state.error?.let { message ->
+                                item("top-error") { ErrorNotice(message, onRetry) }
+                            }
+                            items(headRows, key = { it.post.id }) { row -> RenderPostEntry(row) }
+                            if (showOrderBar) item("order-bar") {
+                                CommentOrderBar(
+                                    total = replyTotal,
+                                    descending = state.descending,
+                                    busy = state.loading || state.refreshing,
+                                    onToggle = onToggleOrder,
                                 )
                             }
+                            if (state.previousIds.isNotEmpty()) item("load-previous") {
+                                PreviousSliceGap(
+                                    hiddenCount = state.previousIds.size,
+                                    loading = state.loading,
+                                    onClick = triggerLoadPrevious,
+                                )
+                            }
+                            items(bodyRows, key = { it.post.id }) { row -> RenderPostEntry(row) }
+                            if (state.loading && (state.posts.isEmpty() || state.remaining.isNotEmpty())) {
+                                item("loading") { IosLoadingBox() }
+                            }
+                            if (!showTopError) state.error?.let { message -> item("error") { ErrorNotice(message, onRetry) } }
+                            if (!state.loading && state.topic != null && state.posts.isEmpty() && state.error == null) {
+                                item("empty") { EmptyNotice() }
+                            }
+                            if (state.posts.isNotEmpty() && state.remaining.isEmpty() && !state.loading && state.error == null) {
+                                item("end") {
+                                    Text(
+                                        text = when {
+                                            state.descending -> "已显示到最早的回复"
+                                            state.previousIds.isEmpty() -> "已显示全部可见楼层"
+                                            else -> "已到话题末尾"
+                                        },
+                                        color = IosTheme.colors.secondaryLabel,
+                                        style = IosTheme.type.footnote,
+                                        modifier = Modifier.padding(20.dp),
+                                    )
+                                }
+                            }
                         }
-                    }
-                    // 左下角放阅读进度胶囊，右下角放回复按钮，配合列表底部 76dp 留白，彻底避免遮挡最后一条评论的操作栏。
-                    if (currentPostNumber != null && totalPosts > 1) {
-                        ReadingProgressPill(
-                            current = currentPostNumber ?: 1,
-                            total = totalPosts,
-                            modifier = Modifier.align(Alignment.BottomStart).padding(start = 12.dp, bottom = 16.dp),
-                        ) {
-                            if (firstPostLoaded) scope.launch { list.animateScrollToItem(0) } else onReloadFromStart()
+                        // 左下角放阅读进度胶囊，右下角放回复按钮，配合列表底部 76dp 留白，彻底避免遮挡最后一条评论的操作栏。
+                        if (currentPostNumber != null && totalPosts > 1) {
+                            ReadingProgressPill(
+                                current = currentPostNumber ?: 1,
+                                total = totalPosts,
+                                modifier = Modifier.align(Alignment.BottomStart).padding(start = 12.dp, bottom = 16.dp),
+                            ) {
+                                if (firstPostLoaded) scope.launch { list.animateScrollToItem(0) } else onReloadFromStart()
+                            }
                         }
-                    }
-                    if (canReply) {
-                        Box(Modifier.align(Alignment.BottomEnd).padding(end = 12.dp, bottom = 16.dp)) {
-                            ReplyFab(enabled = !writeBusy) {
-                                onOpenComposer(ComposerTarget.NewReply(topicId))
+                        if (canReply) {
+                            Box(Modifier.align(Alignment.BottomEnd).padding(end = 12.dp, bottom = 16.dp)) {
+                                ReplyFab(enabled = !writeBusy) {
+                                    onOpenComposer(ComposerTarget.NewReply(topicId))
+                                }
                             }
                         }
                     }
                 }
             }
+            if (composer.open) {
+                ComposerSheet(composer, onDraftChange, onSubmitComposer, onCloseComposer, onAttach)
+            }
+            boostTarget?.let { target ->
+                BoostSheet(
+                    target = target,
+                    draft = boostDraft,
+                    onDraftChange = { boostDraft = it },
+                    busy = writeBusy,
+                    onSend = {
+                        val toSend = boostDraft
+                        boostTarget = null
+                        boostDraft = ""
+                        onBoost(target.postId, toSend)
+                    },
+                    onDismiss = {
+                        boostTarget = null
+                        boostDraft = ""
+                    },
+                )
+            }
         }
     }
     picture?.let { ImageViewer(it) { picture = null } }
-    if (composer.open) ComposerDialog(composer, onDraftChange, onSubmitComposer, onCloseComposer, onAttach)
     manageTarget?.let { post ->
         PostManageDialog(post, onDismiss = { manageTarget = null },
             onEdit = {
@@ -854,39 +897,68 @@ private fun PreviousSliceGap(hiddenCount: Int, loading: Boolean, onClick: () -> 
     }
 }
 
-/** 长按楼层头部弹出的操作面板:左编辑、右删除。删除还要再过一道确认。 */
+/** 长按楼层头部弹出的操作面板:仅保留编辑(蓝色)与删除(红色)两个按钮。 */
 @Composable
 private fun PostManageDialog(post: Post, onDismiss: () -> Unit, onEdit: () -> Unit, onDelete: () -> Unit) {
     Dialog(onDismissRequest = onDismiss) {
-        Column(
-            Modifier.clip(RoundedCornerShape(16.dp)).background(IosTheme.colors.card).padding(20.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
+        Box(
+            modifier = Modifier
+                .widthIn(min = 220.dp, max = 320.dp)
+                .clip(RoundedCornerShape(16.dp))
+                .background(IosTheme.colors.card)
+                .padding(16.dp),
+            contentAlignment = Alignment.Center,
         ) {
-            Text("#${post.postNumber} · ${post.username}", style = IosTheme.type.subheadline,
-                color = IosTheme.colors.secondaryLabel, maxLines = 1)
-            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                if (post.canEdit) ManageAction("编辑", PostAction.Edit, IosTheme.colors.accent, onEdit)
-                if (post.canDelete) ManageAction("删除", PostAction.Delete, IosTheme.colors.destructive, onDelete)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                if (post.canEdit) {
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(44.dp)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(Color(0xFF007AFF))
+                            .clickable {
+                                onDismiss()
+                                onEdit()
+                            },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        ) {
+                            PostActionIcon(PostAction.Edit, selected = false, tint = Color.White)
+                            Text("编辑", style = IosTheme.type.subheadline.copy(fontWeight = FontWeight.SemiBold), color = Color.White)
+                        }
+                    }
+                }
+                if (post.canDelete) {
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(44.dp)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(Color(0xFFFF3B30))
+                            .clickable {
+                                onDismiss()
+                                onDelete()
+                            },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        ) {
+                            PostActionIcon(PostAction.Delete, selected = false, tint = Color.White)
+                            Text("删除", style = IosTheme.type.subheadline.copy(fontWeight = FontWeight.SemiBold), color = Color.White)
+                        }
+                    }
+                }
             }
-            IosTextAction("取消", color = IosTheme.colors.secondaryLabel,
-                textStyle = IosTheme.type.subheadline, onClick = onDismiss)
         }
-    }
-}
-
-@Composable
-private fun ManageAction(label: String, action: PostAction, color: Color, onClick: () -> Unit) {
-    Column(
-        Modifier.clip(RoundedCornerShape(12.dp))
-            .background(color.copy(alpha = 0.1f))
-            .clickable(onClick = onClick)
-            .padding(horizontal = 28.dp, vertical = 14.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(6.dp),
-    ) {
-        PostActionIcon(action, selected = false, tint = color)
-        Text(label, style = IosTheme.type.subheadline, color = color)
     }
 }
 
@@ -1039,9 +1111,77 @@ private fun ComposerAttachmentIcon(tint: Color, modifier: Modifier = Modifier) {
     }
 }
 
-/** 回复 / 编辑共用的输入弹层。从底部弹出,默认 1/3 屏,支持右上角一键全屏展开与收起。 */
+/** 贴吧风格表情图标：圆脸轮廓 + 双眼 + 微笑弧线 */
 @Composable
-private fun ComposerDialog(
+private fun ComposerEmojiIcon(tint: Color, modifier: Modifier = Modifier) {
+    Canvas(modifier.size(22.dp)) {
+        scale(size.width / 24f, size.height / 24f, pivot = Offset.Zero) {
+            val stroke = Stroke(width = 1.8f, cap = StrokeCap.Round, join = StrokeJoin.Round)
+            drawCircle(tint, radius = 9f, center = Offset(12f, 12f), style = stroke)
+            drawCircle(tint, radius = 1.3f, center = Offset(8.8f, 10f))
+            drawCircle(tint, radius = 1.3f, center = Offset(15.2f, 10f))
+            drawArc(
+                color = tint,
+                startAngle = 22f,
+                sweepAngle = 136f,
+                useCenter = false,
+                topLeft = Offset(7.8f, 10.5f),
+                size = androidx.compose.ui.geometry.Size(8.4f, 6.2f),
+                style = stroke,
+            )
+        }
+    }
+}
+
+private val COMMON_EMOJIS = listOf(
+    "😂", "🤣", "😭", "🤔", "👍", "❤️", "🎉", "🚀",
+    "🔥", "👀", "🙏", "🫡", "🥳", "😎", "🥰", "😅",
+    "🥺", "🤯", "😱", "😡", "🤡", "👻", "💀", "💩",
+    "👏", "🙌", "🤝", "💪", "👌", "✌️", "🤞", "🫶",
+    "💯", "✨", "⭐", "🌟", "⚡", "💡", "🎯", "🏆",
+    "🎁", "🎈", "🍻", "☕", "🍉", "🐶", "🐱", "🐧",
+)
+
+@Composable
+private fun QuickEmojiPicker(
+    enabled: Boolean = true,
+    onSelect: (String) -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(144.dp)
+            .clip(RoundedCornerShape(12.dp))
+            .background(IosTheme.colors.fieldBackground)
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 6.dp, vertical = 6.dp),
+        verticalArrangement = Arrangement.spacedBy(2.dp),
+    ) {
+        COMMON_EMOJIS.chunked(8).forEach { rowEmojis ->
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                rowEmojis.forEach { emoji ->
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(38.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                            .clickable(enabled = enabled) { onSelect(emoji) },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text(text = emoji, fontSize = 20.sp)
+                    }
+                }
+            }
+        }
+    }
+}
+
+/** 回复 / 编辑共用的输入弹层。页内底部抽屉设计,完全跟随宿主窗口键盘避让,支持一键全屏展开与收起。 */
+@Composable
+private fun ComposerSheet(
     composer: ComposerUiState,
     onDraftChange: (String) -> Unit,
     onSubmit: () -> Unit,
@@ -1055,7 +1195,9 @@ private fun ComposerDialog(
         is ComposerTarget.Edit -> "编辑 #${target.postNumber}"
     }
     val focus = remember { FocusRequester() }
+    val keyboardController = LocalSoftwareKeyboardController.current
     var isFullScreen by rememberSaveable { mutableStateOf(false) }
+    var showEmojiPicker by rememberSaveable { mutableStateOf(false) }
 
     // 系统相册选择器和 SAF 文件选择器都不需要声明存储权限。
     val pickImage = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
@@ -1066,202 +1208,240 @@ private fun ComposerDialog(
     }
     val busy = composer.submitting || composer.uploading
 
-    Dialog(
-        onDismissRequest = onClose,
-        properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false),
+    BackHandler(enabled = true) {
+        if (!busy) onClose()
+    }
+
+    Box(
+        modifier = Modifier.fillMaxSize(),
+        contentAlignment = Alignment.BottomCenter,
     ) {
+        // 背景半透明暗色遮罩,点击收起弹层
         Box(
-            modifier = Modifier
+            Modifier
                 .fillMaxSize()
-                .imePadding(),
-            contentAlignment = Alignment.BottomCenter,
+                .background(Color.Black.copy(alpha = 0.45f))
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null,
+                    onClick = { if (!busy) onClose() },
+                ),
+        )
+        // 底部抽屉面板
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .then(
+                    when {
+                        isFullScreen -> Modifier.fillMaxHeight(0.92f)
+                        showEmojiPicker -> Modifier.height(390.dp)
+                        else -> Modifier.height(265.dp)
+                    }
+                )
+                .clip(RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp))
+                .background(IosTheme.colors.card)
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null,
+                    onClick = {}, // 阻止点击穿透到遮罩
+                )
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
-            // 背景半透明暗色遮罩,点击收起弹层
-            Box(
-                Modifier
-                    .fillMaxSize()
-                    .background(Color.Black.copy(alpha = 0.45f))
-                    .clickable(
-                        interactionSource = remember { MutableInteractionSource() },
-                        indication = null,
-                        onClick = { if (!busy) onClose() },
-                    ),
-            )
-            // 底部抽屉面板
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .then(
-                        if (isFullScreen) Modifier.fillMaxHeight(0.92f)
-                        else Modifier.fillMaxHeight(0.36f).heightIn(min = 270.dp)
-                    )
-                    .clip(RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp))
-                    .background(IosTheme.colors.card)
-                    .clickable(
-                        interactionSource = remember { MutableInteractionSource() },
-                        indication = null,
-                        onClick = {}, // 阻止点击穿透到遮罩
-                    )
-                    .padding(horizontal = 16.dp, vertical = 12.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp),
+            // 顶部标题与全屏切换栏
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
             ) {
-                // 顶部标题与全屏切换栏
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                ) {
-                    // 左侧轻量关闭叉号
-                    val closeColor = IosTheme.colors.secondaryLabel
-                    Box(
-                        modifier = Modifier
-                            .size(32.dp)
-                            .clip(CircleShape)
-                            .clickable(enabled = !busy) { onClose() },
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        Canvas(Modifier.size(12.dp)) {
-                            drawLine(closeColor, Offset(0f, 0f), Offset(size.width, size.height), strokeWidth = 1.8f, cap = StrokeCap.Round)
-                            drawLine(closeColor, Offset(size.width, 0f), Offset(0f, size.height), strokeWidth = 1.8f, cap = StrokeCap.Round)
-                        }
-                    }
-
-                    Text(
-                        heading,
-                        style = IosTheme.type.headline,
-                        fontWeight = FontWeight.SemiBold,
-                        color = IosTheme.colors.label,
-                        maxLines = 1,
-                    )
-
-                    // 右上角全屏/恢复 切换图标
-                    Box(
-                        modifier = Modifier
-                            .size(32.dp)
-                            .clip(CircleShape)
-                            .clickable { isFullScreen = !isFullScreen }
-                            .semantics { contentDescription = if (isFullScreen) "恢复三分之一屏" else "全屏显示" },
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        FullscreenToggleIcon(isFullScreen = isFullScreen, tint = IosTheme.colors.label)
-                    }
-                }
-
-                // 中间输入区域 (自适应填满剩余空间)
+                // 左侧轻量关闭叉号
+                val closeColor = IosTheme.colors.secondaryLabel
                 Box(
                     modifier = Modifier
-                        .fillMaxWidth()
-                        .weight(1f)
-                        .clip(RoundedCornerShape(12.dp))
-                        .background(IosTheme.colors.fieldBackground)
-                        .verticalScroll(rememberScrollState())
-                        .padding(12.dp),
+                        .size(32.dp)
+                        .clip(CircleShape)
+                        .clickable(enabled = !busy) { onClose() },
+                    contentAlignment = Alignment.Center,
                 ) {
-                    if (composer.loadingDraft) {
-                        IosLoadingBox()
-                    } else {
-                        BasicTextField(
-                            value = composer.draft,
-                            onValueChange = onDraftChange,
-                            enabled = !composer.submitting,
-                            textStyle = IosTheme.type.body.copy(color = IosTheme.colors.label),
-                            cursorBrush = SolidColor(IosTheme.colors.accent),
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .focusRequester(focus),
-                            decorationBox = { field ->
-                                Box {
-                                    if (composer.draft.isEmpty()) {
-                                        Text(
-                                            "发贴千百度 文明第一步，支持 Markdown…",
-                                            style = IosTheme.type.body,
-                                            color = IosTheme.colors.tertiaryLabel,
-                                        )
-                                    }
-                                    field()
+                    Canvas(Modifier.size(12.dp)) {
+                        drawLine(closeColor, Offset(0f, 0f), Offset(size.width, size.height), strokeWidth = 1.8f, cap = StrokeCap.Round)
+                        drawLine(closeColor, Offset(size.width, 0f), Offset(0f, size.height), strokeWidth = 1.8f, cap = StrokeCap.Round)
+                    }
+                }
+
+                Text(
+                    heading,
+                    style = IosTheme.type.headline,
+                    fontWeight = FontWeight.SemiBold,
+                    color = IosTheme.colors.label,
+                    maxLines = 1,
+                )
+
+                // 右上角全屏/恢复 切换图标
+                Box(
+                    modifier = Modifier
+                        .size(32.dp)
+                        .clip(CircleShape)
+                        .clickable { isFullScreen = !isFullScreen }
+                        .semantics { contentDescription = if (isFullScreen) "恢复默认高度" else "全屏显示" },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    FullscreenToggleIcon(isFullScreen = isFullScreen, tint = IosTheme.colors.label)
+                }
+            }
+
+            // 中间输入区域 (自适应填满剩余空间)
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(IosTheme.colors.fieldBackground)
+                    .verticalScroll(rememberScrollState())
+                    .padding(12.dp),
+            ) {
+                if (composer.loadingDraft) {
+                    IosLoadingBox()
+                } else {
+                    BasicTextField(
+                        value = composer.draft,
+                        onValueChange = onDraftChange,
+                        enabled = !composer.submitting,
+                        textStyle = IosTheme.type.body.copy(color = IosTheme.colors.label),
+                        cursorBrush = SolidColor(IosTheme.colors.accent),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .focusRequester(focus),
+                        decorationBox = { field ->
+                            Box {
+                                if (composer.draft.isEmpty()) {
+                                    Text(
+                                        "发贴千百度 文明第一步，支持 Markdown…",
+                                        style = IosTheme.type.body,
+                                        color = IosTheme.colors.tertiaryLabel,
+                                    )
                                 }
-                            },
-                        )
-                    }
+                                field()
+                            }
+                        },
+                    )
                 }
+            }
 
-                composer.error?.let {
-                    Text(it, style = IosTheme.type.footnote, color = IosTheme.colors.destructive)
-                }
+            composer.error?.let {
+                Text(it, style = IosTheme.type.footnote, color = IosTheme.colors.destructive, maxLines = 1)
+            }
 
-                // 底部操作栏: 图片/附件 Icon + 上传状态 + 右侧发送胶囊
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(top = 2.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    // 图片 Icon
-                    Box(
-                        modifier = Modifier
-                            .size(36.dp)
-                            .clip(CircleShape)
-                            .clickable(enabled = !busy) {
-                                pickImage.launch(
-                                    PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly),
-                                )
-                            }
-                            .semantics { contentDescription = "添加图片" },
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        ComposerImageIcon(tint = if (busy) IosTheme.colors.tertiaryLabel else IosTheme.colors.label)
-                    }
-
-                    Spacer(Modifier.width(8.dp))
-
-                    // 附件 Icon
-                    Box(
-                        modifier = Modifier
-                            .size(36.dp)
-                            .clip(CircleShape)
-                            .clickable(enabled = !busy) {
-                                pickFile.launch(arrayOf("*/*"))
-                            }
-                            .semantics { contentDescription = "添加附件" },
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        ComposerAttachmentIcon(tint = if (busy) IosTheme.colors.tertiaryLabel else IosTheme.colors.label)
-                    }
-
-                    if (composer.uploading) {
-                        Spacer(Modifier.width(10.dp))
-                        IosActivityIndicator(diameter = 16.dp)
-                        Text(
-                            "上传中…",
-                            style = IosTheme.type.caption,
-                            color = IosTheme.colors.secondaryLabel,
-                            modifier = Modifier.padding(start = 4.dp),
-                        )
-                    }
-
-                    Spacer(Modifier.weight(1f))
-
-                    // 发送 / 保存 胶囊按钮
-                    val sendText = if (target is ComposerTarget.Edit) "保存" else "发表"
-                    val canSubmit = composer.canSubmit
-                    Box(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(50))
-                            .background(if (canSubmit) IosTheme.colors.accent else IosTheme.colors.accent.copy(alpha = 0.35f))
-                            .clickable(enabled = canSubmit) { onSubmit() }
-                            .padding(horizontal = 22.dp, vertical = 7.dp),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            if (composer.submitting) {
-                                IosActivityIndicator(diameter = 14.dp)
-                                Spacer(Modifier.width(6.dp))
-                            }
-                            Text(
-                                sendText,
-                                style = IosTheme.type.subheadline.copy(fontWeight = FontWeight.Medium),
-                                color = Color.White,
+            // 底部操作栏: 图片/附件/表情 Icon + 上传状态 + 右侧发送胶囊
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 2.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                // 图片 Icon
+                Box(
+                    modifier = Modifier
+                        .size(36.dp)
+                        .clip(CircleShape)
+                        .clickable(enabled = !busy) {
+                            pickImage.launch(
+                                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly),
                             )
                         }
+                        .semantics { contentDescription = "添加图片" },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    ComposerImageIcon(tint = if (busy) IosTheme.colors.tertiaryLabel else IosTheme.colors.label)
+                }
+
+                Spacer(Modifier.width(8.dp))
+
+                // 附件 Icon
+                Box(
+                    modifier = Modifier
+                        .size(36.dp)
+                        .clip(CircleShape)
+                        .clickable(enabled = !busy) {
+                            pickFile.launch(arrayOf("*/*"))
+                        }
+                        .semantics { contentDescription = "添加附件" },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    ComposerAttachmentIcon(tint = if (busy) IosTheme.colors.tertiaryLabel else IosTheme.colors.label)
+                }
+
+                Spacer(Modifier.width(8.dp))
+
+                // 表情 Icon
+                Box(
+                    modifier = Modifier
+                        .size(36.dp)
+                        .clip(CircleShape)
+                        .background(if (showEmojiPicker) IosTheme.colors.accent.copy(alpha = 0.12f) else Color.Transparent)
+                        .clickable(enabled = !busy) {
+                            val next = !showEmojiPicker
+                            showEmojiPicker = next
+                            if (next) {
+                                keyboardController?.hide()
+                            } else {
+                                runCatching { focus.requestFocus() }
+                                keyboardController?.show()
+                            }
+                        }
+                        .semantics { contentDescription = "选择表情" },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    ComposerEmojiIcon(
+                        tint = when {
+                            busy -> IosTheme.colors.tertiaryLabel
+                            showEmojiPicker -> IosTheme.colors.accent
+                            else -> IosTheme.colors.label
+                        },
+                    )
+                }
+
+                if (composer.uploading) {
+                    Spacer(Modifier.width(10.dp))
+                    IosActivityIndicator(diameter = 16.dp)
+                    Text(
+                        "上传中…",
+                        style = IosTheme.type.caption,
+                        color = IosTheme.colors.secondaryLabel,
+                        modifier = Modifier.padding(start = 4.dp),
+                    )
+                }
+
+                Spacer(Modifier.weight(1f))
+
+                // 发送 / 保存 胶囊按钮
+                val sendText = if (target is ComposerTarget.Edit) "保存" else "发表"
+                val canSubmit = composer.canSubmit
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(50))
+                        .background(if (canSubmit) IosTheme.colors.accent else IosTheme.colors.accent.copy(alpha = 0.35f))
+                        .clickable(enabled = canSubmit) { onSubmit() }
+                        .padding(horizontal = 22.dp, vertical = 7.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        if (composer.submitting) {
+                            IosActivityIndicator(diameter = 14.dp)
+                            Spacer(Modifier.width(6.dp))
+                        }
+                        Text(
+                            sendText,
+                            style = IosTheme.type.subheadline.copy(fontWeight = FontWeight.Medium),
+                            color = Color.White,
+                        )
                     }
+                }
+            }
+
+            if (showEmojiPicker) {
+                QuickEmojiPicker(enabled = !busy) { emoji ->
+                    onDraftChange(composer.draft + emoji)
                 }
             }
         }
@@ -1278,18 +1458,63 @@ private fun DeleteConfirmDialog(post: Post, onDismiss: () -> Unit, onConfirm: ()
     val isTopicRoot = post.postNumber <= 1
     Dialog(onDismissRequest = onDismiss) {
         Column(
-            Modifier.clip(RoundedCornerShape(16.dp)).background(IosTheme.colors.card).padding(20.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
+            Modifier
+                .widthIn(min = 280.dp, max = 340.dp)
+                .clip(RoundedCornerShape(18.dp))
+                .background(IosTheme.colors.card)
+                .padding(22.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            Text(if (isTopicRoot) "删除整个话题？" else "删除 #${post.postNumber}？", style = IosTheme.type.title3)
             Text(
-                if (isTopicRoot) "这是 1 楼，删除后整个话题及其下所有回复都会被移除。"
-                else "删除后这条回复将不再显示。",
-                style = IosTheme.type.footnote, color = IosTheme.colors.secondaryLabel,
+                text = if (isTopicRoot) "确认删除此话题？" else "确认删除此评论？",
+                style = IosTheme.type.headline,
+                fontWeight = FontWeight.Bold,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.fillMaxWidth(),
             )
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                IosTextAction("取消", color = IosTheme.colors.secondaryLabel, onClick = onDismiss)
-                IosTextAction("删除", IosTheme.colors.destructive, onClick = onConfirm)
+            if (isTopicRoot) {
+                Text(
+                    "这是 1 楼，删除后整个话题及其下所有回复都会被移除。",
+                    style = IosTheme.type.footnote,
+                    color = IosTheme.colors.secondaryLabel,
+                    textAlign = TextAlign.Center,
+                )
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(44.dp)
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(IosTheme.colors.fieldBackground)
+                        .clickable(onClick = onDismiss),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        "取消",
+                        style = IosTheme.type.subheadline.copy(fontWeight = FontWeight.Medium),
+                        color = IosTheme.colors.label,
+                    )
+                }
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(44.dp)
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(Color(0xFFFF3B30))
+                        .clickable(onClick = onConfirm),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        "删除",
+                        style = IosTheme.type.subheadline.copy(fontWeight = FontWeight.SemiBold),
+                        color = Color.White,
+                    )
+                }
             }
         }
     }
@@ -1328,7 +1553,7 @@ private fun PostRow(
     pending: Boolean,
     error: String?,
     onReact: (String) -> Unit,
-    onBoost: (String) -> Unit,
+    onOpenBoost: () -> Unit,
     onDeleteBoost: (Long) -> Unit,
     onRefresh: () -> Unit,
     onSolution: () -> Unit,
@@ -1381,7 +1606,7 @@ private fun PostRow(
         if (post.acceptedAnswer) Text("✓ 解决方案", style = IosTheme.type.footnote, color = Color(0xFF30B85B))
         CookedContent(blocks, onPicture)
         PostActions(
-            post, reactions, emojiUrls, busy, pending, error, onReact, onBoost, onDeleteBoost,
+            post, reactions, emojiUrls, busy, pending, error, onReact, onOpenBoost, onDeleteBoost,
             onRefresh, onSolution, canReply, onReply,
         )
     }
@@ -1404,7 +1629,7 @@ private fun SubReplyRow(
     pending: Boolean,
     error: String?,
     onReact: (String) -> Unit,
-    onBoost: (String) -> Unit,
+    onOpenBoost: () -> Unit,
     onDeleteBoost: (Long) -> Unit,
     onRefresh: () -> Unit,
     highlighted: Boolean,
@@ -1482,7 +1707,7 @@ private fun SubReplyRow(
             pending = pending,
             error = error,
             onReact = onReact,
-            onBoost = onBoost,
+            onOpenBoost = onOpenBoost,
             onDeleteBoost = onDeleteBoost,
             onRefresh = onRefresh,
             onSolution = {},
@@ -1515,7 +1740,7 @@ private fun PostActions(
     pending: Boolean,
     error: String?,
     onReact: (String) -> Unit,
-    onBoost: (String) -> Unit,
+    onOpenBoost: () -> Unit,
     onDeleteBoost: (Long) -> Unit,
     onRefresh: () -> Unit,
     onSolution: () -> Unit,
@@ -1524,12 +1749,8 @@ private fun PostActions(
     compact: Boolean = false,
 ) {
     var chooseReaction by remember { mutableStateOf(false) }
-    var composeBoost by remember { mutableStateOf(false) }
-    var draft by rememberSaveable(post.id) { mutableStateOf("") }
     var visibleBoosts by rememberSaveable(post.id) { mutableIntStateOf(8) }
     var deleteId by remember { mutableStateOf<Long?>(null) }
-    val touchSize = if (compact) 34.dp else 44.dp
-    LaunchedEffect(post.canBoost) { if (!post.canBoost) { composeBoost = false; draft = "" } }
     if (post.reactions.any { it.count > 0 }) {
         Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             post.reactions.filter { it.count > 0 }.forEach { reaction ->
@@ -1544,7 +1765,7 @@ private fun PostActions(
         modifier = Modifier
             .fillMaxWidth()
             .padding(top = 2.dp),
-        horizontalArrangement = Arrangement.End,
+        horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         // 只有这一条楼层在提交时才转圈。
@@ -1595,25 +1816,14 @@ private fun PostActions(
             )
         }
         if (post.canBoost) {
-            Box {
-                TiebaPostActionButton(
-                    label = "boost简评",
-                    action = PostAction.Boost,
-                    selected = composeBoost,
-                    enabled = !busy,
-                    compact = compact,
-                    onClick = { composeBoost = !composeBoost },
-                )
-                if (composeBoost) {
-                    BoostBubblePopup(
-                        draft = draft,
-                        onDraftChange = { draft = it },
-                        busy = busy,
-                        onSend = { onBoost(draft) },
-                        onDismiss = { composeBoost = false },
-                    )
-                }
-            }
+            TiebaPostActionButton(
+                label = "boost简评",
+                action = PostAction.Boost,
+                selected = false,
+                enabled = !busy,
+                compact = compact,
+                onClick = onOpenBoost,
+            )
         }
     }
     error?.let {
@@ -1643,11 +1853,56 @@ private fun PostActions(
         else if (visibleBoosts > 8) IosTextAction("收起简评", textStyle = IosTheme.type.caption) { visibleBoosts = 8 }
     }
     deleteId?.let { id -> Dialog(onDismissRequest = { deleteId = null }) {
-        Column(Modifier.clip(RoundedCornerShape(16.dp)).background(IosTheme.colors.card).padding(20.dp)) {
-            Text("删除这条简评？", style = IosTheme.type.title3)
-            Row {
-                IosTextAction("取消") { deleteId = null }
-                IosTextAction("删除", Color(0xFFFF453A)) { deleteId = null; onDeleteBoost(id) }
+        Column(
+            Modifier
+                .widthIn(min = 280.dp, max = 340.dp)
+                .clip(RoundedCornerShape(18.dp))
+                .background(IosTheme.colors.card)
+                .padding(22.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Text(
+                text = "确认删除此简评？",
+                style = IosTheme.type.headline,
+                fontWeight = FontWeight.Bold,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(44.dp)
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(IosTheme.colors.fieldBackground)
+                        .clickable { deleteId = null },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        "取消",
+                        style = IosTheme.type.subheadline.copy(fontWeight = FontWeight.Medium),
+                        color = IosTheme.colors.label,
+                    )
+                }
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(44.dp)
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(Color(0xFFFF3B30))
+                        .clickable { deleteId = null; onDeleteBoost(id) },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        "删除",
+                        style = IosTheme.type.subheadline.copy(fontWeight = FontWeight.SemiBold),
+                        color = Color.White,
+                    )
+                }
             }
         }
     } }
@@ -1823,63 +2078,104 @@ private fun ReactionBubblePopup(
 }
 
 /**
- * 点击 boost 简评向上弹出的气泡输入浮层。
- * 带有指向 boost 按钮的小三角形，内部含输入框、字数表情计数和发送/取消按钮。
+ * 点击 boost 简评弹出的页内底部输入抽屉。
+ * 紧贴软键盘上方，避免原悬浮气泡被弹出键盘遮挡或越界。
  */
 @Composable
-private fun BoostBubblePopup(
+private fun BoostSheet(
+    target: BoostTarget,
     draft: String,
     onDraftChange: (String) -> Unit,
     busy: Boolean,
     onSend: () -> Unit,
     onDismiss: () -> Unit,
 ) {
-    var arrowCenterX by remember { mutableFloatStateOf(0f) }
-    val bubbleShape = remember {
-        BubbleShape(cornerRadius = 16.dp, arrowWidth = 14.dp, arrowHeight = 7.dp) { arrowCenterX }
+    BackHandler(enabled = true) {
+        if (!busy) onDismiss()
     }
-    val positionProvider = remember {
-        BubblePopupPositionProvider { arrowCenterX = it }
-    }
+    val focus = remember { FocusRequester() }
+    val keyboardController = LocalSoftwareKeyboardController.current
+    var showEmojiPicker by rememberSaveable { mutableStateOf(false) }
+    val length = remember(draft) { measureBoost(draft) }
+    val over = length.overVisible || length.overEmoji
+    val canSend = length.submittable && !busy
 
-    Popup(
-        popupPositionProvider = positionProvider,
-        onDismissRequest = onDismiss,
-        properties = PopupProperties(focusable = true),
+    Box(
+        modifier = Modifier.fillMaxSize(),
+        contentAlignment = Alignment.BottomCenter,
     ) {
-        val length = remember(draft) { measureBoost(draft) }
-        val over = length.overVisible || length.overEmoji
-        val canSend = length.submittable && !busy
+        Box(
+            Modifier
+                .fillMaxSize()
+                .background(Color.Black.copy(alpha = 0.45f))
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null,
+                    onClick = { if (!busy) onDismiss() },
+                ),
+        )
 
         Column(
             modifier = Modifier
-                .width(290.dp)
-                .shadow(elevation = 6.dp, shape = bubbleShape, clip = false)
-                .clip(bubbleShape)
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp))
                 .background(IosTheme.colors.card)
-                .padding(bottom = 7.dp) // 预留底部小三角高度
-                .padding(12.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null,
+                    onClick = {},
+                )
+                .padding(horizontal = 16.dp, vertical = 14.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Text(
+                    text = "简评 #${target.postNumber} · @${target.username}",
+                    style = IosTheme.type.headline,
+                    fontWeight = FontWeight.SemiBold,
+                    color = IosTheme.colors.label,
+                    maxLines = 1,
+                )
+                val closeColor = IosTheme.colors.secondaryLabel
+                Box(
+                    modifier = Modifier
+                        .size(28.dp)
+                        .clip(CircleShape)
+                        .clickable(enabled = !busy, onClick = onDismiss),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Canvas(Modifier.size(11.dp)) {
+                        drawLine(closeColor, Offset(0f, 0f), Offset(size.width, size.height), strokeWidth = 1.8f, cap = StrokeCap.Round)
+                        drawLine(closeColor, Offset(size.width, 0f), Offset(0f, size.height), strokeWidth = 1.8f, cap = StrokeCap.Round)
+                    }
+                }
+            }
+
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .heightIn(min = 60.dp, max = 110.dp)
-                    .clip(RoundedCornerShape(10.dp))
+                    .heightIn(min = 76.dp, max = 120.dp)
+                    .clip(RoundedCornerShape(12.dp))
                     .background(IosTheme.colors.fieldBackground)
                     .verticalScroll(rememberScrollState())
-                    .padding(8.dp),
+                    .padding(12.dp),
             ) {
                 BasicTextField(
                     value = draft,
                     onValueChange = { if (it.length <= BoostLength.RAW_INPUT_CAP) onDraftChange(it) },
                     textStyle = IosTheme.type.body.copy(color = IosTheme.colors.label),
                     cursorBrush = SolidColor(IosTheme.colors.accent),
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .focusRequester(focus),
                     decorationBox = { field ->
                         Box {
                             if (draft.isEmpty()) {
-                                Text("写一句简评…", style = IosTheme.type.body, color = IosTheme.colors.secondaryLabel)
+                                Text("写一句简评…", style = IosTheme.type.body, color = IosTheme.colors.tertiaryLabel)
                             }
                             field()
                         }
@@ -1887,37 +2183,84 @@ private fun BoostBubblePopup(
                 )
             }
 
-            // 实时计数
-            Text(
-                text = "可见 ${length.visible}/${BoostLength.MAX_VISIBLE} · 表情 ${length.emoji}/${BoostLength.MAX_EMOJI}",
-                style = IosTheme.type.caption,
-                color = if (over) IosTheme.colors.destructive else IosTheme.colors.secondaryLabel,
-            )
-
-            // 底部操作按钮
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.End,
+                horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Box(
-                    modifier = Modifier
-                        .clickable(onClick = onDismiss)
-                        .padding(horizontal = 12.dp, vertical = 6.dp),
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Text("取消", style = IosTheme.type.subheadline, color = IosTheme.colors.secondaryLabel)
+                    Box(
+                        modifier = Modifier
+                            .size(34.dp)
+                            .clip(CircleShape)
+                            .background(if (showEmojiPicker) IosTheme.colors.accent.copy(alpha = 0.12f) else Color.Transparent)
+                            .clickable(enabled = !busy) {
+                                val next = !showEmojiPicker
+                                showEmojiPicker = next
+                                if (next) {
+                                    keyboardController?.hide()
+                                } else {
+                                    runCatching { focus.requestFocus() }
+                                    keyboardController?.show()
+                                }
+                            }
+                            .semantics { contentDescription = "选择表情" },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        ComposerEmojiIcon(
+                            tint = when {
+                                busy -> IosTheme.colors.tertiaryLabel
+                                showEmojiPicker -> IosTheme.colors.accent
+                                else -> IosTheme.colors.label
+                            },
+                            modifier = Modifier.size(20.dp),
+                        )
+                    }
+                    Text(
+                        text = "可见 ${length.visible}/${BoostLength.MAX_VISIBLE} · 表情 ${length.emoji}/${BoostLength.MAX_EMOJI}",
+                        style = IosTheme.type.caption,
+                        color = if (over) IosTheme.colors.destructive else IosTheme.colors.secondaryLabel,
+                    )
                 }
-                Box(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(50))
-                        .background(if (canSend) IosTheme.colors.accent else IosTheme.colors.accent.copy(alpha = 0.35f))
-                        .clickable(enabled = canSend, onClick = onSend)
-                        .padding(horizontal = 16.dp, vertical = 6.dp),
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Text("发送", style = IosTheme.type.subheadline.copy(fontWeight = FontWeight.Medium), color = Color.White)
+                    Box(
+                        modifier = Modifier
+                            .clickable(enabled = !busy, onClick = onDismiss)
+                            .padding(horizontal = 12.dp, vertical = 6.dp),
+                    ) {
+                        Text("取消", style = IosTheme.type.subheadline, color = IosTheme.colors.secondaryLabel)
+                    }
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(50))
+                            .background(if (canSend) IosTheme.colors.accent else IosTheme.colors.accent.copy(alpha = 0.35f))
+                            .clickable(enabled = canSend, onClick = onSend)
+                            .padding(horizontal = 20.dp, vertical = 7.dp),
+                    ) {
+                        Text("发送", style = IosTheme.type.subheadline.copy(fontWeight = FontWeight.Medium), color = Color.White)
+                    }
+                }
+            }
+
+            if (showEmojiPicker) {
+                QuickEmojiPicker(enabled = !busy) { emoji ->
+                    val next = draft + emoji
+                    if (next.length <= BoostLength.RAW_INPUT_CAP) {
+                        onDraftChange(next)
+                    }
                 }
             }
         }
+    }
+
+    LaunchedEffect(target.postId) {
+        runCatching { focus.requestFocus() }
     }
 }
 
@@ -1941,51 +2284,83 @@ private fun PostActionIcon(
         selected -> IosTheme.colors.accent
         else -> IosTheme.colors.secondaryLabel
     }
+    val cardBg = IosTheme.colors.card
     Canvas(modifier) {
         scale(size.width / 24f, size.height / 24f, pivot = Offset.Zero) {
             val shape = Path()
             when (action) {
                 PostAction.Solution -> {
-                    drawCircle(color, 4.5f, Offset(7.5f, 7.5f), style = Stroke(1.7f))
-                    drawLine(color, Offset(11f, 11f), Offset(21f, 21f), 1.7f)
-                    drawLine(color, Offset(15f, 15f), Offset(18f, 12f), 1.7f)
-                    drawLine(color, Offset(18f, 18f), Offset(21f, 15f), 1.7f)
+                    rotate(-45f, pivot = Offset(12f, 12f)) {
+                        // 水平向左钥匙：右侧圆环头部，向左下伸出钥匙柄与钥匙齿
+                        val outerRadius = 4.8f
+                        val innerRadius = 2.3f
+                        val headCenter = Offset(16f, 12f)
+                        val keyPath = Path().apply {
+                            moveTo(11.5f, 10.4f)
+                            lineTo(4.5f, 10.4f)
+                            arcTo(
+                                Rect(3f, 10.4f, 6f, 13.6f),
+                                -90f, -180f, false
+                            )
+                            lineTo(6.5f, 13.6f)
+                            lineTo(6.5f, 16.2f)
+                            lineTo(8f, 16.2f)
+                            lineTo(8f, 13.6f)
+                            lineTo(9.5f, 13.6f)
+                            lineTo(9.5f, 16.2f)
+                            lineTo(11f, 16.2f)
+                            lineTo(11f, 13.6f)
+                            lineTo(11.5f, 13.6f)
+                        }
+                        drawCircle(color, outerRadius, headCenter, style = Stroke(1.7f))
+                        drawCircle(color, innerRadius, headCenter, style = Stroke(1.5f))
+                        drawPath(keyPath, color, style = Stroke(1.7f, cap = StrokeCap.Round, join = StrokeJoin.Round))
+                    }
                 }
                 PostAction.Like -> {
-                    shape.moveTo(12f, 21f)
-                    shape.cubicTo(10f, 19f, 3f, 13f, 3f, 8f)
-                    shape.cubicTo(3f, 2f, 10f, 1f, 12f, 6f)
-                    shape.cubicTo(14f, 1f, 21f, 2f, 21f, 8f)
-                    shape.cubicTo(21f, 13f, 14f, 19f, 12f, 21f)
+                    shape.moveTo(12f, 21.3f)
+                    shape.cubicTo(10.2f, 19.5f, 3.2f, 13.4f, 3.2f, 8.2f)
+                    shape.cubicTo(3.2f, 3.5f, 9.8f, 2.2f, 12f, 6.6f)
+                    shape.cubicTo(14.2f, 2.2f, 20.8f, 3.5f, 20.8f, 8.2f)
+                    shape.cubicTo(20.8f, 13.4f, 13.8f, 19.5f, 12f, 21.3f)
                     shape.close()
-                    if (selected) drawPath(shape, color) else drawPath(shape, color, style = Stroke(1.6f))
+                    if (selected) {
+                        drawPath(shape, color)
+                    } else {
+                        drawPath(shape, color, style = Stroke(1.7f, cap = StrokeCap.Round, join = StrokeJoin.Round))
+                    }
                 }
                 PostAction.Boost -> {
-                    shape.moveTo(9f, 15f); shape.lineTo(9f, 10f)
-                    shape.cubicTo(12f, 5f, 16f, 3f, 21f, 3f)
-                    shape.cubicTo(21f, 8f, 19f, 12f, 14f, 15f)
-                    shape.close()
-                    shape.moveTo(9f, 10f); shape.lineTo(5f, 10f); shape.lineTo(3f, 15f); shape.lineTo(9f, 15f)
-                    shape.moveTo(14f, 15f); shape.lineTo(14f, 19f); shape.lineTo(9f, 21f); shape.lineTo(9f, 15f)
-                    drawPath(shape, color, style = Stroke(1.6f))
-                    drawCircle(color, 1.8f, Offset(16f, 8f), style = Stroke(1.4f))
-                    drawLine(color, Offset(6f, 18f), Offset(3f, 21f), 1.6f)
+                    rotate(45f, pivot = Offset(12f, 12f)) {
+                        val rocket = Path().apply {
+                            moveTo(12f, 3.5f)
+                            cubicTo(14.8f, 7.5f, 15f, 12f, 14.5f, 14.5f)
+                            lineTo(18.5f, 16.5f)
+                            lineTo(18.5f, 18.5f)
+                            lineTo(14f, 17f)
+                            lineTo(13.2f, 18.8f)
+                            lineTo(10.8f, 18.8f)
+                            lineTo(10f, 17f)
+                            lineTo(5.5f, 18.5f)
+                            lineTo(5.5f, 16.5f)
+                            lineTo(9.5f, 14.5f)
+                            cubicTo(9f, 12f, 9.2f, 7.5f, 12f, 3.5f)
+                            close()
+                        }
+                        drawPath(rocket, color)
+                        drawCircle(if (selected) Color.White else cardBg, radius = 1.6f, center = Offset(12f, 9f))
+                    }
                 }
-                // 贴吧风格镂空左弯回复箭头
+                // Discourse PC 原生实心左弯回复箭头 (FontAwesome fa-reply 矢量造型)
                 PostAction.Reply -> {
-                    val arrowHead = Path().apply {
-                        moveTo(7.5f, 5f)
-                        lineTo(3.2f, 9.5f)
-                        lineTo(7.5f, 14f)
-                    }
-                    drawPath(arrowHead, color, style = Stroke(1.7f, cap = StrokeCap.Round, join = StrokeJoin.Round))
-                    val arrowBody = Path().apply {
-                        moveTo(3.5f, 9.5f)
-                        lineTo(13f, 9.5f)
-                        cubicTo(17.5f, 9.5f, 20.5f, 12.5f, 20.5f, 16.5f)
-                        lineTo(20.5f, 19.5f)
-                    }
-                    drawPath(arrowBody, color, style = Stroke(1.7f, cap = StrokeCap.Round, join = StrokeJoin.Round))
+                    shape.moveTo(3.5f, 11.5f)
+                    shape.lineTo(10.5f, 5f)
+                    shape.lineTo(10.5f, 8.8f)
+                    shape.cubicTo(16.5f, 8.8f, 20.5f, 11.5f, 21f, 18.5f)
+                    shape.cubicTo(19.2f, 15f, 15.5f, 13.5f, 10.5f, 13.8f)
+                    shape.lineTo(10.5f, 18f)
+                    shape.close()
+                    drawPath(shape, color)
                 }
                 // 铅笔
                 PostAction.Edit -> {
@@ -2021,11 +2396,19 @@ private fun TiebaPostActionButton(
     onClick: () -> Unit,
     onLongClick: (() -> Unit)? = null,
 ) {
-    Column(
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center,
+    val activeTint = when (action) {
+        PostAction.Like -> Color(0xFFFF3B30)
+        PostAction.Solution -> Color(0xFF30B85B)
+        else -> IosTheme.colors.accent
+    }
+    val buttonTint = if (selected) activeTint else color
+    val buttonBg = if (selected) activeTint.copy(alpha = 0.12f) else Color.Transparent
+
+    Box(
         modifier = Modifier
-            .clip(RoundedCornerShape(6.dp))
+            .size(if (compact) 30.dp else 34.dp)
+            .clip(CircleShape)
+            .background(buttonBg)
             .then(
                 if (onLongClick != null) {
                     Modifier.combinedClickable(enabled = enabled, onClick = onClick, onLongClick = onLongClick)
@@ -2033,21 +2416,14 @@ private fun TiebaPostActionButton(
                     Modifier.clickable(enabled = enabled, onClick = onClick)
                 }
             )
-            .padding(horizontal = if (compact) 6.dp else 10.dp, vertical = 2.dp),
+            .semantics { contentDescription = label },
+        contentAlignment = Alignment.Center,
     ) {
         PostActionIcon(
             action = action,
             selected = selected,
-            tint = if (selected) null else color,
-            modifier = Modifier.size(if (compact) 18.dp else 21.dp),
-        )
-        Spacer(Modifier.height(3.dp))
-        Text(
-            text = label,
-            fontSize = if (compact) 10.sp else 11.sp,
-            color = if (selected) (if (action == PostAction.Like) Color(0xFFFF3B30) else IosTheme.colors.accent) else color,
-            fontWeight = if (selected) FontWeight.Medium else FontWeight.Normal,
-            maxLines = 1,
+            tint = buttonTint,
+            modifier = Modifier.size(if (compact) 18.dp else 20.dp),
         )
     }
 }
@@ -2224,46 +2600,57 @@ private fun ImageViewer(url: String, onDismiss: () -> Unit) {
         properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false),
     ) {
         Box(
-            Modifier.fillMaxSize()
-                .background(Color.Black)
-                .pointerInput(url) {
-                    detectTapGestures(
-                        onDoubleTap = {
-                            if (zoom > 1.05f) {
-                                zoom = 1f
-                                offset = Offset.Zero
-                            } else {
-                                zoom = 2.5f
-                            }
-                        },
-                    )
-                }
-                .pointerInput(url) {
-                    detectTransformGestures { _, pan, scale, _ ->
-                        val nextZoom = (zoom * scale).coerceIn(1f, 6f)
-                        zoom = nextZoom
-                        offset = if (nextZoom > 1f) {
-                            offset + pan
-                        } else {
-                            Offset(0f, (offset.y + pan.y).coerceAtLeast(0f))
-                        }
-                        if (nextZoom == 1f && offset.y > 100.dp.toPx()) onDismiss()
-                    }
-                },
+            Modifier
+                .fillMaxSize()
+                .background(Color.Black),
         ) {
-            AsyncImage(
-                model = originalRequest,
-                contentDescription = "图片预览",
-                contentScale = ContentScale.Fit,
-                modifier = Modifier.fillMaxSize().graphicsLayer {
-                    scaleX = zoom
-                    scaleY = zoom
-                    translationX = offset.x
-                    translationY = offset.y
-                },
-            )
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .zIndex(0f)
+                    .clipToBounds()
+                    .pointerInput(url) {
+                        detectTapGestures(
+                            onDoubleTap = {
+                                if (zoom > 1.05f) {
+                                    zoom = 1f
+                                    offset = Offset.Zero
+                                } else {
+                                    zoom = 2.5f
+                                }
+                            },
+                        )
+                    }
+                    .pointerInput(url) {
+                        detectTransformGestures { _, pan, scale, _ ->
+                            val nextZoom = (zoom * scale).coerceIn(1f, 6f)
+                            zoom = nextZoom
+                            offset = if (nextZoom > 1f) {
+                                offset + pan
+                            } else {
+                                Offset(0f, (offset.y + pan.y).coerceAtLeast(0f))
+                            }
+                            if (nextZoom == 1f && offset.y > 100.dp.toPx()) onDismiss()
+                        }
+                    },
+            ) {
+                AsyncImage(
+                    model = originalRequest,
+                    contentDescription = "图片预览",
+                    contentScale = ContentScale.Fit,
+                    modifier = Modifier.fillMaxSize().graphicsLayer {
+                        scaleX = zoom
+                        scaleY = zoom
+                        translationX = offset.x
+                        translationY = offset.y
+                    },
+                )
+            }
             Row(
-                Modifier.align(Alignment.TopEnd)
+                Modifier
+                    .align(Alignment.TopEnd)
+                    .zIndex(10f)
+                    .graphicsLayer { shadowElevation = 12f }
                     .systemBarsPadding()
                     .padding(horizontal = 16.dp, vertical = 12.dp),
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -2272,9 +2659,11 @@ private fun ImageViewer(url: String, onDismiss: () -> Unit) {
                 Text(
                     text = if (saving) "保存中…" else "保存",
                     color = Color.White,
-                    style = IosTheme.type.subheadline,
-                    modifier = Modifier.clip(RoundedCornerShape(50))
-                        .background(Color.White.copy(alpha = 0.18f))
+                    style = IosTheme.type.subheadline.copy(fontWeight = FontWeight.Medium),
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(50))
+                        .background(Color.Black.copy(alpha = 0.68f))
+                        .border(0.8.dp, Color.White.copy(alpha = 0.38f), RoundedCornerShape(50))
                         .clickable(enabled = !saving) {
                             saving = true
                             scope.launch {
@@ -2293,9 +2682,11 @@ private fun ImageViewer(url: String, onDismiss: () -> Unit) {
                 Text(
                     text = "关闭",
                     color = Color.White,
-                    style = IosTheme.type.subheadline,
-                    modifier = Modifier.clip(RoundedCornerShape(50))
-                        .background(Color.White.copy(alpha = 0.18f))
+                    style = IosTheme.type.subheadline.copy(fontWeight = FontWeight.Medium),
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(50))
+                        .background(Color.Black.copy(alpha = 0.68f))
+                        .border(0.8.dp, Color.White.copy(alpha = 0.38f), RoundedCornerShape(50))
                         .clickable(onClick = onDismiss)
                         .padding(horizontal = 16.dp, vertical = 8.dp),
                 )

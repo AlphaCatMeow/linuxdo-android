@@ -516,6 +516,7 @@ data class TopicDetails(
 data class TopicDetail(
     val id: Long,
     val title: String,
+    @SerialName("posts_count") val postsCount: Int = 0,
     @SerialName("category_id") val categoryId: Int? = null,
     @SerialName("post_stream") val postStream: PostStream = PostStream(),
     @SerialName("valid_reactions") val validReactions: List<String> = emptyList(),

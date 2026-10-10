@@ -24,6 +24,22 @@ class ReadingStore(context: Context) {
             ?.let(::addAll)
     }
 
+    /** 记录各已读话题在本地最后点阅时的总楼层数(postsCount)，用于「未读」列表判断是否有新增楼层。 */
+    private val seenPostsCount: LinkedHashMap<Long, Int> = linkedMapOf<Long, Int>().apply {
+        prefs.getString(KEY_SEEN_POST_COUNTS, null)
+            ?.split(',')
+            ?.forEach { entry ->
+                val parts = entry.split(':')
+                if (parts.size == 2) {
+                    val id = parts[0].trim().toLongOrNull()
+                    val count = parts[1].trim().toIntOrNull()
+                    if (id != null && count != null && count > 0) {
+                        put(id, count)
+                    }
+                }
+            }
+    }
+
     @Volatile
     var syncReadProgress: Boolean = prefs.getBoolean(KEY_SYNC_READ_PROGRESS, false)
         private set
@@ -38,26 +54,53 @@ class ReadingStore(context: Context) {
 
     fun isSeen(topicId: Long): Boolean = synchronized(seen) { topicId in seen }
 
-    /** 返回 true 表示这次确实是新标记的,调用方可据此决定要不要刷界面。 */
-    fun markSeen(topicId: Long): Boolean {
+    /**
+     * 判断话题在「未读」列表中是否已在本地读到最新楼层、应当排除：
+     * - 未在本地点开过 -> false（保留展示）
+     * - 已点开过，且当前总楼层数 <= 本地已读记录楼层数（或旧记录未存楼层数） -> true（排除）
+     * - 已点开过，但服务端总楼层数增长超过了本地记录 -> false（有新回复，重新展示）
+     */
+    fun isUnreadExcluded(topicId: Long, currentPostsCount: Int): Boolean = synchronized(seen) {
+        if (topicId !in seen) return false
+        val recorded = seenPostsCount[topicId] ?: 0
+        recorded <= 0 || currentPostsCount <= recorded
+    }
+
+    /** 返回 true 表示这次是新标记已读或更新了已读楼层上限，调用方可据此刷新界面。 */
+    fun markSeen(topicId: Long, postsCount: Int = 0): Boolean {
         if (topicId <= 0L) return false
-        val snapshot = synchronized(seen) {
+        var changed = false
+        var seenCsv = ""
+        var countsCsv = ""
+        synchronized(seen) {
             // 重新 add 一次把它挪到队尾,保证活跃话题不会被当成最早的淘汰掉。
             val fresh = seen.remove(topicId).not()
             seen.add(topicId)
+            val prevCount = seenPostsCount[topicId] ?: 0
+            val countUpdated = postsCount > prevCount
+            if (postsCount > 0) {
+                seenPostsCount[topicId] = maxOf(prevCount, postsCount)
+            }
             while (seen.size > MAX_SEEN_TOPICS) {
                 val oldest = seen.firstOrNull() ?: break
                 seen.remove(oldest)
+                seenPostsCount.remove(oldest)
             }
-            fresh to seen.joinToString(",")
+            changed = fresh || countUpdated
+            seenCsv = seen.joinToString(",")
+            countsCsv = seenPostsCount.entries.joinToString(",") { "${it.key}:${it.value}" }
         }
-        prefs.edit { putString(KEY_SEEN_TOPICS, snapshot.second) }
-        return snapshot.first
+        prefs.edit {
+            putString(KEY_SEEN_TOPICS, seenCsv)
+            putString(KEY_SEEN_POST_COUNTS, countsCsv)
+        }
+        return changed
     }
 
     private companion object {
         const val PREFS_NAME = "reading_preferences"
         const val KEY_SEEN_TOPICS = "seen_topic_ids"
+        const val KEY_SEEN_POST_COUNTS = "seen_topic_post_counts"
         const val KEY_SYNC_READ_PROGRESS = "sync_read_progress"
         const val MAX_SEEN_TOPICS = 2_000
     }

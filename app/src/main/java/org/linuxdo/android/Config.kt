@@ -64,17 +64,18 @@ object Config {
     /** 远端 version.json 尚未推送到仓库时的本地兜底清单（与根目录 version.json 保持一致，便于本地预演测试）。 */
     const val FALLBACK_VERSION_MANIFEST_JSON = """
         {
-          "versionCode": 8,
-          "versionName": "1.1.0",
+          "versionCode": 10,
+          "versionName": "1.2.0",
           "forceUpdate": false,
           "minVersionCode": 1,
-          "title": "v1.1.0 版本更新",
+          "title": "v1.2.0 版本更新",
           "changelog": [
-            "1、支持2FA登录",
-            "2、优化详情页面UI展示",
-            "3、新增应用内升级机制"
+            "1、整体 UI 重构，全面升级首页、分类、搜索、详情与个人中心交互体验",
+            "2、增加支持安全登录认证（原生人机验证与网页授权认证）",
+            "3、新增浏览帖子数与阅读时长同步功能（默认关闭，开启可能触发掉盾）",
+            "4、支持评论正倒序切换、Emoji 表情面板、分类等级下拉切换及多项细节修复"
           ],
-          "apkUrl": "https://github.com/xuemk/linuxdo-android/releases/download/v1.1.0/linuxdo-1.1.0-release.apk"
+          "apkUrl": "https://github.com/xuemk/linuxdo-android/releases/download/v1.2.0/linuxdo-1.2.0-release.apk"
         }
     """
 }

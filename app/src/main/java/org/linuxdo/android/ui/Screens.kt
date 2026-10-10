@@ -100,6 +100,7 @@ fun ProfileScreen(
     notificationFilter: NotificationFilter = NotificationFilter.All,
     onNotificationFilter: (NotificationFilter) -> Unit = {},
     unreadFilters: Set<NotificationFilter> = emptySet(),
+    onOpenUserTopics: ((username: String, title: String, isBookmark: Boolean) -> Unit)? = null,
     scrollToTopRequest: Int = 0,
     trailing: @Composable () -> Unit = {},
 ) {
@@ -116,7 +117,7 @@ fun ProfileScreen(
     } }
     LaunchedEffect(section, active) {
         if (active) {
-            onLoad(section, false, false)
+            onLoad(section, section == ProfileSection.Notifications, false)
             if (section != ProfileSection.Summary && summaryFields.isEmpty()) {
                 onLoad(ProfileSection.Summary, false, false)
             }
@@ -149,6 +150,8 @@ fun ProfileScreen(
         title = if (notificationOnly) "通知" else "我的",
         listState = list,
         onBack = onBack,
+        showLargeTitle = !notificationOnly,
+        backLabel = if (notificationOnly) "" else "返回",
         scrollToTopRequest = scrollToTopRequest,
         trailing = {
             if (!notificationOnly) {
@@ -162,7 +165,7 @@ fun ProfileScreen(
                             .clickable(onClick = onSettings),
                         contentAlignment = Alignment.Center,
                     ) {
-                        ProfileSettingsGearIcon(tint = IosTheme.colors.label)
+                        ProfileSettingsGearIcon(tint = IosTheme.colors.secondaryLabel)
                     }
                 }
             }
@@ -174,10 +177,10 @@ fun ProfileScreen(
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 6.dp)
-                        .clip(RoundedCornerShape(16.dp))
+                        .padding(horizontal = 16.dp, vertical = 10.dp)
+                        .clip(RoundedCornerShape(18.dp))
                         .background(IosTheme.colors.card)
-                        .padding(16.dp),
+                        .padding(horizontal = 20.dp, vertical = 22.dp),
                 ) {
                     // 上半部分: 头像 + 用户名 + 你的社区足迹 + 右侧退出登录胶囊
                     Row(
@@ -186,7 +189,7 @@ fun ProfileScreen(
                     ) {
                         Box(
                             modifier = Modifier
-                                .size(56.dp)
+                                .size(62.dp)
                                 .clip(CircleShape)
                                 .background(Color(0xFFE1F0FF)),
                             contentAlignment = Alignment.Center,
@@ -195,24 +198,24 @@ fun ProfileScreen(
                                 text = (username?.firstOrNull()?.uppercase() ?: "U"),
                                 style = androidx.compose.ui.text.TextStyle(
                                     fontFamily = FontFamily.SansSerif,
-                                    fontSize = 20.sp,
+                                    fontSize = 22.sp,
                                     fontWeight = FontWeight.Bold,
                                 ),
                                 color = IosTheme.colors.accent,
                             )
                         }
-                        Spacer(Modifier.width(14.dp))
+                        Spacer(Modifier.width(16.dp))
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
                                 text = username ?: "尚未确认登录",
                                 style = androidx.compose.ui.text.TextStyle(
                                     fontFamily = FontFamily.SansSerif,
-                                    fontSize = 20.sp,
+                                    fontSize = 21.sp,
                                     fontWeight = FontWeight.Bold,
                                 ),
                                 color = IosTheme.colors.label,
                             )
-                            Spacer(Modifier.height(3.dp))
+                            Spacer(Modifier.height(4.dp))
                             Text(
                                 text = "你的社区足迹",
                                 style = IosTheme.type.footnote,
@@ -225,7 +228,7 @@ fun ProfileScreen(
                                 .clip(RoundedCornerShape(50))
                                 .background(Color(0xFFFFF0F0))
                                 .clickable { showLogoutDialog = true }
-                                .padding(horizontal = 14.dp, vertical = 6.dp),
+                                .padding(horizontal = 15.dp, vertical = 7.dp),
                             contentAlignment = Alignment.Center,
                         ) {
                             Text(
@@ -237,9 +240,9 @@ fun ProfileScreen(
                         }
                     }
 
-                    Spacer(Modifier.height(16.dp))
+                    Spacer(Modifier.height(20.dp))
                     IosDivider()
-                    Spacer(Modifier.height(14.dp))
+                    Spacer(Modifier.height(18.dp))
 
                     // 下半部分: 3 列核心指标 (访问天数、阅读时长、浏览话题)
                     Row(
@@ -255,15 +258,15 @@ fun ProfileScreen(
                                 text = daysVisited,
                                 style = androidx.compose.ui.text.TextStyle(
                                     fontFamily = FontFamily.SansSerif,
-                                    fontSize = 20.sp,
+                                    fontSize = 18.sp,
                                     fontWeight = FontWeight.Bold,
                                 ),
                                 color = IosTheme.colors.label,
                             )
-                            Spacer(Modifier.height(3.dp))
+                            Spacer(Modifier.height(5.dp))
                             Text(
                                 text = "访问天数",
-                                style = IosTheme.type.caption,
+                                style = IosTheme.type.caption.copy(fontSize = 12.sp),
                                 color = IosTheme.colors.secondaryLabel,
                             )
                         }
@@ -271,7 +274,7 @@ fun ProfileScreen(
                         Box(
                             modifier = Modifier
                                 .width(0.5.dp)
-                                .height(26.dp)
+                                .height(32.dp)
                                 .background(IosTheme.colors.separator),
                         )
 
@@ -284,16 +287,16 @@ fun ProfileScreen(
                                 text = timeRead,
                                 style = androidx.compose.ui.text.TextStyle(
                                     fontFamily = FontFamily.SansSerif,
-                                    fontSize = 20.sp,
+                                    fontSize = 18.sp,
                                     fontWeight = FontWeight.Bold,
                                 ),
                                 color = IosTheme.colors.label,
                                 maxLines = 1,
                             )
-                            Spacer(Modifier.height(3.dp))
+                            Spacer(Modifier.height(5.dp))
                             Text(
                                 text = "阅读时长",
-                                style = IosTheme.type.caption,
+                                style = IosTheme.type.caption.copy(fontSize = 12.sp),
                                 color = IosTheme.colors.secondaryLabel,
                             )
                         }
@@ -301,7 +304,7 @@ fun ProfileScreen(
                         Box(
                             modifier = Modifier
                                 .width(0.5.dp)
-                                .height(26.dp)
+                                .height(32.dp)
                                 .background(IosTheme.colors.separator),
                         )
 
@@ -314,15 +317,15 @@ fun ProfileScreen(
                                 text = topicsEntered,
                                 style = androidx.compose.ui.text.TextStyle(
                                     fontFamily = FontFamily.SansSerif,
-                                    fontSize = 20.sp,
+                                    fontSize = 18.sp,
                                     fontWeight = FontWeight.Bold,
                                 ),
                                 color = IosTheme.colors.label,
                             )
-                            Spacer(Modifier.height(3.dp))
+                            Spacer(Modifier.height(5.dp))
                             Text(
                                 text = "浏览话题",
-                                style = IosTheme.type.caption,
+                                style = IosTheme.type.caption.copy(fontSize = 12.sp),
                                 color = IosTheme.colors.secondaryLabel,
                             )
                         }
@@ -335,8 +338,8 @@ fun ProfileScreen(
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 6.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        .padding(horizontal = 16.dp, vertical = 10.dp),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
                 ) {
                     // 1. 我的总结
                     ProfileNavCard(
@@ -361,7 +364,13 @@ fun ProfileScreen(
                         selected = section == ProfileSection.Notifications,
                         hasBadge = unreadFilters.isNotEmpty() || visibleEntries.any { it.unread },
                         modifier = Modifier.weight(1f),
-                        onClick = { section = ProfileSection.Notifications },
+                        onClick = {
+                            if (section == ProfileSection.Notifications) {
+                                onLoad(ProfileSection.Notifications, true, false)
+                            } else {
+                                section = ProfileSection.Notifications
+                            }
+                        },
                     )
                     // 4. 消息中心
                     ProfileNavCard(
@@ -374,14 +383,14 @@ fun ProfileScreen(
                 }
             }
 
-            // ── 当处于“我的总结”时：展示 5 个双列大统计卡片 (已读帖子、收到赞、送出赞、发表话题、回复数量) ──
+            // ── 当处于“我的总结”时：展示 6 个双列大统计卡片 (已读帖子、收到赞、送出赞、回复数量、创建话题、我的收藏) ──
             if (section == ProfileSection.Summary) {
                 item("metric-cards-row1") {
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(horizontal = 16.dp, vertical = 4.dp),
-                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                            .padding(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 7.dp),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
                     ) {
                         ProfileMetricCard(
                             label = "已读帖子",
@@ -401,8 +410,8 @@ fun ProfileScreen(
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(horizontal = 16.dp, vertical = 4.dp),
-                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                            .padding(horizontal = 16.dp, vertical = 7.dp),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
                     ) {
                         ProfileMetricCard(
                             label = "送出赞",
@@ -422,20 +431,26 @@ fun ProfileScreen(
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(horizontal = 16.dp, vertical = 4.dp),
-                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                            .padding(start = 16.dp, end = 16.dp, top = 7.dp, bottom = 12.dp),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
                     ) {
                         ProfileMetricCard(
                             label = "创建话题",
                             value = topicCount,
                             iconType = MetricCardIconType.Rocket,
                             modifier = Modifier.weight(1f),
+                            onClick = {
+                                if (!username.isNullOrBlank()) onOpenUserTopics?.invoke(username, "创建的话题", false)
+                            },
                         )
                         ProfileMetricCard(
                             label = "我的收藏",
                             value = bookmarkCount,
                             iconType = MetricCardIconType.Bookmark,
                             modifier = Modifier.weight(1f),
+                            onClick = {
+                                if (!username.isNullOrBlank()) onOpenUserTopics?.invoke(username, "我的收藏", true)
+                            },
                         )
                     }
                 }
@@ -628,24 +643,42 @@ private fun findMetric(fields: List<Pair<String, String>>, key: String, fallback
 private fun ProfileSettingsGearIcon(tint: Color) {
     Canvas(Modifier.size(22.dp)) {
         scale(size.width / 24f, size.height / 24f, pivot = Offset.Zero) {
-            val center = Offset(12f, 12f)
-            drawCircle(tint, radius = 4.8f, center = center, style = Stroke(2.2f))
-            for (i in 0 until 8) {
-                val angle = (i * 45f) * (kotlin.math.PI / 180f).toFloat()
-                val innerR = 6.2f
-                val outerR = 9.8f
-                val startX = 12f + innerR * kotlin.math.cos(angle)
-                val startY = 12f + innerR * kotlin.math.sin(angle)
-                val endX = 12f + outerR * kotlin.math.cos(angle)
-                val endY = 12f + outerR * kotlin.math.sin(angle)
-                drawLine(
-                    color = tint,
-                    start = Offset(startX, startY),
-                    end = Offset(endX, endY),
-                    strokeWidth = 2.4f,
-                    cap = StrokeCap.Round,
+            val cx = 12f
+            val cy = 12f
+            val r = 9.2f
+            val cornerRatio = 0.22f
+            val vertices = Array(6) { i ->
+                val rad = (i * 60f) * (kotlin.math.PI / 180.0)
+                Offset(
+                    x = cx + (r * kotlin.math.cos(rad)).toFloat(),
+                    y = cy + (r * kotlin.math.sin(rad)).toFloat(),
                 )
             }
+            val hexPath = Path().apply {
+                for (i in 0 until 6) {
+                    val prev = vertices[(i + 5) % 6]
+                    val curr = vertices[i]
+                    val next = vertices[(i + 1) % 6]
+                    val pStart = Offset(
+                        x = curr.x + (prev.x - curr.x) * cornerRatio,
+                        y = curr.y + (prev.y - curr.y) * cornerRatio,
+                    )
+                    val pEnd = Offset(
+                        x = curr.x + (next.x - curr.x) * cornerRatio,
+                        y = curr.y + (next.y - curr.y) * cornerRatio,
+                    )
+                    if (i == 0) moveTo(pStart.x, pStart.y) else lineTo(pStart.x, pStart.y)
+                    quadraticTo(curr.x, curr.y, pEnd.x, pEnd.y)
+                }
+                close()
+            }
+            val stroke = Stroke(
+                width = 1.7f,
+                cap = StrokeCap.Round,
+                join = androidx.compose.ui.graphics.StrokeJoin.Round,
+            )
+            drawPath(hexPath, color = tint, style = stroke)
+            drawCircle(color = tint, radius = 3.0f, center = Offset(cx, cy), style = stroke)
         }
     }
 }
@@ -669,19 +702,19 @@ private fun ProfileNavCard(
 
     Box(
         modifier = modifier
-            .clip(RoundedCornerShape(12.dp))
+            .clip(RoundedCornerShape(14.dp))
             .background(cardBg)
-            .border(if (selected) 1.5.dp else 0.5.dp, borderColor, RoundedCornerShape(12.dp))
+            .border(if (selected) 1.5.dp else 0.5.dp, borderColor, RoundedCornerShape(14.dp))
             .clickable(onClick = onClick)
-            .padding(vertical = 12.dp, horizontal = 4.dp),
+            .padding(vertical = 18.dp, horizontal = 4.dp),
         contentAlignment = Alignment.Center,
     ) {
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center,
         ) {
-            Box(Modifier.size(24.dp), contentAlignment = Alignment.Center) {
-                Canvas(Modifier.size(20.dp)) {
+            Box(Modifier.size(28.dp), contentAlignment = Alignment.Center) {
+                Canvas(Modifier.size(24.dp)) {
                     scale(size.width / 24f, size.height / 24f, pivot = Offset.Zero) {
                         when (icon) {
                             ProfileNavIconType.Summary -> {
@@ -745,10 +778,10 @@ private fun ProfileNavCard(
                     }
                 }
             }
-            Spacer(Modifier.height(6.dp))
+            Spacer(Modifier.height(8.dp))
             Text(
                 text = title,
-                style = IosTheme.type.caption.copy(fontSize = 12.sp),
+                style = IosTheme.type.caption.copy(fontSize = 13.sp),
                 color = contentColor,
                 fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
                 maxLines = 1,
@@ -757,11 +790,11 @@ private fun ProfileNavCard(
         if (hasBadge) {
             Box(
                 Modifier
-                    .size(6.dp)
+                    .size(7.dp)
                     .clip(CircleShape)
                     .background(Color(0xFFFF3B30))
                     .align(Alignment.TopEnd)
-                    .offset(x = (-4).dp, y = (4).dp)
+                    .offset(x = (-5).dp, y = (5).dp)
             )
         }
     }
@@ -777,13 +810,15 @@ private fun ProfileMetricCard(
     value: String,
     iconType: MetricCardIconType,
     modifier: Modifier = Modifier,
+    onClick: (() -> Unit)? = null,
 ) {
     Row(
         modifier = modifier
             .clip(RoundedCornerShape(14.dp))
             .background(IosTheme.colors.card)
             .border(0.5.dp, IosTheme.colors.separator.copy(alpha = 0.4f), RoundedCornerShape(14.dp))
-            .padding(horizontal = 14.dp, vertical = 14.dp),
+            .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
+            .padding(horizontal = 16.dp, vertical = 20.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Canvas(Modifier.size(32.dp)) {
@@ -873,14 +908,14 @@ private fun ProfileMetricCard(
                 }
             }
         }
-        Spacer(Modifier.width(12.dp))
+        Spacer(Modifier.width(14.dp))
         Column {
             Text(
                 text = label,
-                style = IosTheme.type.caption,
+                style = IosTheme.type.caption.copy(fontSize = 12.sp),
                 color = IosTheme.colors.secondaryLabel,
             )
-            Spacer(Modifier.height(3.dp))
+            Spacer(Modifier.height(4.dp))
             Text(
                 text = value,
                 style = androidx.compose.ui.text.TextStyle(
@@ -1222,7 +1257,12 @@ fun SettingsScreen(
         }
     }
 
-    IosLargeTitleScaffold(title = "设置", onBack = onBack) {
+    IosLargeTitleScaffold(
+        title = "设置",
+        onBack = onBack,
+        showLargeTitle = false,
+        backLabel = "",
+    ) {
         // ── 1. 外观 ──
         item("group-appearance") {
             SectionTitle("外观")
@@ -1335,71 +1375,54 @@ fun SettingsScreen(
         item("group-about") {
             SectionTitle("关于与维护")
             IosGroupCard {
-                // 3.1 当前版本
-                IosRow {
-                    SettingIconBadge(bgColor = Color(0xFFF0F0F2)) {
-                        SettingInfoIcon(tint = Color(0xFF8E8E93))
-                    }
-                    Spacer(Modifier.width(12.dp))
-                    Text(
-                        "当前版本",
-                        style = IosTheme.type.body,
-                        fontWeight = FontWeight.SemiBold,
-                        modifier = Modifier.weight(1f),
-                    )
-                    Box(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(6.dp))
-                            .background(IosTheme.colors.fieldBackground)
-                            .padding(horizontal = 8.dp, vertical = 3.dp),
-                    ) {
-                        Text(
-                            "v${updateState.currentVersion}",
-                            style = IosTheme.type.caption.copy(fontSize = 12.sp),
-                            color = IosTheme.colors.secondaryLabel,
-                            fontWeight = FontWeight.Medium,
-                        )
-                    }
-                }
-
-                IosDivider()
-
-                // 3.2 检查新版本
+                // 3.1 版本信息与检查更新 (合并)
                 IosRow(onClick = onCheckUpdate) {
                     SettingIconBadge(bgColor = Color(0xFFE8F3FF)) {
-                        SettingSyncIcon(tint = Color(0xFF007AFF))
+                        SettingInfoIcon(tint = Color(0xFF007AFF))
                     }
                     Spacer(Modifier.width(12.dp))
                     Text(
-                        "检查新版本",
+                        "版本信息",
                         style = IosTheme.type.body,
                         fontWeight = FontWeight.SemiBold,
                         modifier = Modifier.weight(1f),
                     )
                     when {
                         updateState.checking -> IosActivityIndicator(diameter = 18.dp)
-                        updateState.updateInfo != null -> {
+                        else -> {
                             Row(verticalAlignment = Alignment.CenterVertically) {
-                                Box(
-                                    modifier = Modifier
-                                        .size(7.dp)
-                                        .clip(CircleShape)
-                                        .background(Color(0xFFFF3B30)),
-                                )
-                                Spacer(Modifier.width(5.dp))
+                                Box {
+                                    Box(
+                                        modifier = Modifier
+                                            .clip(RoundedCornerShape(6.dp))
+                                            .background(IosTheme.colors.fieldBackground)
+                                            .padding(horizontal = 8.dp, vertical = 3.dp),
+                                    ) {
+                                        Text(
+                                            "v${updateState.currentVersion}",
+                                            style = IosTheme.type.caption.copy(fontSize = 12.sp),
+                                            color = IosTheme.colors.secondaryLabel,
+                                            fontWeight = FontWeight.Medium,
+                                        )
+                                    }
+                                    if (updateState.updateInfo != null) {
+                                        Box(
+                                            modifier = Modifier
+                                                .size(8.dp)
+                                                .align(Alignment.TopEnd)
+                                                .offset(x = 3.dp, y = (-3).dp)
+                                                .clip(CircleShape)
+                                                .background(Color(0xFFFF3B30)),
+                                        )
+                                    }
+                                }
+                                Spacer(Modifier.width(6.dp))
                                 Text(
-                                    "有可用更新 ›",
+                                    if (updateState.updateInfo != null) "可更新 ›" else "已是最新 ›",
                                     style = IosTheme.type.subheadline,
-                                    color = IosTheme.colors.accent,
+                                    color = if (updateState.updateInfo != null) Color(0xFFFF3B30) else IosTheme.colors.secondaryLabel,
                                 )
                             }
-                        }
-                        else -> {
-                            Text(
-                                "已是最新 ›",
-                                style = IosTheme.type.subheadline,
-                                color = IosTheme.colors.secondaryLabel,
-                            )
                         }
                     }
                 }

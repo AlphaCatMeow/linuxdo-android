@@ -66,17 +66,22 @@ fun IosLargeTitleScaffold(
     listState: LazyListState = rememberLazyListState(),
     onBack: (() -> Unit)? = null,
     compactTop: Boolean = false,
+    showLargeTitle: Boolean = true,
+    backLabel: String = "返回",
     scrollToTopRequest: Int = 0,
     trailing: @Composable () -> Unit = {},
     customLargeTitle: (@Composable () -> Unit)? = null,
+    customCollapsedTitle: (@Composable () -> Unit)? = null,
     content: LazyListScope.() -> Unit,
 ) {
     ScrollToTopOnRequest(listState, scrollToTopRequest)
     val density = LocalDensity.current
-    val largeTitlePx = remember(density) { with(density) { IosMetrics.largeTitleHeight.toPx() } }
-    val collapse by remember {
+    val titleBoxHeight = if (compactTop) IosMetrics.largeTitleHeight else 34.dp
+    val largeTitlePx = remember(density, titleBoxHeight) { with(density) { titleBoxHeight.toPx() } }
+    val collapse by remember(listState, largeTitlePx, showLargeTitle) {
         derivedStateOf {
-            if (listState.firstVisibleItemIndex > 0) 1f
+            if (!showLargeTitle) 1f
+            else if (listState.firstVisibleItemIndex > 0) 1f
             else (listState.firstVisibleItemScrollOffset / largeTitlePx).coerceIn(0f, 1f)
         }
     }
@@ -87,27 +92,29 @@ fun IosLargeTitleScaffold(
             modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(top = if (compactTop) 0.dp else IosMetrics.navBarHeight),
         ) {
-            item(key = "ios-large-title") {
-                Box(
-                    Modifier
-                        .fillMaxWidth()
-                        .height(IosMetrics.largeTitleHeight)
-                        .padding(horizontal = IosMetrics.screenPadding),
-                    contentAlignment = Alignment.BottomStart,
-                ) {
-                    if (customLargeTitle != null) {
-                        customLargeTitle()
-                    } else {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text(
-                                text = title,
-                                style = IosTheme.type.largeTitle,
-                                color = IosTheme.colors.label,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                modifier = Modifier.weight(1f).padding(bottom = 6.dp),
-                            )
-                            if (compactTop) trailing()
+            if (showLargeTitle) {
+                item(key = "ios-large-title") {
+                    Box(
+                        Modifier
+                            .fillMaxWidth()
+                            .height(titleBoxHeight)
+                            .padding(horizontal = IosMetrics.screenPadding),
+                        contentAlignment = Alignment.BottomStart,
+                    ) {
+                        if (customLargeTitle != null) {
+                            customLargeTitle()
+                        } else {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(
+                                    text = title,
+                                    style = IosTheme.type.largeTitle,
+                                    color = IosTheme.colors.label,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.weight(1f).padding(bottom = 6.dp),
+                                )
+                                if (compactTop) trailing()
+                            }
                         }
                     }
                 }
@@ -115,19 +122,21 @@ fun IosLargeTitleScaffold(
             content()
         }
 
-        if (!compactTop || collapse > 0.01f) IosNavBar(
+        if (!compactTop || collapse > 0.01f || !showLargeTitle) IosNavBar(
             title = title,
-            titleAlpha = collapse,
-            showDivider = collapse > 0.01f,
+            titleAlpha = if (!showLargeTitle) 1f else collapse,
+            showDivider = if (!showLargeTitle) true else collapse > 0.01f,
+            backLabel = backLabel,
             // 顶部时与大标题区同色、看起来融为一体,折叠后过渡成实色条。
             // 不能用半透明近似毛玻璃:Compose 没有模糊,透出的是清晰可读的文字,很脏。
-            background = lerp(
+            background = if (!showLargeTitle) IosTheme.colors.card else lerp(
                 IosTheme.colors.groupedBackground,
                 IosTheme.colors.card,
                 collapse,
             ),
             onBack = onBack,
             trailing = trailing,
+            customTitle = customCollapsedTitle,
             modifier = Modifier.align(Alignment.TopStart),
         )
     }
@@ -147,6 +156,7 @@ fun IosNavBar(
     background: Color = IosTheme.colors.card,
     onBack: (() -> Unit)? = null,
     trailing: @Composable () -> Unit = {},
+    customTitle: (@Composable () -> Unit)? = null,
 ) {
     Column(modifier.fillMaxWidth().background(background)) {
         Box(
@@ -156,34 +166,55 @@ fun IosNavBar(
                 .padding(horizontal = 8.dp),
             contentAlignment = Alignment.Center,
         ) {
-            Text(
-                text = title,
-                style = IosTheme.type.subheadline.copy(fontWeight = FontWeight.SemiBold),
-                color = IosTheme.colors.label,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                textAlign = TextAlign.Center,
-                modifier = Modifier
-                    .alpha(titleAlpha)
-                    .padding(start = if (onBack != null) 72.dp else 56.dp, end = 56.dp),
-            )
+            if (customTitle != null) {
+                Box(
+                    Modifier
+                        .fillMaxWidth()
+                        .alpha(titleAlpha)
+                        .padding(
+                            start = if (onBack != null) (if (backLabel.isBlank()) 56.dp else 72.dp) else 8.dp,
+                            end = if (onBack != null) 56.dp else 48.dp,
+                        ),
+                    contentAlignment = if (onBack != null) Alignment.Center else Alignment.CenterStart,
+                ) {
+                    customTitle()
+                }
+            } else {
+                Text(
+                    text = title,
+                    style = IosTheme.type.subheadline.copy(fontWeight = FontWeight.SemiBold),
+                    color = IosTheme.colors.label,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier
+                        .alpha(titleAlpha)
+                        .padding(start = if (onBack != null) (if (backLabel.isBlank()) 56.dp else 72.dp) else 56.dp, end = 56.dp),
+                )
+            }
             if (onBack != null) {
-                Row(
+                Box(
                     Modifier
                         .align(Alignment.CenterStart)
-                        .clickable(onClick = onBack)
                         .heightIn(min = IosMetrics.navBarHeight)
+                        .clickable(onClick = onBack)
                         .padding(horizontal = 8.dp, vertical = 10.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    contentAlignment = Alignment.CenterStart,
                 ) {
-                    IosBackChevron()
-                    Text(
-                        text = backLabel,
-                        style = IosTheme.type.subheadline,
-                        color = IosTheme.colors.accent,
-                        maxLines = 1,
-                    )
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        IosBackChevron()
+                        if (backLabel.isNotBlank()) {
+                            Text(
+                                text = backLabel,
+                                style = IosTheme.type.subheadline,
+                                color = IosTheme.colors.accent,
+                                maxLines = 1,
+                            )
+                        }
+                    }
                 }
             }
             Box(Modifier.align(Alignment.CenterEnd)) { trailing() }

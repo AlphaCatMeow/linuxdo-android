@@ -17,9 +17,12 @@ import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.systemBarsPadding
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -28,6 +31,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.saveable.rememberSaveableStateHolder
@@ -48,6 +52,7 @@ import androidx.lifecycle.repeatOnLifecycle
 import kotlinx.coroutines.delay
 import org.linuxdo.android.net.BrowserSession
 import org.linuxdo.android.Config
+import org.linuxdo.android.data.compactCategoryGroups
 import org.linuxdo.android.ui.design.IosActivityIndicator
 import org.linuxdo.android.ui.design.IosMetrics
 import org.linuxdo.android.ui.design.IosTheme
@@ -60,6 +65,7 @@ import org.linuxdo.android.ui.screen.CategoryListScreen
 import org.linuxdo.android.ui.screen.SearchScreen
 import org.linuxdo.android.ui.screen.TopicListUiState
 import org.linuxdo.android.ui.screen.LoginScreen
+import org.linuxdo.android.ui.screen.categoryLevelOf
 import org.linuxdo.android.ui.nav.MainTab
 import org.linuxdo.android.ui.nav.TabBar
 
@@ -290,6 +296,7 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
     val details by viewModel.details.collectAsStateWithLifecycle()
     val categories by viewModel.categories.collectAsStateWithLifecycle()
     val categoryTopics by viewModel.categoryTopics.collectAsStateWithLifecycle()
+    val userTopicStates by viewModel.userTopicStates.collectAsStateWithLifecycle()
     val search by viewModel.search.collectAsStateWithLifecycle()
     val profile by viewModel.profile.collectAsStateWithLifecycle()
     val notificationFilter by viewModel.notificationFilter.collectAsStateWithLifecycle()
@@ -299,6 +306,7 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
     val themeMode by viewModel.themeMode.collectAsStateWithLifecycle()
     val updateState by viewModel.updateState.collectAsStateWithLifecycle()
     val browsing = state.screen == Screen.List
+    var detailOverlay by rememberSaveable { mutableStateOf(false) }
     val openNotifications = {
         if (stack.current != Route.Notifications) stack.push(Route.Notifications)
         viewModel.loadProfile(org.linuxdo.android.data.ProfileSection.Notifications, refresh = true)
@@ -315,7 +323,11 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                             if (active) when (route) {
                                 is Route.TopicDetail -> viewModel.loadTopic(route.topicId, postNumber = route.postNumber)
                                 Route.CategoryList -> viewModel.loadCategories()
-                                is Route.CategoryTopics -> viewModel.loadCategory(route.categoryId, route.slug)
+                                is Route.CategoryTopics -> {
+                                    if (!categories.loaded && !categories.loading) viewModel.loadCategories()
+                                    viewModel.loadCategory(route.categoryId, route.slug)
+                                }
+                                is Route.UserTopics -> viewModel.loadUserTopics(route.username, route.isBookmark)
                                 else -> Unit
                             }
                         }
@@ -381,6 +393,7 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                     trailing = { UnreadBell(state.unreadCount, openNotifications) },
                                     onToggleOrder = { viewModel.toggleCommentOrder(route.topicId) },
                                     onPostsVisible = { viewModel.onPostsVisible(route.topicId, it) },
+                                    onOverlayActive = { detailOverlay = it },
                                 )
                             }
                             Route.CategoryList -> CategoryListScreen(categories,
@@ -389,13 +402,37 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                 scrollToTopRequest = scrollToTopRequest,
                                 trailing = { UnreadBell(state.unreadCount, openNotifications) })
 
-                            is Route.CategoryTopics -> TopicListScreen(route.name,
-                                state = categoryTopics[route.categoryId] ?: TopicListUiState(),
-                                onRefresh = { viewModel.loadCategory(route.categoryId, route.slug, refresh = true) },
-                                onLoadMore = { viewModel.loadCategory(route.categoryId, route.slug, more = true) },
-                                onOpenTopic = { stack.push(Route.TopicDetail(it.id, it.title)) },
-                                onBack = { stack.pop() }, active = active,
-                                trailing = { UnreadBell(state.unreadCount, openNotifications) })
+                            is Route.CategoryTopics -> {
+                                val variants = remember(categories.items, route.categoryId) {
+                                    val group = compactCategoryGroups(categories.items).firstOrNull { (parent, levels) ->
+                                        levels.isNotEmpty() && (parent.id == route.categoryId || levels.any { it.id == route.categoryId })
+                                    }
+                                    if (group != null) {
+                                        (listOf(group.first) + group.second.sortedBy { categoryLevelOf(it) })
+                                            .filter { categoryLevelOf(it) in 0..3 }
+                                    } else {
+                                        emptyList()
+                                    }
+                                }
+                                TopicListScreen(
+                                    title = route.name,
+                                    state = categoryTopics[route.categoryId] ?: TopicListUiState(),
+                                    onRefresh = { viewModel.loadCategory(route.categoryId, route.slug, refresh = true) },
+                                    onLoadMore = { viewModel.loadCategory(route.categoryId, route.slug, more = true) },
+                                    onOpenTopic = { stack.push(Route.TopicDetail(it.id, it.title)) },
+                                    onBack = { stack.pop() },
+                                    active = active,
+                                    trailing = { UnreadBell(state.unreadCount, openNotifications) },
+                                    categoryVariants = variants,
+                                    currentCategoryId = route.categoryId,
+                                    onSelectCategoryVariant = { target ->
+                                        if (target.id != route.categoryId) {
+                                            stack.replaceCurrent(Route.CategoryTopics(target.id, target.slug, target.name))
+                                            viewModel.loadCategory(target.id, target.slug)
+                                        }
+                                    },
+                                )
+                            }
 
                             Route.Search -> SearchScreen(search, viewModel::updateSearch, viewModel::loadMoreSearch,
                                 onOpenTopic = { stack.push(Route.TopicDetail(it.id, it.title)) },
@@ -405,6 +442,9 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
 
                             Route.Profile -> ProfileScreen(state.username, profile, viewModel::loadProfile,
                                 onOpenTopic = { id, title, postNumber -> stack.push(Route.TopicDetail(id, title, postNumber)) },
+                                onOpenUserTopics = { username, title, isBookmark ->
+                                    stack.push(Route.UserTopics(username, title, isBookmark))
+                                },
                                 onDiagnostics = { stack.push(Route.Diagnostics) },
                                 onSettings = { stack.push(Route.Settings) },
                                 onLogout = viewModel::logout,
@@ -415,6 +455,20 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                 unreadFilters = state.unreadFilters,
                                 scrollToTopRequest = scrollToTopRequest,
                                 trailing = { UnreadBell(state.unreadCount, openNotifications) })
+
+                            is Route.UserTopics -> {
+                                val key = "${if (route.isBookmark) "bookmark" else "created"}:${route.username}"
+                                TopicListScreen(
+                                    title = route.title,
+                                    state = userTopicStates[key] ?: TopicListUiState(),
+                                    onRefresh = { viewModel.loadUserTopics(route.username, route.isBookmark, refresh = true) },
+                                    onLoadMore = { viewModel.loadUserTopics(route.username, route.isBookmark, more = true) },
+                                    onOpenTopic = { stack.push(Route.TopicDetail(it.id, it.title)) },
+                                    onBack = { stack.pop() },
+                                    active = active,
+                                    trailing = { UnreadBell(state.unreadCount, openNotifications) },
+                                )
+                            }
 
 
                             Route.Settings -> SettingsScreen(
@@ -452,12 +506,15 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                 }
             }
         }
-        TabBar(selected, homeFeedLabel = state.homeFeed.label) { tab ->
-            if (browsing) {
-                if (tab == selected) {
-                    stacks.getValue(tab).popToRoot()
-                    scrollRequests.getValue(tab).intValue++
-                } else selected = tab
+        val isKeyboardOpen = WindowInsets.ime.getBottom(LocalDensity.current) > 0
+        if (!composer.open && !detailOverlay && !isKeyboardOpen) {
+            TabBar(selected, homeFeedLabel = state.homeFeed.label) { tab ->
+                if (browsing) {
+                    if (tab == selected) {
+                        stacks.getValue(tab).popToRoot()
+                        scrollRequests.getValue(tab).intValue++
+                    } else selected = tab
+                }
             }
         }
     }

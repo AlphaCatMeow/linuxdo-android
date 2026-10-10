@@ -202,32 +202,6 @@ fun SearchScreen(
                     color = IosTheme.colors.accent,
                 )
             }
-            // 辅助筛选胶囊：时间、热度、分类、包含多等
-            listOf("时间", "热度", "分类", "包含多...").forEach { filterLabel ->
-                Row(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(50))
-                        .background(IosTheme.colors.fieldBackground)
-                        .clickable {
-                            focusManager.clearFocus()
-                            showSort = true
-                        }
-                        .padding(horizontal = 12.dp, vertical = 6.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(4.dp),
-                ) {
-                    Text(
-                        text = filterLabel,
-                        style = IosTheme.type.footnote,
-                        color = IosTheme.colors.secondaryLabel,
-                    )
-                    Text(
-                        text = "⌄",
-                        style = IosTheme.type.footnote,
-                        color = IosTheme.colors.tertiaryLabel,
-                    )
-                }
-            }
         }
 
         Spacer(Modifier.height(4.dp))

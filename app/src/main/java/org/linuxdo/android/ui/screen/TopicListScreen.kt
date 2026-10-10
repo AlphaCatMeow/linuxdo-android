@@ -20,6 +20,7 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Text
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
@@ -28,7 +29,9 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -101,15 +104,20 @@ fun TopicListScreen(
     currentFeed: HomeFeedType? = null,
     onFeedSelect: ((HomeFeedType) -> Unit)? = null,
     hasUnread: Boolean = false,
+    categoryVariants: List<Category> = emptyList(),
+    currentCategoryId: Int? = null,
+    onSelectCategoryVariant: ((Category) -> Unit)? = null,
 ) {
     val feedListStates = remember { mutableMapOf<HomeFeedType, LazyListState>() }
+    val categoryListStates = remember { mutableMapOf<Int, LazyListState>() }
     val defaultListState = rememberLazyListState()
-    val listState = if (currentFeed != null) {
-        feedListStates.getOrPut(currentFeed) { LazyListState() }
-    } else {
-        defaultListState
+    val listState = when {
+        currentFeed != null -> feedListStates.getOrPut(currentFeed) { LazyListState() }
+        currentCategoryId != null -> categoryListStates.getOrPut(currentCategoryId) { LazyListState() }
+        else -> defaultListState
     }
     val pullState = rememberPullToRefreshState()
+    val hasCategoryDropdown = categoryVariants.size > 1 && onSelectCategoryVariant != null
 
     // 距底部还有 4 项时就开始取下一页,滚到底时数据通常已经就位。
     // 必须要求列表已有真实数据:空列表时占位项也会让 lastVisible 命中阈值,
@@ -157,16 +165,51 @@ fun TopicListScreen(
             compactTop = onBack == null,
             scrollToTopRequest = scrollToTopRequest,
             trailing = trailing,
-            customLargeTitle = if (currentFeed != null && onFeedSelect != null) {
-                {
-                    HomeFeedTitleBar(
-                        currentFeed = currentFeed,
-                        onFeedSelect = onFeedSelect,
-                        hasUnread = hasUnread,
-                        trailing = trailing,
-                    )
+            customLargeTitle = when {
+                currentFeed != null && onFeedSelect != null -> {
+                    {
+                        HomeFeedTitleBar(
+                            currentFeed = currentFeed,
+                            onFeedSelect = onFeedSelect,
+                            trailing = trailing,
+                        )
+                    }
                 }
-            } else null,
+                hasCategoryDropdown -> {
+                    {
+                        CategoryVariantSelector(
+                            title = title,
+                            variants = categoryVariants,
+                            currentCategoryId = currentCategoryId,
+                            collapsed = false,
+                            onSelect = { onSelectCategoryVariant?.invoke(it) },
+                        )
+                    }
+                }
+                else -> null
+            },
+            customCollapsedTitle = when {
+                currentFeed != null && onFeedSelect != null -> {
+                    {
+                        HomeFeedCollapsedBar(
+                            currentFeed = currentFeed,
+                            onFeedSelect = onFeedSelect,
+                        )
+                    }
+                }
+                hasCategoryDropdown -> {
+                    {
+                        CategoryVariantSelector(
+                            title = title,
+                            variants = categoryVariants,
+                            currentCategoryId = currentCategoryId,
+                            collapsed = true,
+                            onSelect = { onSelectCategoryVariant?.invoke(it) },
+                        )
+                    }
+                }
+                else -> null
+            },
         ) {
             state.error?.let { message ->
                 item(key = "error") { ErrorNotice(message, onRefresh) }
@@ -180,7 +223,7 @@ fun TopicListScreen(
 
             itemsIndexed(
                 items = state.items,
-                key = { index, item -> "${currentFeed?.name ?: "topic"}_${item.topic.id}_$index" },
+                key = { index, item -> "${currentFeed?.name ?: currentCategoryId ?: "topic"}_${item.topic.id}_$index" },
             ) { index, item ->
                 Column(Modifier.background(IosTheme.colors.card)) {
                     TopicRow(item) { onOpenTopic(item.topic) }
@@ -616,7 +659,6 @@ fun parseCategoryColor(hex: String?): Color? {
 private fun HomeFeedTitleBar(
     currentFeed: HomeFeedType,
     onFeedSelect: (HomeFeedType) -> Unit,
-    hasUnread: Boolean,
     trailing: @Composable () -> Unit,
 ) {
     Row(
@@ -642,23 +684,12 @@ private fun HomeFeedTitleBar(
                         .clickable { onFeedSelect(feed) }
                         .padding(horizontal = 2.dp, vertical = 2.dp),
                 ) {
-                    Box(contentAlignment = Alignment.TopEnd) {
-                        Text(
-                            text = feed.label,
-                            fontSize = if (selected) 21.sp else 16.sp,
-                            fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
-                            color = if (selected) IosTheme.colors.label else IosTheme.colors.secondaryLabel,
-                        )
-                        if (feed == HomeFeedType.Unread && hasUnread) {
-                            Box(
-                                modifier = Modifier
-                                    .offset(x = 6.dp, y = 1.dp)
-                                    .size(7.dp)
-                                    .clip(CircleShape)
-                                    .background(Color(0xFFFF3B30)),
-                            )
-                        }
-                    }
+                    Text(
+                        text = feed.label,
+                        fontSize = if (selected) 21.sp else 16.sp,
+                        fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+                        color = if (selected) IosTheme.colors.label else IosTheme.colors.secondaryLabel,
+                    )
                     Spacer(Modifier.height(4.dp))
                     if (selected) {
                         Box(
@@ -677,3 +708,244 @@ private fun HomeFeedTitleBar(
         trailing()
     }
 }
+
+@Composable
+private fun HomeFeedCollapsedBar(
+    currentFeed: HomeFeedType,
+    onFeedSelect: (HomeFeedType) -> Unit,
+) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(18.dp),
+    ) {
+        HomeFeedType.entries.forEach { feed ->
+            val selected = feed == currentFeed
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(6.dp))
+                    .clickable { onFeedSelect(feed) }
+                    .padding(horizontal = 2.dp, vertical = 2.dp),
+            ) {
+                Text(
+                    text = feed.label,
+                    fontSize = if (selected) 16.sp else 14.sp,
+                    fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+                    color = if (selected) IosTheme.colors.label else IosTheme.colors.secondaryLabel,
+                )
+                Spacer(Modifier.height(2.dp))
+                if (selected) {
+                    Box(
+                        modifier = Modifier
+                            .width(16.dp)
+                            .height(2.5.dp)
+                            .clip(RoundedCornerShape(1.25.dp))
+                            .background(IosTheme.colors.accent),
+                    )
+                } else {
+                    Spacer(Modifier.height(2.5.dp))
+                }
+            }
+        }
+    }
+}
+
+private val CATEGORY_LEVEL_REGEX = Regex("[,，\\s]*Lv\\s*(\\d+)\\s*$", RegexOption.IGNORE_CASE)
+
+internal fun categoryLevelOf(category: Category): Int =
+    CATEGORY_LEVEL_REGEX.find(category.name)?.groupValues?.getOrNull(1)?.toIntOrNull()?.coerceIn(0, 3) ?: 0
+
+internal fun categoryBaseNameOf(name: String): String =
+    name.replace(CATEGORY_LEVEL_REGEX, "").trim().ifBlank { name }
+
+@Composable
+private fun CategoryVariantSelector(
+    title: String,
+    variants: List<Category>,
+    currentCategoryId: Int?,
+    collapsed: Boolean,
+    onSelect: (Category) -> Unit,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    val currentCategory = variants.firstOrNull { it.id == currentCategoryId }
+    val currentLevel = currentCategory?.let(::categoryLevelOf)
+        ?: CATEGORY_LEVEL_REGEX.find(title)?.groupValues?.getOrNull(1)?.toIntOrNull()?.coerceIn(0, 3)
+        ?: 0
+    val baseTitle = categoryBaseNameOf(currentCategory?.name ?: title)
+    val isDark = IosTheme.colors.isDark
+
+    val (pillBg, pillBorder, pillText) = levelPillColors(currentLevel, isDark)
+
+    Box {
+        Row(
+            modifier = Modifier
+                .clip(RoundedCornerShape(8.dp))
+                .clickable { expanded = true }
+                .padding(
+                    bottom = if (collapsed) 0.dp else 6.dp,
+                    end = 4.dp,
+                ),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text(
+                text = baseTitle,
+                style = if (collapsed) {
+                    IosTheme.type.subheadline.copy(fontWeight = FontWeight.SemiBold)
+                } else {
+                    IosTheme.type.largeTitle
+                },
+                color = IosTheme.colors.label,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Row(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(6.dp))
+                    .background(pillBg)
+                    .border(0.8.dp, pillBorder, RoundedCornerShape(6.dp))
+                    .padding(
+                        horizontal = if (collapsed) 6.dp else 8.dp,
+                        vertical = if (collapsed) 2.dp else 3.5.dp,
+                    ),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                Text(
+                    text = "Lv.$currentLevel",
+                    style = IosTheme.type.caption.copy(
+                        fontSize = if (collapsed) 11.sp else 12.sp,
+                        fontWeight = FontWeight.Bold,
+                    ),
+                    color = pillText,
+                )
+                DropdownChevronGlyph(
+                    color = pillText,
+                    expanded = expanded,
+                    size = if (collapsed) 9.dp else 10.dp,
+                )
+            }
+        }
+
+        DropdownMenu(
+            expanded = expanded,
+            onDismissRequest = { expanded = false },
+            containerColor = IosTheme.colors.card,
+            shape = RoundedCornerShape(14.dp),
+        ) {
+            variants.forEachIndexed { idx, variant ->
+                val level = categoryLevelOf(variant)
+                val selected = variant.id == currentCategoryId
+                val (itemBg, itemBorder, itemText) = levelPillColors(level, isDark)
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable {
+                            expanded = false
+                            onSelect(variant)
+                        }
+                        .background(
+                            if (selected) IosTheme.colors.accent.copy(alpha = 0.08f) else Color.Transparent,
+                        )
+                        .padding(horizontal = 14.dp, vertical = 11.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Box(
+                        Modifier
+                            .size(8.dp)
+                            .clip(RoundedCornerShape(2.dp))
+                            .background(parseCategoryColor(variant.color) ?: IosTheme.colors.tertiaryLabel),
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        text = categoryBaseNameOf(variant.name),
+                        style = IosTheme.type.subheadline,
+                        fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+                        color = if (selected) IosTheme.colors.accent else IosTheme.colors.label,
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(5.dp))
+                            .background(itemBg)
+                            .border(0.7.dp, itemBorder, RoundedCornerShape(5.dp))
+                            .padding(horizontal = 6.dp, vertical = 1.5.dp),
+                    ) {
+                        Text(
+                            text = "Lv.$level",
+                            style = IosTheme.type.caption.copy(fontSize = 11.sp, fontWeight = FontWeight.Bold),
+                            color = itemText,
+                        )
+                    }
+                    Spacer(Modifier.weight(1f))
+                    Spacer(Modifier.width(14.dp))
+                    if (selected) {
+                        Text(
+                            text = "✓",
+                            style = IosTheme.type.subheadline,
+                            fontWeight = FontWeight.Bold,
+                            color = IosTheme.colors.accent,
+                        )
+                    } else if (variant.topicCount > 0) {
+                        Text(
+                            text = "${variant.topicCount}",
+                            style = IosTheme.type.caption,
+                            color = IosTheme.colors.tertiaryLabel,
+                        )
+                    }
+                }
+                if (idx < variants.lastIndex) {
+                    IosDivider(startIndent = 14.dp)
+                }
+            }
+        }
+    }
+}
+
+private fun levelPillColors(level: Int, isDark: Boolean): Triple<Color, Color, Color> = when (level) {
+    0 -> if (isDark) {
+        Triple(Color(0xFF25282E), Color(0xFF3E434D), Color(0xFFD5D8E0))
+    } else {
+        Triple(Color(0xFFF0F2F6), Color(0xFFD5DAE3), Color(0xFF4A5160))
+    }
+    1 -> if (isDark) {
+        Triple(Color(0xFF152942), Color(0xFF2B548C), Color(0xFF6EAEFF))
+    } else {
+        Triple(Color(0xFFEAF3FF), Color(0xFFBBD7FF), Color(0xFF155FD0))
+    }
+    2 -> if (isDark) {
+        Triple(Color(0xFF36250B), Color(0xFF8F651A), Color(0xFFFFD166))
+    } else {
+        Triple(Color(0xFFFFF4D9), Color(0xFFEFC163), Color(0xFF824B05))
+    }
+    else -> Triple(Color(0xFF4A3410), Color(0xFFD4AF37), Color(0xFFFFE28A))
+}
+
+@Composable
+private fun DropdownChevronGlyph(
+    color: Color,
+    expanded: Boolean,
+    size: Dp,
+) {
+    Canvas(Modifier.size(size)) {
+        val w = this.size.width
+        val h = this.size.height
+        val path = Path().apply {
+            if (expanded) {
+                moveTo(w * 0.18f, h * 0.68f)
+                lineTo(w * 0.5f, h * 0.32f)
+                lineTo(w * 0.82f, h * 0.68f)
+            } else {
+                moveTo(w * 0.18f, h * 0.34f)
+                lineTo(w * 0.5f, h * 0.70f)
+                lineTo(w * 0.82f, h * 0.34f)
+            }
+        }
+        drawPath(
+            path = path,
+            color = color,
+            style = Stroke(width = w * 0.2f, cap = StrokeCap.Round),
+        )
+    }
+}
+

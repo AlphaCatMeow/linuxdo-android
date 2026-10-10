@@ -17,6 +17,7 @@ sealed interface Route : Serializable {
     data object Diagnostics : Route
     data object Settings : Route
     data object Notifications : Route
+    data class UserTopics(val username: String, val title: String, val isBookmark: Boolean = false) : Route
 }
 
 /**
@@ -51,6 +52,14 @@ class NavStack(root: Route) {
 
     fun popToRoot() {
         if (canPop) entries = entries.take(1)
+    }
+
+    fun replaceCurrent(route: Route) {
+        entries = if (entries.isEmpty()) {
+            listOf(NavEntry(nextId++, route))
+        } else {
+            entries.dropLast(1) + entries.last().copy(route = route)
+        }
     }
 
     companion object {

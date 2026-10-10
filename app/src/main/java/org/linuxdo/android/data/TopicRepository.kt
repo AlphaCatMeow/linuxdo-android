@@ -122,14 +122,164 @@ class TopicRepository(
         return result.toMap().also { emojiCache = it }
     }
 
-    suspend fun fetchFeed(feed: HomeFeedType, page: Int, awaitCategories: Boolean = true): TopicPage =
-        toPage(json.decodeFromString(request("${feed.apiPath}?page=$page", burst = page == 0)), awaitCategories)
+    private var unreadFeedCursorPage = 0
+    private var unreadHasMorePages = true
+    private var newHasMorePages = true
+
+    suspend fun fetchFeed(feed: HomeFeedType, page: Int, awaitCategories: Boolean = true): TopicPage {
+        if (feed == HomeFeedType.Unread) {
+            return fetchUnreadAndNewMerged(page, awaitCategories)
+        }
+        return toPage(json.decodeFromString(request("${feed.apiPath}?page=$page", burst = page == 0)), awaitCategories)
+    }
+
+    /**
+     * 首页「未读」合并拉取 `/unread.json`（跟踪且有新回复的话题）与 `/new.json`（未点开过的新话题），
+     * 并结合本地 [ReadingStore] 排除已在 APP 内读到最新楼层的话题（兼容未开启阅读进度同步的纯净模式）。
+     */
+    private suspend fun fetchUnreadAndNewMerged(page: Int, awaitCategories: Boolean): TopicPage {
+        if (page == 0) {
+            unreadFeedCursorPage = 0
+            unreadHasMorePages = true
+            newHasMorePages = true
+        }
+        val accumulated = mutableListOf<TopicListItem>()
+        var attempts = 0
+        while (attempts < 2 && (unreadHasMorePages || newHasMorePages)) {
+            val cursor = unreadFeedCursorPage++
+            attempts++
+            val unreadResp = if (unreadHasMorePages) {
+                try {
+                    json.decodeFromString<TopicListResponse>(request("/unread.json?page=$cursor", burst = cursor == 0))
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: NeedsInteractiveVerification) {
+                    throw e
+                } catch (e: Exception) {
+                    if (!newHasMorePages && attempts == 1) throw e
+                    diagnostics.log("拉取 /unread.json?page=$cursor 失败，降级使用 /new.json: ${e.message}")
+                    unreadHasMorePages = false
+                    null
+                }
+            } else null
+
+            val newResp = if (newHasMorePages) {
+                try {
+                    json.decodeFromString<TopicListResponse>(request("/new.json?page=$cursor", burst = true))
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: NeedsInteractiveVerification) {
+                    throw e
+                } catch (e: Exception) {
+                    if (unreadResp == null && attempts == 1) throw e
+                    diagnostics.log("拉取 /new.json?page=$cursor 失败，仅使用 /unread.json: ${e.message}")
+                    newHasMorePages = false
+                    null
+                }
+            } else null
+
+            unreadHasMorePages = unreadResp?.topicList?.moreTopicsUrl != null
+            newHasMorePages = newResp?.topicList?.moreTopicsUrl != null
+
+            val mergedTopics = (unreadResp?.topicList?.topics.orEmpty() + newResp?.topicList?.topics.orEmpty())
+                .distinctBy { it.id }
+                .sortedByDescending { it.bumpedAt ?: it.lastPostedAt ?: it.createdAt.orEmpty() }
+            val mergedUsers = (unreadResp?.users.orEmpty() + newResp?.users.orEmpty())
+                .distinctBy { it.id }
+            val mergedMoreUrl = unreadResp?.topicList?.moreTopicsUrl ?: newResp?.topicList?.moreTopicsUrl
+
+            val pageResult = toPage(
+                response = TopicListResponse(
+                    topicList = TopicListPayload(topics = mergedTopics, moreTopicsUrl = mergedMoreUrl),
+                    users = mergedUsers,
+                ),
+                awaitCategories = awaitCategories,
+                excludeReadUnread = true,
+            )
+            accumulated.addAll(pageResult.items)
+            // 若当前页被本地已读过滤后剩余过少且服务端仍有下一页，自动顺延补拉一页避免首屏空列表
+            if (accumulated.distinctBy { it.topic.id }.size >= 10) break
+        }
+        return TopicPage(
+            items = accumulated.distinctBy { it.topic.id },
+            hasMore = unreadHasMorePages || newHasMorePages,
+        )
+    }
 
     suspend fun fetchLatest(page: Int, awaitCategories: Boolean = true): TopicPage =
         fetchFeed(HomeFeedType.Latest, page, awaitCategories)
 
     suspend fun fetchCategoryTopics(slug: String, categoryId: Int, page: Int): TopicPage =
         toPage(json.decodeFromString(request("/c/${encode(slug.ifBlank { "category" })}/$categoryId.json?page=$page", burst = page == 0)), awaitCategories = false)
+
+    suspend fun fetchUserCreatedTopics(username: String, page: Int): TopicPage =
+        toPage(json.decodeFromString(request("/topics/created-by/${encode(username)}.json?page=$page", burst = page == 0)), awaitCategories = false)
+
+    suspend fun fetchUserBookmarks(username: String, page: Int): TopicPage {
+        val userPath = encode(username)
+        val pageQuery = if (page > 0) "&page=$page" else ""
+        val root = objectRequest("/u/$userPath/bookmarks.json?q=&acting_username=$pageQuery", burst = page == 0)
+        val listObj = root["user_bookmark_list"] as? JsonObject
+        val bookmarks = listObj?.objects("bookmarks") ?: root.objects("bookmarks")
+        val moreUrl = listObj?.text("more_bookmarks_url").orEmpty().ifBlank { root.text("more_bookmarks_url") }
+        val known = categoryCache ?: categories()
+        val urlTopicRegex = Regex("/t/(?:[^/]+/)?(\\d+)")
+
+        val items = bookmarks.mapNotNull { bm ->
+            val topicId = bm.number("topic_id")
+                ?: bm.number("bookmarkable_id")?.takeIf { bm.text("bookmarkable_type").equals("Topic", ignoreCase = true) }
+                ?: urlTopicRegex.find(bm.text("bookmarkable_url"))?.groupValues?.getOrNull(1)?.toLongOrNull()
+                ?: return@mapNotNull null
+
+            val rawTitle = bm.text("title").ifBlank { bm.text("fancy_title") }.ifBlank { bm.text("name") }
+            val title = Jsoup.parseBodyFragment(rawTitle).text().ifBlank { "已收藏话题" }
+            val slug = bm.text("slug").ifBlank { "topic" }
+            val highest = bm.text("highest_post_number").toIntOrNull()
+            val linked = bm.text("linked_post_number").toIntOrNull() ?: bm.text("post_number").toIntOrNull()
+            val postsCount = bm.text("posts_count").toIntOrNull() ?: highest ?: linked ?: 1
+            val replyCount = bm.text("reply_count").toIntOrNull() ?: (postsCount - 1).coerceAtLeast(0)
+            val categoryId = bm.text("category_id").toIntOrNull()
+
+            val userObj = (bm["user"] as? JsonObject) ?: (bm["post_user"] as? JsonObject)
+            val author = userObj?.text("username")?.takeIf { it.isNotBlank() }
+                ?: bm.text("username").ifBlank { bm.text("post_username") }.ifBlank { null }
+            val avatar = userObj?.text("avatar_template")?.takeIf { it.isNotBlank() }
+                ?: bm.text("avatar_template").ifBlank { bm.text("post_user_avatar_template") }
+
+            val createdAt = bm.text("created_at")
+            val bumpedAt = bm.text("bumped_at").ifBlank { bm.text("updated_at").ifBlank { createdAt } }
+            val excerpt = Jsoup.parseBodyFragment(bm.text("excerpt").ifBlank { bm.text("cooked") }).text()
+            val tags = (bm["tags"] as? JsonArray).orEmpty().mapNotNull { elem ->
+                (elem as? JsonPrimitive)?.contentOrNull
+                    ?: (elem as? JsonObject)?.text("name")?.takeIf { it.isNotBlank() }
+            }
+
+            TopicListItem(
+                topic = Topic(
+                    id = topicId,
+                    title = title,
+                    slug = slug,
+                    postsCount = postsCount,
+                    replyCount = replyCount,
+                    createdAt = createdAt,
+                    lastPostedAt = bumpedAt,
+                    bumpedAt = bumpedAt,
+                    categoryId = categoryId,
+                    excerpt = excerpt,
+                    tags = tags,
+                ),
+                authorUsername = author,
+                avatarUrl = avatarUrlOf(avatar),
+                category = categoryId?.let { known[it] },
+                trustLevel = null,
+            )
+        }.distinctBy { it.topic.id }
+
+        return TopicPage(
+            items = items,
+            hasMore = moreUrl.isNotBlank() && items.isNotEmpty(),
+        )
+    }
 
     suspend fun fetchTopic(
         id: Long,
@@ -473,6 +623,7 @@ class TopicRepository(
         section: ProfileSection,
         cursor: Int,
         notificationFilter: NotificationFilter = NotificationFilter.All,
+        excludeIds: Set<String> = emptySet(),
     ): ProfilePage {
         val userPath = encode(username)
         return when (section) {
@@ -516,7 +667,7 @@ class TopicRepository(
                         postNumber = action.text("post_number").toIntOrNull()?.takeIf { it > 0 })
                 }, hasMore = actions.size >= 30, nextCursor = cursor + 1)
             }
-            ProfileSection.Notifications -> fetchNotifications(cursor, notificationFilter)
+            ProfileSection.Notifications -> fetchNotifications(cursor, notificationFilter, excludeIds)
             ProfileSection.Messages -> {
                 val result = toPage(json.decodeFromString(request("/topics/private-messages/$userPath.json?page=$cursor")))
                 ProfilePage(entries = result.items.map { item -> ProfileEntry(item.topic.id.toString(), item.topic.title,
@@ -529,19 +680,49 @@ class TopicRepository(
     /**
      * 按类型取通知。
      *
-     * 关键点:服务端分页是按**全类型**通知流算 offset 的,而界面只展示其中一类。
-     * 如果像普通分页那样"一页请求换一页展示",私信这种低频类型会出现一页只命中 1~2 条、
-     * 界面于是不停触发加载下一页、用户只看到一个转不停的 spinner 的情况。
-     *
-     * 所以这里在一次加载内就把游标往前推到攒够 PAGE_TARGET 条为止:
-     * 先带上 filter_by_types 让服务端尽量只回目标类型(不被支持时该参数被忽略,返回全类型),
-     * 再在客户端按类型过滤 —— 两条路径都靠这个循环收敛,所以服务端支持与否都不影响正确性。
+     * 首屏(offset == 0)对齐 PC 端右上角通知菜单，优先请求 `recent=true&silent=true`：
+     * Discourse 后端仅在 `recent=true` 时走 `Notification.prioritized_list`，将未读的高优通知与所有非点赞类未读通知
+     * （包括关注的人发帖 801、关注的人回复 802、新增关注 800、徽章 12、回复/提及等）置顶排列，且仅在此时生效 `filter_by_types`；
+     * 若不带 `recent=true`，服务端按纯 `created_at DESC` 排序且忽略 `filter_by_types`，早期未读的关注提醒会被近期大量点赞淹没。
+     * 继续向下翻页(offset > 0)时切回 `offset` 全量历史流，并用 `seenIds` 自动去重已展示条目。
      */
-    private suspend fun fetchNotifications(offset: Int, filter: NotificationFilter): ProfilePage {
+    private suspend fun fetchNotifications(
+        offset: Int,
+        filter: NotificationFilter,
+        excludeIds: Set<String> = emptySet(),
+    ): ProfilePage {
         val typeParam = filter.serverTypes.takeIf { it.isNotBlank() }
             ?.let { "&filter_by_types=${encode(it)}" }.orEmpty()
+        val seenIds = excludeIds.toMutableSet()
         val collected = mutableListOf<ProfileEntry>()
-        var scanned = offset
+        if (offset == 0) {
+            val recentPage = try {
+                objectRequest(
+                    "/notifications.json?recent=true&limit=$NOTIFICATION_SCAN_LIMIT&silent=true$typeParam",
+                    burst = true,
+                )
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: NeedsInteractiveVerification) {
+                throw error
+            } catch (error: Exception) {
+                diagnostics.log("优先通知列表加载回退: ${error.message}")
+                null
+            }
+            if (recentPage != null) {
+                val recentNotices = recentPage.objects("notifications")
+                collected += recentNotices.map(::toNotificationEntry)
+                    .filter { filter.includes(it.notificationType) && seenIds.add(it.id) }
+                if (collected.size >= PAGE_TARGET || recentNotices.size < NOTIFICATION_SCAN_LIMIT) {
+                    return ProfilePage(
+                        entries = collected,
+                        hasMore = recentNotices.size >= PAGE_TARGET,
+                        nextCursor = 1,
+                    )
+                }
+            }
+        }
+        var scanned = if (offset <= 1) 0 else offset
         var hasMore = true
         var rounds = 0
         while (hasMore && collected.size < PAGE_TARGET && rounds < MAX_SCAN_ROUNDS) {
@@ -550,7 +731,7 @@ class TopicRepository(
                 "/notifications.json?offset=$scanned&limit=$NOTIFICATION_SCAN_LIMIT$typeParam",
                 // 第 2 轮起走突发间隔。低频分类(私信)可能要连扫几轮才凑够一页,
                 // 每轮都等满 1 秒的话用户要干等 5 秒;轮数有上限,峰值是封顶的。
-                burst = rounds > 1,
+                burst = rounds > 1 || offset == 0,
             )
             val notices = page.objects("notifications")
             // 游标按请求的 limit 走,不按返回条数 —— 服务端是先分页、再剔除不可访问的话题,
@@ -559,7 +740,8 @@ class TopicRepository(
             val total = page.number("total_rows_notifications")
             // 同理,"这一页不满"不能当作已到末尾,有总数就按总数判断。
             hasMore = total?.let { scanned < it } ?: (notices.size >= NOTIFICATION_SCAN_LIMIT)
-            collected += notices.map(::toNotificationEntry).filter { filter.includes(it.notificationType) }
+            collected += notices.map(::toNotificationEntry)
+                .filter { filter.includes(it.notificationType) && seenIds.add(it.id) }
         }
         return ProfilePage(entries = collected, hasMore = hasMore, nextCursor = scanned)
     }
@@ -576,11 +758,17 @@ class TopicRepository(
             ?: data.text("original_post_number").toIntOrNull()?.takeIf { it > 0 }
             ?: data.text("post_number").toIntOrNull()?.takeIf { it > 0 }
         val badgeName = data.text("badge_name")
+        val topicTitle = notice.text("fancy_title").ifBlank { data.text("fancy_title") }.ifBlank { data.text("topic_title") }
         val rawTitle = when {
             resolvedType == 12 && badgeName.isNotBlank() -> "获得了 '$badgeName'"
-            else -> notice.text("fancy_title").ifBlank { data.text("fancy_title") }.ifBlank { data.text("topic_title") }
+            resolvedType == 800 && topicTitle.isBlank() -> "已开始关注您。"
+            else -> topicTitle
         }
-        val baseActor = data.text("display_username").ifBlank { notice.text("acting_user_name") }.ifBlank { null }
+        val baseActor = data.text("display_username")
+            .ifBlank { data.text("original_username") }
+            .ifBlank { data.text("username") }
+            .ifBlank { notice.text("acting_user_name") }
+            .ifBlank { null }
         val count = data.text("count").toIntOrNull() ?: 0
         val resolvedActor = if (baseActor != null && count > 1) {
             "$baseActor 和其他 ${count - 1} 人"
@@ -597,7 +785,9 @@ class TopicRepository(
             topicId = notice.number("topic_id") ?: data.number("topic_id"),
             unread = notice.text("read") == "false",
             notificationType = resolvedType,
-            avatarUrl = avatarUrlOf(notice.text("acting_user_avatar_template")),
+            avatarUrl = avatarUrlOf(
+                notice.text("acting_user_avatar_template").ifBlank { data.text("avatar_template") },
+            ),
             actor = resolvedActor,
             postNumber = resolvedPostNumber,
         )
@@ -895,16 +1085,23 @@ class TopicRepository(
         }
     }
 
-    private suspend fun toPage(response: TopicListResponse, awaitCategories: Boolean = true): TopicPage {
+    private suspend fun toPage(
+        response: TopicListResponse,
+        awaitCategories: Boolean = true,
+        excludeReadUnread: Boolean = false,
+    ): TopicPage {
         val known = if (awaitCategories) categories() else categoryCache.orEmpty()
         val usersById = response.users.associateBy { it.id }
         // 本地已读集合优先于服务端 unseen:纯净模式下压根没上报过,服务端当然还认为没读。
-        val seen = reading?.seenTopicIds().orEmpty()
-        val items = response.topicList.topics.distinctBy { it.id }.map { topic ->
+        val filteredTopics = response.topicList.topics.distinctBy { it.id }.filterNot { topic ->
+            excludeReadUnread && reading?.isUnreadExcluded(topic.id, topic.postsCount) == true
+        }
+        val items = filteredTopics.map { topic ->
             // Discourse 的 posters 顺序固定,第一个是原始发帖人。
             val author = topic.posters.firstOrNull()?.userId?.let { usersById[it] }
+            val locallyRead = reading?.isUnreadExcluded(topic.id, topic.postsCount) == true
             TopicListItem(
-                topic = if (topic.unseen && topic.id in seen) topic.copy(unseen = false) else topic,
+                topic = if (topic.unseen && locallyRead) topic.copy(unseen = false) else topic,
                 authorUsername = author?.username ?: topic.lastPosterUsername,
                 avatarUrl = avatarUrlOf(author?.avatarTemplate),
                 category = topic.categoryId?.let { known[it] },
