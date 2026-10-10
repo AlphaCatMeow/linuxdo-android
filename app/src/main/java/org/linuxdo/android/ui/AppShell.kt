@@ -428,6 +428,7 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                 syncReadProgress = syncReadProgress,
                                 onSyncReadProgress = viewModel::setSyncReadProgress,
                                 onDiagnostics = { stack.push(Route.Diagnostics) },
+                                onLogout = viewModel::logout,
                             )
 
                             Route.Notifications -> ProfileScreen(state.username, profile, viewModel::loadProfile,
