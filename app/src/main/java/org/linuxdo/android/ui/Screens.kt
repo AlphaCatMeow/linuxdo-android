@@ -141,8 +141,9 @@ fun ProfileScreen(
     val postsRead = remember(summaryFields) { findMetric(summaryFields, "已读帖子") }
     val likesReceived = remember(summaryFields) { findMetric(summaryFields, "收到赞") }
     val likesGiven = remember(summaryFields) { findMetric(summaryFields, "送出赞") }
-    val topicCount = remember(summaryFields) { findMetric(summaryFields, "发表话题") }
     val postCount = remember(summaryFields) { findMetric(summaryFields, "回复数量") }
+    val topicCount = remember(summaryFields) { findMetric(summaryFields, "创建话题", findMetric(summaryFields, "发表话题")) }
+    val bookmarkCount = remember(summaryFields) { findMetric(summaryFields, "我的收藏") }
 
     IosLargeTitleScaffold(
         title = if (notificationOnly) "通知" else "我的",
@@ -410,9 +411,9 @@ fun ProfileScreen(
                             modifier = Modifier.weight(1f),
                         )
                         ProfileMetricCard(
-                            label = "发表话题",
-                            value = topicCount,
-                            iconType = MetricCardIconType.Rocket,
+                            label = "回复数量",
+                            value = postCount,
+                            iconType = MetricCardIconType.Reply,
                             modifier = Modifier.weight(1f),
                         )
                     }
@@ -425,12 +426,17 @@ fun ProfileScreen(
                         horizontalArrangement = Arrangement.spacedBy(10.dp),
                     ) {
                         ProfileMetricCard(
-                            label = "回复数量",
-                            value = postCount,
-                            iconType = MetricCardIconType.Reply,
-                            modifier = Modifier.weight(0.5f),
+                            label = "创建话题",
+                            value = topicCount,
+                            iconType = MetricCardIconType.Rocket,
+                            modifier = Modifier.weight(1f),
                         )
-                        Spacer(Modifier.weight(0.5f))
+                        ProfileMetricCard(
+                            label = "我的收藏",
+                            value = bookmarkCount,
+                            iconType = MetricCardIconType.Bookmark,
+                            modifier = Modifier.weight(1f),
+                        )
                     }
                 }
             }
@@ -762,7 +768,7 @@ private fun ProfileNavCard(
 }
 
 enum class MetricCardIconType {
-    Book, Heart, Thumb, Rocket, Reply
+    Book, Heart, Thumb, Rocket, Reply, Bookmark
 }
 
 @Composable
@@ -849,6 +855,20 @@ private fun ProfileMetricCard(
                         drawCircle(Color.White, 1.2f, Offset(9f, 12f))
                         drawCircle(Color.White, 1.2f, Offset(12f, 12f))
                         drawCircle(Color.White, 1.2f, Offset(15f, 12f))
+                    }
+                    MetricCardIconType.Bookmark -> {
+                        val bookmark = Path().apply {
+                            moveTo(6f, 3.5f)
+                            lineTo(18f, 3.5f)
+                            cubicTo(18.5f, 3.5f, 19f, 4f, 19f, 4.5f)
+                            lineTo(19f, 20.5f)
+                            lineTo(12f, 16f)
+                            lineTo(5f, 20.5f)
+                            lineTo(5f, 4.5f)
+                            cubicTo(5f, 4f, 5.5f, 3.5f, 6f, 3.5f)
+                            close()
+                        }
+                        drawPath(bookmark, Color(0xFFFFB800))
                     }
                 }
             }

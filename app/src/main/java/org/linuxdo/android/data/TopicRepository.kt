@@ -482,7 +482,8 @@ class TopicRepository(
                 val metrics = listOf("days_visited" to "访问天数", "time_read" to "阅读时长",
                     "topics_entered" to "浏览话题", "posts_read_count" to "已读帖子",
                     "likes_given" to "送出赞", "likes_received" to "收到赞",
-                    "topic_count" to "发表话题", "post_count" to "回复数量")
+                    "topic_count" to "创建话题", "post_count" to "回复数量",
+                    "bookmark_count" to "我的收藏")
                 ProfilePage(fields = metrics.map { (key, label) ->
                     val value = summary.text(key)
                     label to if (key == "time_read" && value.toLongOrNull() != null) "${value.toLong() / 60} 分钟" else value.ifBlank { "—" }
