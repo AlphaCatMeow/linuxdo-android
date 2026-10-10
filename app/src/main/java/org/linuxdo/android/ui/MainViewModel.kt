@@ -241,7 +241,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      * 重放登录要自己收尾(boot 或回登录页),而不是交给 boot() 去恢复一个页面加载。
      */
     private var pendingEmailLoginToken: String? = null
-    private var latestLoading = false
+    private val loadingFeeds = java.util.concurrent.ConcurrentHashMap.newKeySet<HomeFeedType>()
     private var searchJob: Job? = null
     private var unreadJob: Job? = null
     private var unreadFailures = 0
@@ -1489,7 +1489,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      * 而单次占用是有上限的。当前正在看的分类优先,其余按声明顺序补。
      */
     private fun prefetchUnreadNotifications() {
-        if (latestLoading || pageJobs.values.any { it.isActive }) return
+        if (loadingFeeds.isNotEmpty() || pageJobs.values.any { it.isActive }) return
         val username = _state.value.username ?: return
         val current = _notificationFilter.value
         val unread = _state.value.unreadFilters
@@ -2444,8 +2444,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private suspend fun loadFeed(feed: HomeFeedType, page: Int, pullRefresh: Boolean) {
         val current = _feedStates.value[feed] ?: _state.value.latest
-        if (latestLoading || current.refreshing || current.loadingMore) return
-        latestLoading = true
+        if (!loadingFeeds.add(feed) || current.refreshing || current.loadingMore) return
 
         val loadingState = current.copy(
             refreshing = pullRefresh && page == 0,
@@ -2465,7 +2464,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
             val existing = _feedStates.value[feed]?.items ?: emptyList()
             val merged = if (page == 0) {
-                result.items
+                result.items.distinctBy { it.topic.id }
             } else {
                 (existing + result.items).distinctBy { it.topic.id }
             }
@@ -2500,7 +2499,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             diagnostics.log("加载 ${feed.label} 异常: ${error.message}")
             settleFeedLoading(feed, error.message ?: error.javaClass.simpleName)
         } finally {
-            latestLoading = false
+            loadingFeeds.remove(feed)
         }
     }
 

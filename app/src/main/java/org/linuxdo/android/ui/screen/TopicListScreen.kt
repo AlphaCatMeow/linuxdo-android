@@ -11,9 +11,11 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
@@ -100,13 +102,19 @@ fun TopicListScreen(
     onFeedSelect: ((HomeFeedType) -> Unit)? = null,
     hasUnread: Boolean = false,
 ) {
-    val listState = rememberLazyListState()
+    val feedListStates = remember { mutableMapOf<HomeFeedType, LazyListState>() }
+    val defaultListState = rememberLazyListState()
+    val listState = if (currentFeed != null) {
+        feedListStates.getOrPut(currentFeed) { LazyListState() }
+    } else {
+        defaultListState
+    }
     val pullState = rememberPullToRefreshState()
 
     // 距底部还有 4 项时就开始取下一页,滚到底时数据通常已经就位。
     // 必须要求列表已有真实数据:空列表时占位项也会让 lastVisible 命中阈值,
     // 配合"失败不更新 page"就会变成每秒重打同一页的死循环。
-    val nearEnd by remember {
+    val nearEnd by remember(listState) {
         derivedStateOf {
             val info = listState.layoutInfo
             val lastVisible = info.visibleItemsInfo.lastOrNull()?.index ?: return@derivedStateOf false
@@ -170,7 +178,10 @@ fun TopicListScreen(
                 item(key = "empty") { EmptyNotice() }
             }
 
-            itemsIndexed(state.items, key = { _, item -> item.topic.id }) { index, item ->
+            itemsIndexed(
+                items = state.items,
+                key = { index, item -> "${currentFeed?.name ?: "topic"}_${item.topic.id}_$index" },
+            ) { index, item ->
                 Column(Modifier.background(IosTheme.colors.card)) {
                     TopicRow(item) { onOpenTopic(item.topic) }
                     if (index < state.items.lastIndex) {
@@ -641,7 +652,7 @@ private fun HomeFeedTitleBar(
                         if (feed == HomeFeedType.Unread && hasUnread) {
                             Box(
                                 modifier = Modifier
-                                    .padding(top = 1.dp, end = (-7).dp)
+                                    .offset(x = 6.dp, y = 1.dp)
                                     .size(7.dp)
                                     .clip(CircleShape)
                                     .background(Color(0xFFFF3B30)),

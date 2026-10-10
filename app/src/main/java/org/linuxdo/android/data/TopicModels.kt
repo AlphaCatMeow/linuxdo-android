@@ -18,8 +18,8 @@ import org.linuxdo.android.Config
 
 /** 首页顶部支持切换的 4 个 Feed 类别。默认是 Latest。 */
 enum class HomeFeedType(val label: String, val apiPath: String) {
-    Unread("未读", "/unread.json"),
     Latest("最新", "/latest.json"),
+    Unread("未读", "/unread.json"),
     Hot("热门", "/hot.json"),
     Posted("我的帖子", "/posted.json");
 

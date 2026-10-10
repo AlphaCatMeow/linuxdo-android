@@ -900,7 +900,7 @@ class TopicRepository(
         val usersById = response.users.associateBy { it.id }
         // 本地已读集合优先于服务端 unseen:纯净模式下压根没上报过,服务端当然还认为没读。
         val seen = reading?.seenTopicIds().orEmpty()
-        val items = response.topicList.topics.map { topic ->
+        val items = response.topicList.topics.distinctBy { it.id }.map { topic ->
             // Discourse 的 posters 顺序固定,第一个是原始发帖人。
             val author = topic.posters.firstOrNull()?.userId?.let { usersById[it] }
             TopicListItem(
