@@ -168,7 +168,9 @@ private fun LevelBadgeChip(
         }
 
         else -> {
-            // ── Lv.3 大佬专属：淡紫/淡金交融底 + 紫金流光金属描边 + 鎏金皇冠星芒 + 动态流光扫光 ──
+            // ── Lv.3 大佬专属：深鎏金金属底 + 亮金流光描边 + 纯金皇冠星芒 + 动态流光扫光 ──
+            // 刻意走"深底亮字"：Lv.2 和 Lv.3 同在黄色系，只差深浅的话这么小的徽章上根本分不开，
+            // 明暗反转才一眼可辨，顺带让最高等级有块金牌的分量。
             val transition = rememberInfiniteTransition(label = "lv3-shimmer")
             val shimmerProgress by transition.animateFloat(
                 initialValue = -0.6f,
@@ -179,51 +181,32 @@ private fun LevelBadgeChip(
                 ),
                 label = "lv3-sweep",
             )
-            val bgBrush = if (isDark) {
-                Brush.linearGradient(
-                    colors = listOf(
-                        Color(0xFF2B124C),
-                        Color(0xFF431C6B),
-                        Color(0xFF4A3214),
-                    ),
-                )
-            } else {
-                Brush.linearGradient(
-                    colors = listOf(
-                        Color(0xFFF3E6FF),
-                        Color(0xFFE9D4FF),
-                        Color(0xFFFDF0CA),
-                    ),
-                )
-            }
-            val borderBrush = if (isDark) {
-                Brush.linearGradient(
-                    colors = listOf(
-                        Color(0xFFB56BFF),
-                        Color(0xFFFFD76A),
-                        Color(0xFF9D4EDD),
-                    ),
-                )
-            } else {
-                Brush.linearGradient(
-                    colors = listOf(
-                        Color(0xFF8A2BE2),
-                        Color(0xFFD99B16),
-                        Color(0xFF6A1B9A),
-                    ),
-                )
-            }
-            val textColor = if (isDark) Color(0xFFFFE082) else Color(0xFF56108E)
-            val crownGold = if (isDark) Color(0xFFFFD54F) else Color(0xFFD48806)
-            val crownPurple = if (isDark) Color(0xFFD09CFF) else Color(0xFF7B1FA2)
-            val shimmerColor = if (isDark) Color(0x55FFE57F) else Color(0x88FFFDF5)
+            // 浅色模式同样用深底：白底卡片上这块深金牌才是全屏最扎眼的那一个。
+            val bgBrush = Brush.linearGradient(
+                colors = listOf(
+                    Color(0xFF3E2B08),
+                    Color(0xFF6B4A12),
+                    Color(0xFF4A3410),
+                ),
+            )
+            val borderBrush = Brush.linearGradient(
+                colors = listOf(
+                    Color(0xFFFFE9A8),
+                    Color(0xFFD4AF37),
+                    Color(0xFFFFD76A),
+                ),
+            )
+            val textColor = Color(0xFFFFD873)
+            val crownGold = Color(0xFFFFE9A8)
+            val crownShade = Color(0xFFC9971F)
+            val shimmerColor = Color(0x66FFF3C4)
 
             Row(
                 modifier = Modifier
                     .shadow(
                         elevation = if (isDark) 4.dp else 2.dp,
                         shape = shape,
-                        ambientColor = Color(0xFF8A2BE2),
+                        ambientColor = Color(0xFF6B4A12),
                         spotColor = Color(0xFFD4AF37),
                     )
                     .clip(shape)
@@ -250,7 +233,7 @@ private fun LevelBadgeChip(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(3.5.dp),
             ) {
-                Lv3CrownEmblem(gold = crownGold, purple = crownPurple)
+                Lv3CrownEmblem(gold = crownGold, shade = crownShade)
                 Text(
                     text = label,
                     style = IosTheme.type.caption.copy(fontSize = 12.sp, letterSpacing = 0.2.sp),
@@ -263,9 +246,9 @@ private fun LevelBadgeChip(
     }
 }
 
-/** Lv.3 专属鎏金三尖皇冠 + 星芒徽记。 */
+/** Lv.3 专属纯金三尖皇冠 + 星芒徽记。 */
 @Composable
-private fun Lv3CrownEmblem(gold: Color, purple: Color) {
+private fun Lv3CrownEmblem(gold: Color, shade: Color) {
     Canvas(Modifier.size(13.dp)) {
         scale(size.width / 24f, size.height / 24f, pivot = Offset.Zero) {
             // 皇冠主体
@@ -281,7 +264,7 @@ private fun Lv3CrownEmblem(gold: Color, purple: Color) {
             }
             drawPath(
                 path = crown,
-                brush = Brush.verticalGradient(listOf(gold, purple)),
+                brush = Brush.verticalGradient(listOf(gold, shade)),
             )
             // 皇冠底座金边
             drawLine(

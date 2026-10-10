@@ -14,8 +14,21 @@ data class TransportResult(
 interface Transport {
     val name: String
 
-    suspend fun get(path: String): TransportResult
-    suspend fun write(path: String, method: String, body: String?, csrf: String): TransportResult
+    suspend fun get(path: String, present: Boolean = true): TransportResult
+
+    /**
+     * 发写请求。[contentType] 默认 JSON；少数 Discourse 端点(如 `/topics/timings`)
+     * 只认 `application/x-www-form-urlencoded` 的嵌套参数写法,由调用方显式指定。
+     * [present] 标记前台用户活跃（Discourse-Present: true），避免后台请求误更 last_seen / days_visited。
+     */
+    suspend fun write(
+        path: String,
+        method: String,
+        body: String?,
+        csrf: String,
+        contentType: String = JSON_CONTENT_TYPE,
+        present: Boolean = true,
+    ): TransportResult
 
     /** 以 multipart/form-data 上传一个文件。 */
     suspend fun upload(
@@ -35,6 +48,11 @@ interface Transport {
      * 必须连 token 一起重取才能重发。
      */
     suspend fun revalidate(reason: String): Boolean
+
+    companion object {
+        const val JSON_CONTENT_TYPE = "application/json; charset=utf-8"
+        const val FORM_CONTENT_TYPE = "application/x-www-form-urlencoded; charset=utf-8"
+    }
 }
 
 /** 静默重验证失败,必须让用户在可见 WebView 中完成验证。 */
@@ -88,3 +106,9 @@ object ChallengeDetector {
         return challengeTitles.any { lower.contains(it) }
     }
 }
+
+class RiskControlException(
+    val status: Int = 403,
+    override val message: String = "触发安全风控 (403)",
+) : RuntimeException(message)
+

@@ -68,6 +68,7 @@ fun IosLargeTitleScaffold(
     compactTop: Boolean = false,
     scrollToTopRequest: Int = 0,
     trailing: @Composable () -> Unit = {},
+    customLargeTitle: (@Composable () -> Unit)? = null,
     content: LazyListScope.() -> Unit,
 ) {
     ScrollToTopOnRequest(listState, scrollToTopRequest)
@@ -94,16 +95,20 @@ fun IosLargeTitleScaffold(
                         .padding(horizontal = IosMetrics.screenPadding),
                     contentAlignment = Alignment.BottomStart,
                 ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(
-                        text = title,
-                        style = IosTheme.type.largeTitle,
-                        color = IosTheme.colors.label,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.weight(1f).padding(bottom = 6.dp),
-                    )
-                    if (compactTop) trailing()
+                    if (customLargeTitle != null) {
+                        customLargeTitle()
+                    } else {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                text = title,
+                                style = IosTheme.type.largeTitle,
+                                color = IosTheme.colors.label,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f).padding(bottom = 6.dp),
+                            )
+                            if (compactTop) trailing()
+                        }
                     }
                 }
             }

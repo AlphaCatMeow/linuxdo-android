@@ -328,9 +328,7 @@ fun ProfileScreen(
         item("actions") {
             Row(Modifier.fillMaxWidth().padding(16.dp), horizontalArrangement = Arrangement.SpaceBetween) {
                 IosTextAction("刷新") { onLoad(section, true, false) }
-                if (BuildConfig.DEBUG) {
-                    IosTextAction("开发者选项", color = IosTheme.colors.secondaryLabel, onClick = onDiagnostics)
-                }
+                IosTextAction("开发者选项", color = IosTheme.colors.secondaryLabel, onClick = onDiagnostics)
             }
         }
     }
@@ -602,7 +600,19 @@ fun SettingsScreen(
     onThemeMode: (ThemeMode) -> Unit,
     updateState: UpdateUiState = UpdateUiState(),
     onCheckUpdate: () -> Unit = {},
+    syncReadProgress: Boolean = false,
+    onSyncReadProgress: (Boolean) -> Unit = {},
+    onDiagnostics: () -> Unit = {},
 ) {
+    var showSyncConfirmDialog by remember { mutableStateOf(false) }
+    val handleSyncToggle: (Boolean) -> Unit = { targetState ->
+        if (targetState) {
+            showSyncConfirmDialog = true
+        } else {
+            onSyncReadProgress(false)
+        }
+    }
+
     IosLargeTitleScaffold(title = "设置", onBack = onBack) {
         item("appearance") {
             SectionTitle("外观")
@@ -630,6 +640,19 @@ fun SettingsScreen(
                         )
                     }
                     IosSwitch(checked = treeView, onCheckedChange = onTreeView)
+                }
+                IosDivider()
+                IosRow(onClick = { handleSyncToggle(!syncReadProgress) }) {
+                    Column(Modifier.weight(1f)) {
+                        Text("同步楼层已读进度与阅读时长", style = IosTheme.type.body)
+                        Text(
+                            "默认关闭（仅本地标记）。开启后将向服务端上报楼层阅读进度与阅读时长（消除网页端未读小蓝点）。如遇安全策略拦截将自动静默重试或放弃，不打扰正常阅读。\n注：话题浏览与访问天数在关闭状态下已通过详情加载正常记录。",
+                            style = IosTheme.type.footnote,
+                            color = IosTheme.colors.secondaryLabel,
+                            modifier = Modifier.padding(top = 4.dp),
+                        )
+                    }
+                    IosSwitch(checked = syncReadProgress, onCheckedChange = handleSyncToggle)
                 }
             }
         }
@@ -684,8 +707,44 @@ fun SettingsScreen(
                         else -> Text("›", color = IosTheme.colors.tertiaryLabel, style = IosTheme.type.title3)
                     }
                 }
+                IosDivider()
+                IosRow(onClick = onDiagnostics) {
+                    Text("开发者选项与诊断", style = IosTheme.type.body, modifier = Modifier.weight(1f))
+                    Text("›", color = IosTheme.colors.tertiaryLabel, style = IosTheme.type.title3)
+                }
             }
         }
+    }
+
+    if (showSyncConfirmDialog) {
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { showSyncConfirmDialog = false },
+            title = { Text("开启阅读进度同步") },
+            text = {
+                Text(
+                    "开启后将向服务端上报各楼层阅读进度与阅读时长（消除网页端未读小蓝点）。\n\n" +
+                        "提示：阅读进度上报属于后台写请求。如遇 Cloudflare 拦截，应用将自动静默重试或放弃，不会弹出验证打断您的正常浏览。\n\n" +
+                        "（注：无论开关与否，话题浏览与访问天数均会随浏览正常记录）"
+                )
+            },
+            confirmButton = {
+                androidx.compose.material3.TextButton(
+                    onClick = {
+                        showSyncConfirmDialog = false
+                        onSyncReadProgress(true)
+                    }
+                ) {
+                    Text("确认开启", color = IosTheme.colors.accent)
+                }
+            },
+            dismissButton = {
+                androidx.compose.material3.TextButton(
+                    onClick = { showSyncConfirmDialog = false }
+                ) {
+                    Text("取消")
+                }
+            },
+        )
     }
 }
 

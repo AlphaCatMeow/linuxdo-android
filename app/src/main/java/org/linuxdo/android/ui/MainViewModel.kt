@@ -1,6 +1,8 @@
 package org.linuxdo.android.ui
 
 import android.app.Application
+import android.content.Context
+import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
@@ -10,6 +12,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.core.content.edit
 import androidx.lifecycle.viewModelScope
 import java.io.ByteArrayOutputStream
+import java.util.Collections
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -32,6 +35,7 @@ import org.linuxdo.android.BuildConfig
 import org.linuxdo.android.Config
 import org.linuxdo.android.data.TopicRepository
 import org.linuxdo.android.data.Category
+import org.linuxdo.android.data.HomeFeedType
 import org.linuxdo.android.data.Post
 import org.linuxdo.android.data.TopicDetail
 import org.linuxdo.android.data.SearchOrder
@@ -42,8 +46,11 @@ import org.linuxdo.android.data.UploadLimits
 import org.linuxdo.android.data.effectiveReplyToPostNumber
 import org.linuxdo.android.data.threadRows
 import org.linuxdo.android.net.HttpStatusException
+import org.linuxdo.android.net.LoginRejectedException
 import org.linuxdo.android.net.NeedsInteractiveVerification
 import org.linuxdo.android.net.NetworkPath
+import org.linuxdo.android.net.NetworkTimeoutException
+import org.linuxdo.android.net.RiskControlException
 import org.linuxdo.android.net.SecondFactorRequiredException
 import org.linuxdo.android.ui.screen.TopicListUiState
 
@@ -74,6 +81,14 @@ data class LoginUiState(
     val emailSent: Boolean = false,
     val secondFactorRequired: Boolean = false,
     val backupEnabled: Boolean = false,
+    val showWebLoginDialog: Boolean = false,
+    val isRiskOrCaptchaBlocked: Boolean = false,
+    val showRiskControlDialog: Boolean = false,
+    val webAuthLoading: Boolean = false,
+    val webAuthMessage: String? = null,
+    val savedLogin: String = "",
+    val savedPassword: String = "",
+    val rememberPassword: Boolean = false,
 )
 enum class ThemeMode(val label: String) { System("跟随系统"), Light("浅色"), Dark("深色") }
 enum class DetailLoad { Topic, Next, Previous }
@@ -100,10 +115,19 @@ data class DetailUiState(
      * 界面不会读到"编辑器已关、但列表还没更新"的中间态。
      */
     val createdPostId: Long? = null,
+    /** 评论区是否倒序(最新一级主评论在前)。1 楼主贴永远置顶,不参与翻转。 */
+    val descending: Boolean = false,
 ) {
     private val windowStart: Int get() = topic?.postStream?.stream.orEmpty().indexOf(windowStartId).coerceAtLeast(0)
-    val remaining: List<Long> get() = topic?.postStream?.stream.orEmpty().drop(windowStart).filterNot { it in consumedIds }
-    val previousIds: List<Long> get() = topic?.postStream?.stream.orEmpty().take(windowStart).filterNot { it in consumedIds }
+    val remaining: List<Long> get() {
+        val stream = topic?.postStream?.stream.orEmpty()
+        // 倒序下"加载更多"是往更早的楼层回溯,不受向下窗口起点的约束。
+        return if (descending) stream.filterNot { it in consumedIds }
+        else stream.drop(windowStart).filterNot { it in consumedIds }
+    }
+    /** 倒序时不提供"加载之前的楼层"缺口 —— 那和倒序的回溯加载是同一个方向,会互相抢楼。 */
+    val previousIds: List<Long> get() = if (descending) emptyList()
+        else topic?.postStream?.stream.orEmpty().take(windowStart).filterNot { it in consumedIds }
 }
 
 data class CategoriesUiState(
@@ -173,6 +197,7 @@ data class ProfileUiState(
 data class UiState(
     val screen: Screen = Screen.Boot,
     val username: String? = null,
+    val homeFeed: HomeFeedType = HomeFeedType.Latest,
     val latest: TopicListUiState = TopicListUiState(),
     val path: NetworkPath = NetworkPath.OKHTTP,
     val autoRefresh: Boolean = false,
@@ -190,12 +215,21 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val container = (application as App).container
     private val store = container.sessionStore
     private val browser = container.browser
+    private val userApiKeyAuthService = container.userApiKeyAuthService
     val diagnostics = container.diagnostics
 
-    private val _state = MutableStateFlow(UiState(userAgent = container.userAgent))
+    private val initialHomeFeed = HomeFeedType.fromName(store.homeFeed())
+    private val _feedStates = MutableStateFlow<Map<HomeFeedType, TopicListUiState>>(emptyMap())
+    val feedStates = _feedStates.asStateFlow()
+    private val _state = MutableStateFlow(UiState(userAgent = container.userAgent, homeFeed = initialHomeFeed))
     val state: StateFlow<UiState> = _state.asStateFlow()
 
-    private val repository = TopicRepository({ container.transport(_state.value.path) }, diagnostics)
+    private val repository = TopicRepository(
+        transportProvider = { container.transport(_state.value.path) },
+        diagnostics = diagnostics,
+        reading = container.reading,
+        fallbackTransportProvider = { container.transport(NetworkPath.WEBVIEW) },
+    )
 
     private var bootJob: Job? = null
     private var autoJob: Job? = null
@@ -234,12 +268,43 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val composer = _composer.asStateFlow()
     private val _treeView = MutableStateFlow(container.preferences.getBoolean("tree_view", true))
     val treeView = _treeView.asStateFlow()
+    private val _syncReadProgress = MutableStateFlow(container.reading.syncReadProgress)
+    val syncReadProgress = _syncReadProgress.asStateFlow()
+    /** 开启同步后，话题的进入时刻、上次上报时刻与已上报时长。 */
+    private val topicEnteredAt = mutableMapOf<Long, Long>()
+    private val lastReportedAt = mutableMapOf<Long, Long>()
+    private val reportedReadMs = mutableMapOf<Long, Long>()
+    private val readReportJobs = mutableMapOf<Long, Job>()
+    /** 当前处于前台可见、活跃状态的话题集合（被验证页遮挡、切后台或被下层路由盖住时不在其中）。 */
+    private val activeTopicIds = Collections.synchronizedSet(mutableSetOf<Long>())
+    /** 各话题在当前屏幕上当前可见的楼层号。 */
+    private val currentVisiblePostsByTopic = mutableMapOf<Long, List<Int>>()
+    /** 各话题在屏幕上实际浏览过但尚未结算上报的楼层号队列（保留阅读顺序，按批次结算，避免倒序饥饿）。 */
+    private val pendingVisiblePostsByTopic = mutableMapOf<Long, LinkedHashSet<Int>>()
+
+    fun setTopicActive(topicId: Long, active: Boolean) {
+        if (active) {
+            activeTopicIds.add(topicId)
+        } else {
+            activeTopicIds.remove(topicId)
+        }
+    }
+
+    private fun isTopicActive(topicId: Long): Boolean {
+        return _state.value.screen == Screen.List && activeTopicIds.contains(topicId)
+    }
     private val _themeMode = MutableStateFlow(ThemeMode.entries.firstOrNull {
         it.name == container.preferences.getString("theme_mode", ThemeMode.System.name)
     } ?: ThemeMode.System)
     val themeMode = _themeMode.asStateFlow()
 
-    private val _loginUiState = MutableStateFlow(LoginUiState())
+    private val _loginUiState = MutableStateFlow(
+        LoginUiState(
+            savedLogin = store.savedLogin().orEmpty(),
+            savedPassword = store.savedPassword().orEmpty(),
+            rememberPassword = store.isRememberPassword(),
+        )
+    )
     val loginUiState: StateFlow<LoginUiState> = _loginUiState.asStateFlow()
 
     private val _updateState = MutableStateFlow(UpdateUiState())
@@ -552,67 +617,177 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         return 0
     }
 
+    private var loginJob: Job? = null
+
     fun dismissLoginError() {
-        _loginUiState.update { it.copy(error = null, emailSent = false) }
+        _loginUiState.update { it.copy(error = null, emailSent = false, isRiskOrCaptchaBlocked = false) }
+    }
+
+    fun isDarkMode(): Boolean {
+        if (_themeMode.value == ThemeMode.Dark) return true
+        if (_themeMode.value == ThemeMode.Light) return false
+        val app = getApplication<android.app.Application>()
+        val uiMode = app.resources.configuration.uiMode
+        return (uiMode and android.content.res.Configuration.UI_MODE_NIGHT_MASK) == android.content.res.Configuration.UI_MODE_NIGHT_YES
+    }
+
+    fun openWebLoginModal(
+        login: String? = null,
+        password: String? = null,
+        secondFactorToken: String? = null,
+        secondFactorMethod: Int = 1,
+        rememberPassword: Boolean = false,
+    ) {
+        loginJob?.cancel()
+        loginJob = null
+        val u = login.orEmpty()
+        val p = password.orEmpty()
+        _loginUiState.update {
+            it.copy(
+                loading = false,
+                sendingCode = false,
+                error = null,
+                isRiskOrCaptchaBlocked = false,
+                showWebLoginDialog = true,
+            )
+        }
+        val onResult: (Boolean, String?, Boolean) -> Unit = { success, errorMsg, need2FA ->
+            viewModelScope.launch {
+                when {
+                    success -> {
+                        diagnostics.log("安全验证与网页登录全流程成功，正在同步会话...")
+                        android.webkit.CookieManager.getInstance().flush()
+                        store.syncFromWebView()
+                        if (u.isNotBlank()) {
+                            store.saveCredentials(u, p, rememberPassword)
+                        }
+                        _loginUiState.update {
+                            LoginUiState(
+                                savedLogin = u,
+                                savedPassword = if (rememberPassword) p else "",
+                                rememberPassword = rememberPassword,
+                            )
+                        }
+                        boot()
+                    }
+                    need2FA -> {
+                        diagnostics.log("安全验证通过，需要进行二步验证 (2FA)")
+                        _loginUiState.update {
+                            it.copy(
+                                showWebLoginDialog = false,
+                                secondFactorRequired = true,
+                                error = null,
+                            )
+                        }
+                    }
+                    else -> {
+                        diagnostics.log("安全验证或登录失败: $errorMsg")
+                        _loginUiState.update {
+                            it.copy(
+                                showWebLoginDialog = false,
+                                loading = false,
+                                error = errorMsg ?: "登录失败，请重试。",
+                            )
+                        }
+                    }
+                }
+            }
+        }
+        if (!secondFactorToken.isNullOrBlank() && browser.resumeSecondFactorLogin(
+                secondFactorToken = secondFactorToken,
+                secondFactorMethod = secondFactorMethod,
+                onResult = onResult,
+            )
+        ) {
+            diagnostics.log("在原网页认证会话中续交 2FA 验证码")
+            return
+        }
+
+        diagnostics.log("拉起内联安全认证弹框 (hCaptcha / CF / 2FA 全流程)")
+        browser.loadCaptchaLogin(
+            login = u,
+            password = p,
+            secondFactorToken = secondFactorToken,
+            secondFactorMethod = secondFactorMethod,
+            isDark = isDarkMode(),
+            onResult = onResult,
+        )
+    }
+
+    fun closeWebLoginModal() {
+        browser.cancelCaptchaLogin()
+        _loginUiState.update { it.copy(showWebLoginDialog = false) }
     }
 
     fun resetSecondFactor() {
+        browser.discardPendingSecondFactorLogin()
         _loginUiState.update { it.copy(secondFactorRequired = false, backupEnabled = false, error = null) }
     }
 
-    /** 账号密码登录：先拿 CSRF token，再 POST /session（支持 2FA 两步验证）。 */
+    /**
+     * 原生界面只收集凭据；账号密码、hCaptcha、Cloudflare 与 2FA 均在同一认证 WebView 中提交。
+     * 先走 OkHttp 再让 WebView 重提会拆开浏览器指纹和 h_captcha_temp_id，导致 CF 后无法续交。
+     */
     fun loginWithPassword(
         login: String,
         password: String,
         secondFactorToken: String? = null,
         secondFactorMethod: Int = 1,
+        rememberPassword: Boolean = false,
     ) {
-        if (_loginUiState.value.loading) return
-        viewModelScope.launch {
-            _loginUiState.update { it.copy(loading = true, error = null) }
-            try {
-                val result = repository.sessionLogin(login, password, secondFactorToken, secondFactorMethod)
-                if (result) {
-                    diagnostics.log("原生密码登录成功，回调 boot()")
-                    _loginUiState.update { LoginUiState() }
-                    boot()
-                } else {
-                    _loginUiState.update { it.copy(loading = false, error = "用户名或密码错误，请检查后重试。") }
-                }
-            } catch (error: CancellationException) {
-                throw error
-            } catch (error: SecondFactorRequiredException) {
-                _loginUiState.update {
-                    it.copy(
-                        loading = false,
-                        secondFactorRequired = true,
-                        backupEnabled = error.backupEnabled,
-                        error = null,
-                    )
-                }
-            } catch (error: NeedsInteractiveVerification) {
-                _loginUiState.update { it.copy(loading = false) }
-                enterWebScreen(Screen.Verify, error.message.orEmpty())
-            } catch (error: Exception) {
-                _loginUiState.update { it.copy(loading = false, error = error.message ?: "登录失败，请稍后重试。") }
-            }
-        }
+        if (_loginUiState.value.showWebLoginDialog) return
+        loginJob?.cancel()
+        loginJob = null
+        diagnostics.log("原生表单已提交，转入同一 WebView 认证会话")
+        openWebLoginModal(login, password, secondFactorToken, secondFactorMethod, rememberPassword)
     }
 
     /** 发送邮箱一次性登录链接。 */
     fun sendLoginEmail(email: String) {
-        if (_loginUiState.value.sendingCode) return
-        viewModelScope.launch {
+        if (_loginUiState.value.sendingCode || _loginUiState.value.showWebLoginDialog) return
+        loginJob?.cancel()
+        loginJob = viewModelScope.launch {
             _loginUiState.update { it.copy(sendingCode = true, error = null, emailSent = false) }
             try {
                 repository.sendEmailLogin(email)
+                if (!isActive) return@launch
                 _loginUiState.update { it.copy(sendingCode = false, emailSent = true) }
             } catch (error: CancellationException) {
                 throw error
             } catch (error: NeedsInteractiveVerification) {
-                _loginUiState.update { it.copy(sendingCode = false) }
-                enterWebScreen(Screen.Verify, error.message.orEmpty())
+                if (!isActive) return@launch
+                _loginUiState.update {
+                    it.copy(
+                        sendingCode = false,
+                        error = "发送邮件触发了人机安全验证，需在安全验证页面完成验证。",
+                        isRiskOrCaptchaBlocked = true,
+                    )
+                }
+            } catch (error: RiskControlException) {
+                if (!isActive) return@launch
+                diagnostics.log("发送邮件触发 403 风控: ${error.message}")
+                _loginUiState.update {
+                    it.copy(
+                        sendingCode = false,
+                        showRiskControlDialog = true,
+                        error = null,
+                    )
+                }
+            } catch (error: NetworkTimeoutException) {
+                if (!isActive) return@launch
+                _loginUiState.update { it.copy(sendingCode = false, error = "发送请求超时 (20s)，请检查网络连接。") }
+            } catch (error: HttpStatusException) {
+                if (!isActive) return@launch
+                val isCaptcha = (error.status == 403 && (error.message?.contains("invalid_access") == true || error.message?.contains("captcha", ignoreCase = true) == true)) || error.message?.contains("人机") == true
+                _loginUiState.update {
+                    it.copy(
+                        sendingCode = false,
+                        error = if (isCaptcha) "发送邮件触发了站点安全验证，需在安全验证页面完成验证。" else "发送失败 (${error.message})",
+                        isRiskOrCaptchaBlocked = isCaptcha,
+                    )
+                }
             } catch (error: Exception) {
+                if (!isActive) return@launch
                 _loginUiState.update { it.copy(sendingCode = false, error = error.message ?: "发送失败，请稍后重试。") }
             }
         }
@@ -627,9 +802,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         secondFactorToken: String? = null,
         secondFactorMethod: Int = 1,
     ) {
-        if (_loginUiState.value.loading) return
+        if (_loginUiState.value.loading || _loginUiState.value.showWebLoginDialog) return
         val sanitizedToken = token.trim()
-        viewModelScope.launch {
+        loginJob?.cancel()
+        loginJob = viewModelScope.launch {
             _loginUiState.update { it.copy(loading = true, error = null) }
             try {
                 if (sanitizedToken.isBlank()) {
@@ -637,12 +813,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     return@launch
                 }
                 repository.emailLoginWithToken(sanitizedToken, secondFactorToken, secondFactorMethod)
+                if (!isActive) return@launch
                 diagnostics.log("邮件 token 登录成功,复核会话")
                 _loginUiState.update { LoginUiState() }
                 boot()
             } catch (error: CancellationException) {
                 throw error
             } catch (error: SecondFactorRequiredException) {
+                if (!isActive) return@launch
                 _loginUiState.update {
                     it.copy(
                         loading = false,
@@ -652,10 +830,42 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     )
                 }
             } catch (error: NeedsInteractiveVerification) {
-                _loginUiState.update { it.copy(loading = false) }
-                pendingEmailLoginToken = sanitizedToken
-                enterWebScreen(Screen.Verify, error.message.orEmpty())
+                if (!isActive) return@launch
+                _loginUiState.update {
+                    it.copy(
+                        loading = false,
+                        error = "验证请求触发了安全验证，需在安全验证页面完成验证。",
+                        isRiskOrCaptchaBlocked = true,
+                    )
+                }
+            } catch (error: RiskControlException) {
+                if (!isActive) return@launch
+                diagnostics.log("邮件登录触发 403 风控: ${error.message}")
+                _loginUiState.update {
+                    it.copy(
+                        loading = false,
+                        showRiskControlDialog = true,
+                        error = null,
+                    )
+                }
+            } catch (error: NetworkTimeoutException) {
+                if (!isActive) return@launch
+                _loginUiState.update { it.copy(loading = false, error = "验证请求超时 (20s)，请检查当前代理节点。") }
+            } catch (error: LoginRejectedException) {
+                if (!isActive) return@launch
+                _loginUiState.update { it.copy(loading = false, error = error.message ?: "登录链接无效或已过期。") }
+            } catch (error: HttpStatusException) {
+                if (!isActive) return@launch
+                val isCaptcha = (error.status == 403 && (error.message?.contains("invalid_access") == true || error.message?.contains("captcha", ignoreCase = true) == true)) || error.message?.contains("人机") == true
+                _loginUiState.update {
+                    it.copy(
+                        loading = false,
+                        error = if (isCaptcha) "验证请求触发了安全验证，需在安全验证页面完成验证。" else "服务器响应异常 (${error.message})",
+                        isRiskOrCaptchaBlocked = isCaptcha,
+                    )
+                }
             } catch (error: Exception) {
+                if (!isActive) return@launch
                 _loginUiState.update { it.copy(loading = false, error = error.message ?: "登录失败，请检查 token 是否正确。") }
             }
         }
@@ -681,12 +891,106 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     )
                 }
                 _state.update { it.copy(screen = Screen.Login) }
+            } catch (error: RiskControlException) {
+                diagnostics.log("重试邮件登录遇到 403 风控: ${error.message}")
+                _loginUiState.update {
+                    it.copy(
+                        loading = false,
+                        showRiskControlDialog = true,
+                        error = null,
+                    )
+                }
+                _state.update { it.copy(screen = Screen.Login) }
             } catch (error: Exception) {
                 _loginUiState.update {
                     it.copy(loading = false, error = error.message ?: "登录失败，请重新获取验证码。")
                 }
                 _state.update { it.copy(screen = Screen.Login) }
             }
+        }
+    }
+
+    fun dismissRiskControlDialog() {
+        _loginUiState.update { it.copy(showRiskControlDialog = false) }
+    }
+
+    /** 发起网页授权认证（拉起系统浏览器或外部应用） */
+    fun startWebAuth(context: Context? = null) {
+        val targetContext = context ?: getApplication<Application>()
+        viewModelScope.launch {
+            _loginUiState.update {
+                it.copy(
+                    showRiskControlDialog = false,
+                    webAuthLoading = true,
+                    webAuthMessage = "正在准备网页授权...",
+                    error = null,
+                )
+            }
+            try {
+                val url = userApiKeyAuthService.buildAuthorizeUrl()
+                val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                targetContext.startActivity(intent)
+                _loginUiState.update {
+                    it.copy(
+                        webAuthLoading = true,
+                        webAuthMessage = "已调起浏览器，请在网页中完成授权...",
+                    )
+                }
+            } catch (e: Exception) {
+                diagnostics.log("拉起网页授权失败: ${e.message}")
+                _loginUiState.update {
+                    it.copy(
+                        webAuthLoading = false,
+                        webAuthMessage = null,
+                        error = "无法打开浏览器，请检查是否安装了浏览器应用",
+                    )
+                }
+            }
+        }
+    }
+
+    fun handleWebAuthCallback(callbackUri: String) {
+        val uri = runCatching { Uri.parse(callbackUri) }.getOrNull() ?: return
+        handleWebAuthCallback(uri)
+    }
+
+    /** 接收深链回调并兑换令牌 */
+    fun handleWebAuthCallback(uri: Uri) {
+        viewModelScope.launch {
+            _loginUiState.update {
+                it.copy(
+                    webAuthLoading = true,
+                    webAuthMessage = "正在兑换登录令牌并验证...",
+                    error = null,
+                )
+            }
+            try {
+                userApiKeyAuthService.handleAuthRedirect(uri)
+                diagnostics.log("网页授权登录成功，重新加载会话")
+                _loginUiState.update { LoginUiState() }
+                boot()
+            } catch (e: Exception) {
+                diagnostics.log("网页授权登录兑换失败: ${e.message}")
+                _loginUiState.update {
+                    it.copy(
+                        webAuthLoading = false,
+                        webAuthMessage = null,
+                        error = e.message ?: "网页授权登录失败，请重试",
+                    )
+                }
+            }
+        }
+    }
+
+    fun cancelWebAuth() {
+        userApiKeyAuthService.cancel()
+        _loginUiState.update {
+            it.copy(
+                webAuthLoading = false,
+                webAuthMessage = null,
+            )
         }
     }
 
@@ -700,6 +1004,159 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun setTreeView(enabled: Boolean) {
         _treeView.value = enabled
         container.preferences.edit { putBoolean("tree_view", enabled) }
+    }
+
+    /**
+     * 开/关「同步阅读进度与统计」。
+     *
+     * 关闭是默认的纯净模式:网络行为与不记录时完全一致,未读蓝点靠本地已读集合消除。
+     * 关掉时顺手清掉在途计时,避免刚关完又飞出去一个上报。
+     */
+    fun setSyncReadProgress(enabled: Boolean) {
+        if (_syncReadProgress.value == enabled) return
+        _syncReadProgress.value = enabled
+        container.reading.setSyncReadProgress(enabled)
+        if (!enabled) {
+            readReportJobs.values.forEach { it.cancel() }
+            readReportJobs.clear()
+            topicEnteredAt.clear()
+            lastReportedAt.clear()
+            reportedReadMs.clear()
+            pendingVisiblePostsByTopic.clear()
+            currentVisiblePostsByTopic.clear()
+        }
+        diagnostics.log(if (enabled) "已开启阅读进度同步(低频 timings 上报)" else "已关闭阅读进度同步(仅本地标记已读)")
+    }
+
+    /** 记录用户在屏幕上实际浏览到的楼层号 */
+    fun onPostsVisible(topicId: Long, postNumbers: List<Int>) {
+        if (topicId <= 0L || postNumbers.isEmpty()) return
+        val valid = postNumbers.filter { it > 0 }
+        if (valid.isEmpty()) return
+        currentVisiblePostsByTopic[topicId] = valid
+        val queue = pendingVisiblePostsByTopic.getOrPut(topicId) { LinkedHashSet() }
+        valid.forEach { queue.add(it) }
+    }
+
+    /**
+     * 本地记下"这帖看过了",并就地把列表里的未读蓝点摘掉。
+     *
+     * 纯净模式下服务端压根不知道我们读过,所以不能等 unseen 从服务端变化 ——
+     * 只有本地这份持久化集合能保证下拉刷新、切分类、重启后蓝点都不再反弹。
+     */
+    private fun markTopicSeen(topicId: Long) {
+        if (!container.reading.markSeen(topicId)) return
+        fun clear(list: TopicListUiState): TopicListUiState {
+            val patched = list.items.map { item ->
+                if (item.topic.id == topicId && item.topic.unseen) {
+                    item.copy(topic = item.topic.copy(unseen = false))
+                } else item
+            }
+            return if (patched != list.items) list.copy(items = patched) else list
+        }
+        _state.update { it.copy(latest = clear(it.latest)) }
+        _categoryTopics.update { states -> states.mapValues { (_, list) -> clear(list) } }
+        _search.update { it.copy(results = clear(it.results)) }
+    }
+
+    /**
+     * 开始为这次阅读计时。
+     * 停留满 3.5s 时首次上报以建立 baseline 与初始可见楼层；
+     * 随后在帖内阅读期间按心跳（35s）周期性上报，确保两次上报间隔 < 100s，使服务端 time_read 正确累加。
+     */
+    private fun beginReadTracking(topicId: Long) {
+        if (!_syncReadProgress.value || topicId in topicEnteredAt) return
+        val now = SystemClock.elapsedRealtime()
+        topicEnteredAt[topicId] = now
+        lastReportedAt[topicId] = now
+        readReportJobs[topicId]?.cancel()
+        readReportJobs[topicId] = viewModelScope.launch {
+            delay(Config.READ_REPORT_THRESHOLD_MS)
+            val startedAt = topicEnteredAt[topicId] ?: return@launch
+            // 弱网或首拉时楼层数据可能尚未完成解析与写入，轮询等待楼层就绪（最多等 5 秒）
+            var waited = 0
+            while (_details.value[topicId]?.posts.isNullOrEmpty() && waited < 5 && topicId in topicEnteredAt) {
+                delay(1_000L)
+                waited++
+            }
+            if (topicId !in topicEnteredAt) return@launch
+            if (isTopicActive(topicId)) {
+                val stayed = SystemClock.elapsedRealtime() - startedAt
+                if (sendTimings(topicId, stayed)) {
+                    reportedReadMs[topicId] = stayed
+                    lastReportedAt[topicId] = SystemClock.elapsedRealtime()
+                }
+            } else {
+                lastReportedAt[topicId] = SystemClock.elapsedRealtime()
+            }
+
+            // 帖内驻留心跳：每隔 READ_REPORT_HEARTBEAT_MS 累计增量上报一次，维持 0 < diff < 100s
+            while (isActive && topicId in topicEnteredAt) {
+                delay(Config.READ_REPORT_HEARTBEAT_MS)
+                if (topicId !in topicEnteredAt) break
+                if (!isTopicActive(topicId)) {
+                    // 页面失活或应用处于后台：暂停心跳上报，顺延基准时间
+                    lastReportedAt[topicId] = SystemClock.elapsedRealtime()
+                    continue
+                }
+                val lastReport = lastReportedAt[topicId] ?: SystemClock.elapsedRealtime()
+                val delta = SystemClock.elapsedRealtime() - lastReport
+                if (delta >= 10_000L) {
+                    if (sendTimings(topicId, delta)) {
+                        reportedReadMs[topicId] = (reportedReadMs[topicId] ?: 0L) + delta
+                        lastReportedAt[topicId] = SystemClock.elapsedRealtime()
+                    }
+                }
+            }
+        }
+    }
+
+    /** 离开话题。停留时长比上次上报多出一截时在有效窗口（5s~90s）内补报一次。 */
+    fun leaveTopic(topicId: Long) {
+        setTopicActive(topicId, false)
+        readReportJobs.remove(topicId)?.cancel()
+        val startedAt = topicEnteredAt.remove(topicId) ?: return
+        val lastReport = lastReportedAt.remove(topicId) ?: startedAt
+        reportedReadMs.remove(topicId)
+        val pendingSet = pendingVisiblePostsByTopic.remove(topicId)
+        val currentVisible = currentVisiblePostsByTopic.remove(topicId).orEmpty()
+        if (!_syncReadProgress.value) return
+        val now = SystemClock.elapsedRealtime()
+        val totalStayed = now - startedAt
+        if (totalStayed < Config.READ_REPORT_THRESHOLD_MS) return
+        val pendingDelta = now - lastReport
+        // 增量需在有效上报窗口内（>= 5s 且 < 90s，上游 Discourse 仅在 diff < 100s 时累加阅读时长）
+        if (pendingDelta in 5_000L..90_000L) {
+            val batch = pendingSet?.take(READ_REPORT_POST_CAP)?.takeIf { it.isNotEmpty() }
+                ?: currentVisible.take(READ_REPORT_POST_CAP)
+            if (batch.isNotEmpty()) {
+                viewModelScope.launch {
+                    sendTimings(topicId, pendingDelta, numbersOverride = batch)
+                }
+            }
+        }
+    }
+
+    private suspend fun sendTimings(
+        topicId: Long,
+        timeMs: Long,
+        numbersOverride: List<Int>? = null,
+    ): Boolean {
+        // 优先使用显式指定的楼层列表或待上报队列中的可见楼层（FIFO 顺序取至多 60 楼）
+        val pendingSet = pendingVisiblePostsByTopic[topicId]
+        val candidateNumbers = numbersOverride
+            ?: pendingSet?.take(READ_REPORT_POST_CAP)?.takeIf { it.isNotEmpty() }
+            ?: currentVisiblePostsByTopic[topicId]?.take(READ_REPORT_POST_CAP).orEmpty()
+        val numbers = candidateNumbers.filter { it > 0 }.distinct()
+        // 严禁回退到整个话题已加载楼层：若从未采集到屏幕可见楼层，坚决不虚报未读楼层
+        if (numbers.isEmpty()) return false
+
+        val success = repository.recordTopicTimings(topicId, timeMs, numbers)
+        if (success && numbersOverride == null) {
+            // 心跳上报成功后，从待上报队列中剔除已结算批次
+            pendingSet?.removeAll(numbers.toSet())
+        }
+        return success
     }
 
     fun loadProfile(section: ProfileSection, refresh: Boolean = false, more: Boolean = false) {
@@ -817,7 +1274,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
             try {
-                val freshTopic = repository.fetchTopic(id)
+                // 默认带上 track_visit=true 记录用户活跃与话题浏览。
+                val freshTopic = repository.fetchTopic(id, trackVisit = true)
                 val freshById = freshTopic.postStream.posts.associateBy { it.id }
                 val latest = _details.value[id] ?: current
                 val wasAtEnd = latest.remaining.isEmpty()
@@ -869,6 +1327,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun loadTopic(id: Long, more: Boolean = false, retry: Boolean = false, postNumber: Int? = null, previous: Boolean = false) {
         val current = _details.value[id] ?: DetailUiState()
+        if (!more && !previous) {
+            markTopicSeen(id)
+            beginReadTracking(id)
+        }
         val targetLoaded = postNumber == null || current.posts.any { it.postNumber == postNumber }
         val isExplicitJump = !more && !previous && postNumber != null && !targetLoaded
         if (current.reactingPosts.isNotEmpty() || (current.loading && !isExplicitJump)) return
@@ -884,7 +1346,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             _details.update { it + (id to current.copy(loading = true, error = null)) }
             try {
                 if (more || previous) {
-                    val requested = if (previous) current.previousIds.takeLast(20) else current.remaining.take(20)
+                    val requested = when {
+                        previous -> current.previousIds.takeLast(20)
+                        // 倒序是由新到旧回溯,所以从尚未加载的楼层尾部往前取。
+                        current.descending -> current.remaining.takeLast(20)
+                        else -> current.remaining.take(20)
+                    }
                     val posts = repository.fetchPosts(id, requested)
                     _details.update {
                         val latest = it[id] ?: current
@@ -896,7 +1363,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         ))
                     }
                 } else {
-                    val topic = repository.fetchTopic(id, postNumber)
+                    val topic = repository.fetchTopic(id, postNumber, trackVisit = true)
                     val category = repository.categoryById(topic.categoryId)
                     val emojis = repository.emojiUrls()
                     val rootPost = current.posts.filter { it.postNumber == 1 }
@@ -917,6 +1384,66 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 handlePageFailure(error) { loadTopic(id, more, retry = true, postNumber = postNumber, previous = previous) }
             } finally {
                 _details.update { states -> states[id]?.let { states + (id to it.copy(loading = false)) } ?: states }
+            }
+        }
+    }
+
+    /**
+     * 切换评论区正序 / 倒序。
+     *
+     * 短帖(楼层已全在手上)和切回正序都是纯内存翻转,0 网络请求。
+     * 长帖切到倒序时只保留 **1 楼 + stream 尾部的连续窗口**,而不是把开头的 2~20 楼和
+     * 尾部的 281~300 楼混排:混排一是滑过 #281 会直接跳到 #20、中间断层两百多楼,
+     * 二是 #299 若回复过 #5,树形排列会把最新回复吸进排在最底部的 #5 楼中楼里。
+     * 切回正序时 windowStartId 仍指着尾窗首个,现有的"加载之前的楼层"缺口会自动补位。
+     */
+    fun toggleCommentOrder(topicId: Long) {
+        val current = _details.value[topicId] ?: return
+        if (current.loading || current.refreshing) return
+        val target = !current.descending
+        val stream = current.topic?.postStream?.stream.orEmpty()
+        val tail = stream.takeLast(TAIL_WINDOW)
+        val tailMissing = tail.filterNot { it in current.consumedIds }
+        if (!target || tailMissing.isEmpty()) {
+            _details.update { states ->
+                states[topicId]?.let { states + (topicId to it.copy(descending = target)) } ?: states
+            }
+            return
+        }
+        pageJobs["topic:$topicId"]?.cancel()
+        pageJobs["topic:$topicId"] = viewModelScope.launch {
+            _details.update { it + (topicId to current.copy(loading = true, error = null, descending = true)) }
+            try {
+                val fetched = repository.fetchPosts(topicId, tailMissing)
+                _details.update { states ->
+                    val latest = states[topicId] ?: return@update states
+                    val merged = (latest.posts.filter { it.postNumber == 1 || it.id in tail } + fetched)
+                        .distinctBy { it.id }
+                        .sortedBy { it.postNumber }
+                    val anchor = merged.firstOrNull { it.postNumber > 1 } ?: merged.firstOrNull()
+                    states + (topicId to latest.copy(
+                        posts = merged,
+                        consumedIds = merged.map { it.id }.toSet(),
+                        windowStartId = anchor?.id ?: latest.windowStartId,
+                        // 窗口换了一批楼层,楼中楼的游标和"已取完"标记跟着作废,否则展开按钮会点不动。
+                        replyCursors = emptyMap(),
+                        completedReplies = emptySet(),
+                        descending = true,
+                        error = null,
+                        failedLoad = DetailLoad.Topic,
+                    ))
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                _details.update { states ->
+                    states[topicId]?.let {
+                        states + (topicId to it.copy(descending = current.descending, error = error.message ?: "切换顺序失败"))
+                    } ?: states
+                }
+                handlePageFailure(error) { toggleCommentOrder(topicId) }
+            } finally {
+                _details.update { states -> states[topicId]?.let { states + (topicId to it.copy(loading = false)) } ?: states }
             }
         }
     }
@@ -1747,16 +2274,35 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun switchHomeFeed(feed: HomeFeedType) {
+        if (_state.value.homeFeed == feed) return
+        val cached = _feedStates.value[feed]
+        _state.update {
+            it.copy(
+                homeFeed = feed,
+                latest = cached ?: TopicListUiState(initialLoading = true),
+            )
+        }
+        store.saveHomeFeed(feed.name)
+        if (cached == null || (cached.items.isEmpty() && !cached.loadingMore && !cached.refreshing)) {
+            viewModelScope.launch { loadFeed(feed, page = 0, pullRefresh = false) }
+        }
+    }
+
     fun refreshLatest() {
-        viewModelScope.launch { loadLatest(page = 0, pullRefresh = true) }
+        val feed = _state.value.homeFeed
+        viewModelScope.launch { loadFeed(feed, page = 0, pullRefresh = true) }
     }
 
     fun retryLatest() {
-        viewModelScope.launch { loadLatest(page = 0, pullRefresh = false) }
+        val feed = _state.value.homeFeed
+        viewModelScope.launch { loadFeed(feed, page = 0, pullRefresh = false) }
     }
 
     fun loadMoreLatest() {
-        viewModelScope.launch { loadLatest(page = _state.value.latest.page + 1, pullRefresh = false) }
+        val feed = _state.value.homeFeed
+        val currentPage = _feedStates.value[feed]?.page ?: _state.value.latest.page
+        viewModelScope.launch { loadFeed(feed, page = currentPage + 1, pullRefresh = false) }
     }
 
     fun setPath(path: NetworkPath) {
@@ -1797,29 +2343,45 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val hasSession = cookies.containsKey(Config.SESSION_COOKIE)
         when (_state.value.screen) {
             Screen.Verify -> when {
-                hasSession -> {
-                    verifying = true
-                    pendingEmailLoginToken = null
-                    diagnostics.log("安全验证完成,重新校验会话")
-                    boot()
-                }
-                // 页面不再被挑战但仍无会话:本来就没登录,回登录页收场,不要在这里干等。
-                pendingEmailLoginToken == null -> {
-                    diagnostics.log("安全验证通过但无会话,回到登录页")
-                    enterWebScreen(Screen.Login)
-                }
-                // 被 CF 拦下的邮件登录:验证一过就重放,重放自己收尾。
-                else -> {
+                pendingEmailLoginToken != null -> {
                     val token = pendingEmailLoginToken ?: return
                     verifying = true
                     pendingEmailLoginToken = null
                     diagnostics.log("安全验证完成,重放邮件登录")
                     retryEmailLogin(token)
                 }
+                resumeAfterVerification != null -> {
+                    verifying = true
+                    val resume = resumeAfterVerification
+                    resumeAfterVerification = null
+                    diagnostics.log("安全验证完成,恢复中断的操作")
+                    _state.update { it.copy(screen = Screen.List) }
+                    verifying = false
+                    resume?.invoke()
+                }
+                hasSession -> {
+                    verifying = true
+                    diagnostics.log("安全验证完成,重新校验会话")
+                    boot()
+                }
+                // 页面不再被挑战但仍无会话:本来就没登录,回登录页收场,不要在这里干等。
+                else -> {
+                    diagnostics.log("安全验证通过但无会话,回到登录页")
+                    enterWebScreen(Screen.Login)
+                }
             }
-            Screen.Login -> if (hasSession) {
+            Screen.Login -> if (hasSession && !verifying) {
                 verifying = true
-                boot()
+                diagnostics.log("检测到登录 Cookie _t，正在校验服务端真实会话...")
+                val verifiedUser = runCatching { repository.fetchCurrentUser() }.getOrNull()
+                if (!verifiedUser.isNullOrBlank()) {
+                    diagnostics.log("服务端会话确认有效 (用户: $verifiedUser)，关闭弹层进入论坛")
+                    _loginUiState.update { LoginUiState() }
+                    boot()
+                } else {
+                    diagnostics.log("Cookie 存在但服务端尚未建立有效会话，继续等待页面完成登录")
+                    verifying = false
+                }
             }
             else -> Unit
         }
@@ -1831,6 +2393,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         unreadJob?.cancel()
         pageJobs.values.forEach { it.cancel() }
         pageJobs.clear()
+        readReportJobs.values.forEach { it.cancel() }
+        readReportJobs.clear()
+        topicEnteredAt.clear()
+        lastReportedAt.clear()
+        reportedReadMs.clear()
+        activeTopicIds.clear()
+        pendingVisiblePostsByTopic.clear()
+        currentVisiblePostsByTopic.clear()
         resumeAfterVerification = null
         pendingEmailLoginToken = null
         container.preferences.edit { remove("cached_username") }
@@ -1846,7 +2416,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             store.clear()
             browser.reset()
             diagnostics.log("已登出并清除 Cookie")
-            _state.update { UiState(path = it.path, userAgent = it.userAgent) }
+            _feedStates.value = emptyMap()
+            _state.update { UiState(path = it.path, userAgent = it.userAgent, homeFeed = initialHomeFeed) }
+            _loginUiState.update {
+                LoginUiState(
+                    savedLogin = store.savedLogin().orEmpty(),
+                    savedPassword = store.savedPassword().orEmpty(),
+                    rememberPassword = store.isRememberPassword(),
+                )
+            }
             enterWebScreen(Screen.Login)
         }
     }
@@ -1861,79 +2439,100 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    private suspend fun loadLatest(page: Int, pullRefresh: Boolean) =
+        loadFeed(_state.value.homeFeed, page, pullRefresh)
 
-    private suspend fun loadLatest(page: Int, pullRefresh: Boolean) {
-        val current = _state.value.latest
+    private suspend fun loadFeed(feed: HomeFeedType, page: Int, pullRefresh: Boolean) {
+        val current = _feedStates.value[feed] ?: _state.value.latest
         if (latestLoading || current.refreshing || current.loadingMore) return
         latestLoading = true
 
-        _state.update {
-            it.copy(
-                latest = current.copy(
-                    refreshing = pullRefresh && page == 0,
-                    loadingMore = page > 0,
-                    initialLoading = page == 0 && current.items.isEmpty() && !pullRefresh,
-                    error = null,
-                ),
-            )
+        val loadingState = current.copy(
+            refreshing = pullRefresh && page == 0,
+            loadingMore = page > 0,
+            initialLoading = page == 0 && current.items.isEmpty() && !pullRefresh,
+            error = null,
+        )
+        _feedStates.update { it + (feed to loadingState) }
+        if (_state.value.homeFeed == feed) {
+            _state.update { it.copy(latest = loadingState) }
         }
+
         try {
-            val result = repository.fetchLatest(page, awaitCategories = false)
+            val result = repository.fetchFeed(feed, page, awaitCategories = false)
             if (page == 0 && pageJobs["sync:categories"]?.isActive != true && repository.cachedCategoryList() == null) {
                 syncCategoriesInBackground()
             }
-            _state.update { state ->
-                val merged = if (page == 0) {
-                    result.items
-                } else {
-                    (state.latest.items + result.items).distinctBy { it.topic.id }
-                }
-                state.copy(
-                    latest = state.latest.copy(
-                        items = merged,
-                        page = page,
-                        hasMore = result.hasMore && (page == 0 || merged.size > state.latest.items.size),
-                        refreshing = false,
-                        loadingMore = false,
-                        initialLoading = false,
-                        error = null,
-                    ),
-                )
+            val existing = _feedStates.value[feed]?.items ?: emptyList()
+            val merged = if (page == 0) {
+                result.items
+            } else {
+                (existing + result.items).distinctBy { it.topic.id }
+            }
+            val newState = current.copy(
+                items = merged,
+                page = page,
+                hasMore = result.hasMore && (page == 0 || merged.size > existing.size),
+                refreshing = false,
+                loadingMore = false,
+                initialLoading = false,
+                error = null,
+            )
+            _feedStates.update { it + (feed to newState) }
+            if (_state.value.homeFeed == feed) {
+                _state.update { it.copy(latest = newState) }
             }
             refreshCookieInfo()
         } catch (error: CancellationException) {
             throw error
         } catch (error: NeedsInteractiveVerification) {
-            settleLoading()
+            settleFeedLoading(feed)
             enterWebScreen(Screen.Verify, error.message.orEmpty())
         } catch (error: HttpStatusException) {
-            diagnostics.log("加载失败: ${error.message}")
-            settleLoading(error.message)
+            val msg = if (error.status == 403 && (_state.value.username == null || (feed == HomeFeedType.Unread || feed == HomeFeedType.Posted))) {
+                "请先登录账号后查看${feed.label}"
+            } else {
+                error.message ?: "加载失败 (HTTP ${error.status})"
+            }
+            diagnostics.log("加载 ${feed.label} 失败: $msg")
+            settleFeedLoading(feed, msg)
         } catch (error: Exception) {
-            diagnostics.log("加载异常: ${error.message}")
-            settleLoading(error.message ?: error.javaClass.simpleName)
+            diagnostics.log("加载 ${feed.label} 异常: ${error.message}")
+            settleFeedLoading(feed, error.message ?: error.javaClass.simpleName)
         } finally {
             latestLoading = false
         }
     }
 
-    private fun settleLoading(message: String? = null) {
-        _state.update {
-            it.copy(
-                latest = it.latest.copy(
-                    refreshing = false,
-                    loadingMore = false,
-                    initialLoading = false,
-                    error = message,
-                ),
-            )
+    private fun settleFeedLoading(feed: HomeFeedType, message: String? = null) {
+        val current = _feedStates.value[feed] ?: _state.value.latest
+        val settled = current.copy(
+            refreshing = false,
+            loadingMore = false,
+            initialLoading = false,
+            error = message,
+        )
+        _feedStates.update { it + (feed to settled) }
+        if (_state.value.homeFeed == feed) {
+            _state.update { it.copy(latest = settled) }
         }
     }
+
+    private fun settleLoading(message: String? = null) =
+        settleFeedLoading(_state.value.homeFeed, message)
 
     private fun refreshCookieInfo() {
         val cookies = store.syncFromWebView()
         _state.update {
             it.copy(cookieNames = cookies.keys.sorted(), cookieSavedAt = store.savedAtMillis())
         }
+    }
+
+    private companion object {
+        /** 长帖切倒序时一次拉取的尾部楼层数,与 fetchPosts 的单批上限一致。 */
+        const val TAIL_WINDOW = 20
+
+        /** 单次阅读进度上报最多携带多少个楼层号。 */
+        const val READ_REPORT_POST_CAP = 60
     }
 }

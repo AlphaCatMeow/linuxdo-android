@@ -1,8 +1,10 @@
 package org.linuxdo.android.ui.screen
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTransformGestures
@@ -28,12 +30,15 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.scale
 import androidx.compose.ui.semantics.contentDescription
@@ -55,8 +60,20 @@ import androidx.compose.ui.text.withLink
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.graphics.Outline
+import androidx.compose.ui.graphics.Shape
+import androidx.compose.ui.unit.Density
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntRect
+import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import androidx.compose.ui.window.Popup
+import androidx.compose.ui.window.PopupPositionProvider
+import androidx.compose.ui.window.PopupProperties
 import android.content.ContentValues
 import android.content.Context
 import android.net.Uri
@@ -132,10 +149,12 @@ fun TopicDetailScreen(
     onAttach: (Uri) -> Unit,
     topicId: Long,
     onRefresh: () -> Unit = {},
+    onToggleOrder: () -> Unit = {},
     onOpenTopic: (Long, String, Int?) -> Unit = { _, _, _ -> },
     active: Boolean = true,
     initialPostNumber: Int? = null,
     trailing: @Composable () -> Unit = {},
+    onPostsVisible: (List<Int>) -> Unit = {},
 ) {
     val list = rememberLazyListState()
     val pullState = rememberPullToRefreshState()
@@ -150,9 +169,17 @@ fun TopicDetailScreen(
     val topicAuthorUsername = remember(state.posts) {
         state.posts.firstOrNull { it.postNumber == 1 }?.username
     }
-    val rows = remember(state.posts, treeView, collapsed, expanded) {
-        if (treeView) threadRows(state.posts, collapsed.toSet(), expanded.toSet())
-        else state.posts.sortedBy { it.postNumber }.map { TreePost(it, 0, 0, false) }
+    val rows = remember(state.posts, treeView, collapsed, expanded, state.descending) {
+        if (treeView) {
+            threadRows(state.posts, collapsed.toSet(), expanded.toSet(), descending = state.descending)
+        } else {
+            // 平铺模式同样只翻转评论区,1 楼主贴保持置顶。
+            val sorted = state.posts.sortedBy { it.postNumber }
+            val op = sorted.filter { it.postNumber == 1 }
+            val comments = sorted.filterNot { it.postNumber == 1 }
+                .let { if (state.descending) it.asReversed() else it }
+            (op + comments).map { TreePost(it, 0, 0, false) }
+        }
     }
     LaunchedEffect(highlightedPost) {
         if (highlightedPost != null) {
@@ -167,13 +194,19 @@ fun TopicDetailScreen(
         if (active && located && nearEnd && !state.loading && state.error == null &&
             state.posts.isNotEmpty() && state.remaining.isNotEmpty()) onLoadMore()
     }
-    // 楼层进度取"最靠下的可见楼层",和网页端的阅读进度一致。
-    // 用 item key(post.id) 反查,而不是用列表下标 —— 标题、错误条、"加载之前的楼层"
-    // 都会挤占下标,算偏移量很容易错。
-    val currentPostNumber by remember(rows) { derivedStateOf {
-        val visible = list.layoutInfo.visibleItemsInfo.mapNotNull { it.key as? Long }.toSet()
-        rows.lastOrNull { it.post.id in visible }?.post?.postNumber
+    // 真实屏幕可见楼层提取（依据 Discourse screen-track.js 规范，仅上报在屏幕上可见的楼层号）
+    val visiblePostNumbers by remember(rows) { derivedStateOf {
+        val visibleIds = list.layoutInfo.visibleItemsInfo.mapNotNull { it.key as? Long }.toSet()
+        rows.filter { it.post.id in visibleIds }.map { it.post.postNumber }
     } }
+    val currentPostNumber by remember(rows, visiblePostNumbers) { derivedStateOf {
+        visiblePostNumbers.maxOrNull()
+    } }
+    LaunchedEffect(visiblePostNumbers) {
+        if (visiblePostNumbers.isNotEmpty()) {
+            onPostsVisible(visiblePostNumbers)
+        }
+    }
     val totalPosts = state.topic?.postStream?.stream?.size ?: 0
     val firstPostLoaded = state.posts.any { it.postNumber == 1 }
     val showTopError = !located || state.failedLoad == DetailLoad.Previous
@@ -194,16 +227,28 @@ fun TopicDetailScreen(
             expanded = (expanded + targets).distinct()
         }
     }
-    val hasPinnedRoot = state.previousIds.isNotEmpty() &&
-        rows.firstOrNull()?.post?.postNumber == 1 &&
-        rows.size > 1
-    val headRows = if (hasPinnedRoot) rows.take(1) else emptyList()
-    val bodyRows = if (hasPinnedRoot) rows.drop(1) else rows
+    // 1 楼在手上时就把它单独拆出来:它既要在前序缺口之上保持置顶,也是评论区头部栏的锚点。
+    val opPinned = rows.firstOrNull()?.post?.postNumber == 1
+    val headRows = if (opPinned) rows.take(1) else emptyList()
+    val bodyRows = if (opPinned) rows.drop(1) else rows
+    val replyTotal = (totalPosts - 1).coerceAtLeast(0)
+    val showOrderBar = opPinned && (bodyRows.isNotEmpty() || replyTotal > 0)
+    val topErrorCount = if (showTopError && state.error != null) 1 else 0
 
     fun lazyIndexOf(rowIndex: Int): Int {
-        val topErrorCount = if (showTopError && state.error != null) 1 else 0
-        val gapBefore = if (state.previousIds.isNotEmpty() && (!hasPinnedRoot || rowIndex >= 1)) 1 else 0
-        return 1 + topErrorCount + gapBefore + rowIndex
+        val afterHead = rowIndex >= headRows.size
+        val orderBarBefore = if (showOrderBar && afterHead) 1 else 0
+        val gapBefore = if (state.previousIds.isNotEmpty() && afterHead) 1 else 0
+        return 1 + topErrorCount + orderBarBefore + gapBefore + rowIndex
+    }
+
+    // 切换正/倒序后把视口带回评论区头部,否则用户会停在原先的滚动偏移上、看不出顺序变了。
+    var lastDescending by remember { mutableStateOf(state.descending) }
+    LaunchedEffect(state.descending, state.loading, rows) {
+        if (lastDescending == state.descending || state.loading) return@LaunchedEffect
+        lastDescending = state.descending
+        if (!showOrderBar) return@LaunchedEffect
+        list.scrollToItem(1 + topErrorCount + headRows.size)
     }
 
     LaunchedEffect(active, initialPostNumber, state.posts, rows, treeView, state.loading, state.error, located, state.previousIds.isNotEmpty()) {
@@ -553,6 +598,14 @@ fun TopicDetailScreen(
                             item("top-error") { ErrorNotice(message, onRetry) }
                         }
                         items(headRows, key = { it.post.id }) { row -> RenderPostEntry(row) }
+                        if (showOrderBar) item("order-bar") {
+                            CommentOrderBar(
+                                total = replyTotal,
+                                descending = state.descending,
+                                busy = state.loading || state.refreshing,
+                                onToggle = onToggleOrder,
+                            )
+                        }
                         if (state.previousIds.isNotEmpty()) item("load-previous") {
                             PreviousSliceGap(
                                 hiddenCount = state.previousIds.size,
@@ -569,9 +622,18 @@ fun TopicDetailScreen(
                             item("empty") { EmptyNotice() }
                         }
                         if (state.posts.isNotEmpty() && state.remaining.isEmpty() && !state.loading && state.error == null) {
-                            item("end") { Text(if (state.previousIds.isEmpty()) "已显示全部可见楼层" else "已到话题末尾",
-                                color = IosTheme.colors.secondaryLabel,
-                                style = IosTheme.type.footnote, modifier = Modifier.padding(20.dp)) }
+                            item("end") {
+                                Text(
+                                    text = when {
+                                        state.descending -> "已显示到最早的回复"
+                                        state.previousIds.isEmpty() -> "已显示全部可见楼层"
+                                        else -> "已到话题末尾"
+                                    },
+                                    color = IosTheme.colors.secondaryLabel,
+                                    style = IosTheme.type.footnote,
+                                    modifier = Modifier.padding(20.dp),
+                                )
+                            }
                         }
                     }
                     // 左下角放阅读进度胶囊，右下角放回复按钮，配合列表底部 76dp 留白，彻底避免遮挡最后一条评论的操作栏。
@@ -613,11 +675,60 @@ fun TopicDetailScreen(
     }
 }
 
+/**
+ * 评论区头部栏:左侧总回复数,右侧 iOS 分段控件样式的「正序 / 倒序」胶囊。
+ * 固定跟在 1 楼下方 —— 顺序只作用于评论,主贴不参与翻转。
+ */
+@Composable
+private fun CommentOrderBar(total: Int, descending: Boolean, busy: Boolean, onToggle: () -> Unit) {
+    Column(Modifier.fillMaxWidth().background(IosTheme.colors.card)) {
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = if (total > 0) "全部回复 $total" else "全部回复",
+                style = IosTheme.type.subheadline,
+                fontWeight = FontWeight.SemiBold,
+                color = IosTheme.colors.label,
+            )
+            Spacer(Modifier.weight(1f))
+            Row(
+                Modifier
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(IosTheme.colors.fieldBackground)
+                    .padding(2.dp),
+            ) {
+                OrderSegment("正序", selected = !descending, enabled = !busy) { if (descending) onToggle() }
+                OrderSegment("倒序", selected = descending, enabled = !busy) { if (!descending) onToggle() }
+            }
+        }
+        IosDivider()
+    }
+}
+
+@Composable
+private fun OrderSegment(label: String, selected: Boolean, enabled: Boolean, onClick: () -> Unit) {
+    Box(
+        Modifier
+            .clip(RoundedCornerShape(6.dp))
+            .background(if (selected) IosTheme.colors.card else Color.Transparent)
+            .clickable(enabled = enabled && !selected, onClick = onClick)
+            .padding(horizontal = 12.dp, vertical = 4.dp),
+    ) {
+        Text(
+            text = label,
+            style = IosTheme.type.footnote,
+            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+            color = if (selected) IosTheme.colors.label else IosTheme.colors.secondaryLabel,
+        )
+    }
+}
+
 private data class InternalTopicLink(
     val topicId: Long,
     val postNumber: Int? = null,
 )
-
 /**
  * 解析站内（linux.do）帖子链接，支持：
  * - `https://linux.do/t/{slug}/{topicId}`
@@ -779,27 +890,33 @@ private fun ManageAction(label: String, action: PostAction, color: Color, onClic
     }
 }
 
-/** 回复整个话题的入口。做成圆形纯图标,和进度胶囊上下错开,互不遮挡。 */
+/** 回复整个话题的入口。淡雅蓝白微光质感,与页面底色及阅读进度胶囊自然呼应。 */
 @Composable
 private fun ReplyFab(enabled: Boolean, onClick: () -> Unit) {
-    val background = if (enabled) IosTheme.colors.accent else IosTheme.colors.tertiaryLabel
+    val tintColor = if (enabled) IosTheme.colors.accent else IosTheme.colors.tertiaryLabel
+    val bgBase = IosTheme.colors.card.copy(alpha = 0.95f)
+    val bgTint = tintColor.copy(alpha = if (enabled) 0.12f else 0.05f)
+    val borderColor = tintColor.copy(alpha = if (enabled) 0.28f else 0.12f)
     Box(
         Modifier
-            .size(48.dp)
+            .size(46.dp)
+            .shadow(elevation = 3.dp, shape = CircleShape, clip = false)
             .clip(CircleShape)
-            .background(background)
+            .background(bgBase)
+            .background(bgTint)
+            .border(1.dp, borderColor, CircleShape)
             .clickable(enabled = enabled, onClick = onClick)
             .semantics { contentDescription = "回复这个话题" },
         contentAlignment = Alignment.Center,
     ) {
-        Canvas(Modifier.size(22.dp)) {
+        Canvas(Modifier.size(20.dp)) {
             scale(size.width / 24f, size.height / 24f, pivot = Offset.Zero) {
                 val arrow = Path().apply {
                     moveTo(10f, 5f); lineTo(3f, 11f); lineTo(10f, 17f)
                     lineTo(10f, 13f); cubicTo(17f, 12f, 19f, 15f, 21f, 20f)
                     cubicTo(21f, 10f, 17f, 8f, 10f, 9f); close()
                 }
-                drawPath(arrow, Color.White)
+                drawPath(arrow, tintColor)
             }
         }
     }
@@ -829,7 +946,100 @@ private fun ReadingProgressPill(current: Int, total: Int, modifier: Modifier = M
     }
 }
 
-/** 回复 / 编辑共用的输入弹层。 */
+/** 全屏/退出全屏切换按钮图标 (四个朝外直角展开 / 四个朝内折角收起) */
+@Composable
+private fun FullscreenToggleIcon(isFullScreen: Boolean, tint: Color, modifier: Modifier = Modifier) {
+    Canvas(modifier.size(18.dp)) {
+        scale(size.width / 24f, size.height / 24f, pivot = Offset.Zero) {
+            val stroke = Stroke(width = 2.2f, cap = StrokeCap.Round, join = StrokeJoin.Round)
+            if (!isFullScreen) {
+                // 四个直角朝外：全屏展开模式
+                val p1 = Path().apply { moveTo(3f, 8f); lineTo(3f, 3f); lineTo(8f, 3f) }
+                val p2 = Path().apply { moveTo(16f, 3f); lineTo(21f, 3f); lineTo(21f, 8f) }
+                val p3 = Path().apply { moveTo(21f, 16f); lineTo(21f, 21f); lineTo(16f, 21f) }
+                val p4 = Path().apply { moveTo(8f, 21f); lineTo(3f, 21f); lineTo(3f, 16f) }
+                drawPath(p1, tint, style = stroke)
+                drawPath(p2, tint, style = stroke)
+                drawPath(p3, tint, style = stroke)
+                drawPath(p4, tint, style = stroke)
+            } else {
+                // 四个折角朝内：恢复 1/3 模式
+                val p1 = Path().apply { moveTo(3f, 8f); lineTo(8f, 8f); lineTo(8f, 3f) }
+                val p2 = Path().apply { moveTo(16f, 3f); lineTo(16f, 8f); lineTo(21f, 8f) }
+                val p3 = Path().apply { moveTo(21f, 16f); lineTo(16f, 16f); lineTo(16f, 21f) }
+                val p4 = Path().apply { moveTo(8f, 21f); lineTo(8f, 16f); lineTo(3f, 16f) }
+                drawPath(p1, tint, style = stroke)
+                drawPath(p2, tint, style = stroke)
+                drawPath(p3, tint, style = stroke)
+                drawPath(p4, tint, style = stroke)
+            }
+        }
+    }
+}
+
+/** 贴吧风格图片选择图标：圆角矩形外框 + 小太阳 + 起伏山峰 */
+@Composable
+private fun ComposerImageIcon(tint: Color, modifier: Modifier = Modifier) {
+    Canvas(modifier.size(22.dp)) {
+        scale(size.width / 24f, size.height / 24f, pivot = Offset.Zero) {
+            val stroke = Stroke(width = 1.8f, cap = StrokeCap.Round, join = StrokeJoin.Round)
+            // 外边框圆角矩形 (3, 3) 宽高 18x18
+            val rectPath = Path().apply {
+                addRoundRect(
+                    androidx.compose.ui.geometry.RoundRect(
+                        left = 3f, top = 3f, right = 21f, bottom = 21f,
+                        radiusX = 4f, radiusY = 4f
+                    )
+                )
+            }
+            drawPath(rectPath, tint, style = stroke)
+            // 左上角小太阳圆点
+            drawCircle(tint, radius = 1.5f, center = Offset(7.5f, 7.5f))
+            // 起伏山峰线条
+            val mountain = Path().apply {
+                moveTo(3.5f, 17f)
+                lineTo(8.5f, 11.5f)
+                lineTo(13f, 16f)
+                lineTo(16.5f, 12f)
+                lineTo(20.5f, 16.5f)
+            }
+            drawPath(mountain, tint, style = stroke)
+        }
+    }
+}
+
+/** 贴吧风格附件图标：右上折角纸张 + 内部两道横线 */
+@Composable
+private fun ComposerAttachmentIcon(tint: Color, modifier: Modifier = Modifier) {
+    Canvas(modifier.size(22.dp)) {
+        scale(size.width / 24f, size.height / 24f, pivot = Offset.Zero) {
+            val stroke = Stroke(width = 1.8f, cap = StrokeCap.Round, join = StrokeJoin.Round)
+            // 折角文件外轮廓
+            val doc = Path().apply {
+                moveTo(6f, 3f)
+                lineTo(14f, 3f)
+                lineTo(19f, 8f)
+                lineTo(19f, 21f)
+                lineTo(6f, 21f)
+                close()
+            }
+            drawPath(doc, tint, style = stroke)
+            // 折角折痕
+            val fold = Path().apply {
+                moveTo(14f, 3f)
+                lineTo(14f, 8f)
+                lineTo(19f, 8f)
+            }
+            drawPath(fold, tint, style = stroke)
+            // 文本横线1
+            drawLine(tint, Offset(9f, 13f), Offset(15f, 13f), strokeWidth = 1.8f, cap = StrokeCap.Round)
+            // 文本横线2
+            drawLine(tint, Offset(9f, 17f), Offset(16f, 17f), strokeWidth = 1.8f, cap = StrokeCap.Round)
+        }
+    }
+}
+
+/** 回复 / 编辑共用的输入弹层。从底部弹出,默认 1/3 屏,支持右上角一键全屏展开与收起。 */
 @Composable
 private fun ComposerDialog(
     composer: ComposerUiState,
@@ -840,11 +1050,13 @@ private fun ComposerDialog(
 ) {
     val target = composer.target ?: return
     val heading = when (target) {
-        is ComposerTarget.NewReply -> "回复话题"
-        is ComposerTarget.ReplyTo -> "回复 @${target.username} 的 #${target.postNumber}"
+        is ComposerTarget.NewReply -> "发表评论"
+        is ComposerTarget.ReplyTo -> "回复 @${target.username}"
         is ComposerTarget.Edit -> "编辑 #${target.postNumber}"
     }
     val focus = remember { FocusRequester() }
+    var isFullScreen by rememberSaveable { mutableStateOf(false) }
+
     // 系统相册选择器和 SAF 文件选择器都不需要声明存储权限。
     val pickImage = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
         uri?.let(onAttach)
@@ -853,74 +1065,208 @@ private fun ComposerDialog(
         uri?.let(onAttach)
     }
     val busy = composer.submitting || composer.uploading
-    Dialog(onDismissRequest = onClose) {
-        Column(
-            Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp))
-                .background(IosTheme.colors.card).padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
+
+    Dialog(
+        onDismissRequest = onClose,
+        properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false),
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .imePadding(),
+            contentAlignment = Alignment.BottomCenter,
         ) {
-            Text(heading, style = IosTheme.type.subheadline, fontWeight = FontWeight.SemiBold, maxLines = 2)
+            // 背景半透明暗色遮罩,点击收起弹层
             Box(
-                Modifier.fillMaxWidth().heightIn(min = 120.dp, max = 260.dp)
-                    .clip(RoundedCornerShape(10.dp)).background(IosTheme.colors.fieldBackground)
-                    // 输入框高度有上限,长文必须能在容器内滚动,否则后面输入的内容会被裁掉看不见。
-                    .verticalScroll(rememberScrollState()).padding(12.dp),
+                Modifier
+                    .fillMaxSize()
+                    .background(Color.Black.copy(alpha = 0.45f))
+                    .clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                        onClick = { if (!busy) onClose() },
+                    ),
+            )
+            // 底部抽屉面板
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .then(
+                        if (isFullScreen) Modifier.fillMaxHeight(0.92f)
+                        else Modifier.fillMaxHeight(0.36f).heightIn(min = 270.dp)
+                    )
+                    .clip(RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp))
+                    .background(IosTheme.colors.card)
+                    .clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                        onClick = {}, // 阻止点击穿透到遮罩
+                    )
+                    .padding(horizontal = 16.dp, vertical = 12.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
-                if (composer.loadingDraft) IosLoadingBox() else {
-                    BasicTextField(
-                        value = composer.draft,
-                        onValueChange = onDraftChange,
-                        enabled = !composer.submitting,
-                        textStyle = IosTheme.type.body.copy(color = IosTheme.colors.label),
-                        cursorBrush = SolidColor(IosTheme.colors.accent),
-                        modifier = Modifier.fillMaxWidth().focusRequester(focus),
-                        decorationBox = { field ->
-                            Box {
-                                if (composer.draft.isEmpty()) {
-                                    Text("支持 Markdown，输入内容…", style = IosTheme.type.body,
-                                        color = IosTheme.colors.tertiaryLabel)
+                // 顶部标题与全屏切换栏
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
+                    // 左侧轻量关闭叉号
+                    val closeColor = IosTheme.colors.secondaryLabel
+                    Box(
+                        modifier = Modifier
+                            .size(32.dp)
+                            .clip(CircleShape)
+                            .clickable(enabled = !busy) { onClose() },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Canvas(Modifier.size(12.dp)) {
+                            drawLine(closeColor, Offset(0f, 0f), Offset(size.width, size.height), strokeWidth = 1.8f, cap = StrokeCap.Round)
+                            drawLine(closeColor, Offset(size.width, 0f), Offset(0f, size.height), strokeWidth = 1.8f, cap = StrokeCap.Round)
+                        }
+                    }
+
+                    Text(
+                        heading,
+                        style = IosTheme.type.headline,
+                        fontWeight = FontWeight.SemiBold,
+                        color = IosTheme.colors.label,
+                        maxLines = 1,
+                    )
+
+                    // 右上角全屏/恢复 切换图标
+                    Box(
+                        modifier = Modifier
+                            .size(32.dp)
+                            .clip(CircleShape)
+                            .clickable { isFullScreen = !isFullScreen }
+                            .semantics { contentDescription = if (isFullScreen) "恢复三分之一屏" else "全屏显示" },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        FullscreenToggleIcon(isFullScreen = isFullScreen, tint = IosTheme.colors.label)
+                    }
+                }
+
+                // 中间输入区域 (自适应填满剩余空间)
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f)
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(IosTheme.colors.fieldBackground)
+                        .verticalScroll(rememberScrollState())
+                        .padding(12.dp),
+                ) {
+                    if (composer.loadingDraft) {
+                        IosLoadingBox()
+                    } else {
+                        BasicTextField(
+                            value = composer.draft,
+                            onValueChange = onDraftChange,
+                            enabled = !composer.submitting,
+                            textStyle = IosTheme.type.body.copy(color = IosTheme.colors.label),
+                            cursorBrush = SolidColor(IosTheme.colors.accent),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .focusRequester(focus),
+                            decorationBox = { field ->
+                                Box {
+                                    if (composer.draft.isEmpty()) {
+                                        Text(
+                                            "发贴千百度 文明第一步，支持 Markdown…",
+                                            style = IosTheme.type.body,
+                                            color = IosTheme.colors.tertiaryLabel,
+                                        )
+                                    }
+                                    field()
                                 }
-                                field()
+                            },
+                        )
+                    }
+                }
+
+                composer.error?.let {
+                    Text(it, style = IosTheme.type.footnote, color = IosTheme.colors.destructive)
+                }
+
+                // 底部操作栏: 图片/附件 Icon + 上传状态 + 右侧发送胶囊
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(top = 2.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    // 图片 Icon
+                    Box(
+                        modifier = Modifier
+                            .size(36.dp)
+                            .clip(CircleShape)
+                            .clickable(enabled = !busy) {
+                                pickImage.launch(
+                                    PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly),
+                                )
                             }
-                        },
-                    )
+                            .semantics { contentDescription = "添加图片" },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        ComposerImageIcon(tint = if (busy) IosTheme.colors.tertiaryLabel else IosTheme.colors.label)
+                    }
+
+                    Spacer(Modifier.width(8.dp))
+
+                    // 附件 Icon
+                    Box(
+                        modifier = Modifier
+                            .size(36.dp)
+                            .clip(CircleShape)
+                            .clickable(enabled = !busy) {
+                                pickFile.launch(arrayOf("*/*"))
+                            }
+                            .semantics { contentDescription = "添加附件" },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        ComposerAttachmentIcon(tint = if (busy) IosTheme.colors.tertiaryLabel else IosTheme.colors.label)
+                    }
+
+                    if (composer.uploading) {
+                        Spacer(Modifier.width(10.dp))
+                        IosActivityIndicator(diameter = 16.dp)
+                        Text(
+                            "上传中…",
+                            style = IosTheme.type.caption,
+                            color = IosTheme.colors.secondaryLabel,
+                            modifier = Modifier.padding(start = 4.dp),
+                        )
+                    }
+
+                    Spacer(Modifier.weight(1f))
+
+                    // 发送 / 保存 胶囊按钮
+                    val sendText = if (target is ComposerTarget.Edit) "保存" else "发表"
+                    val canSubmit = composer.canSubmit
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(50))
+                            .background(if (canSubmit) IosTheme.colors.accent else IosTheme.colors.accent.copy(alpha = 0.35f))
+                            .clickable(enabled = canSubmit) { onSubmit() }
+                            .padding(horizontal = 22.dp, vertical = 7.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            if (composer.submitting) {
+                                IosActivityIndicator(diameter = 14.dp)
+                                Spacer(Modifier.width(6.dp))
+                            }
+                            Text(
+                                sendText,
+                                style = IosTheme.type.subheadline.copy(fontWeight = FontWeight.Medium),
+                                color = Color.White,
+                            )
+                        }
+                    }
                 }
-            }
-            composer.error?.let { Text(it, style = IosTheme.type.footnote, color = IosTheme.colors.destructive) }
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Start,
-                verticalAlignment = Alignment.CenterVertically) {
-                IosTextAction("图片", textStyle = IosTheme.type.subheadline,
-                    color = if (busy) IosTheme.colors.tertiaryLabel else IosTheme.colors.accent) {
-                    if (!busy) pickImage.launch(
-                        PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly),
-                    )
-                }
-                IosTextAction("附件", textStyle = IosTheme.type.subheadline,
-                    color = if (busy) IosTheme.colors.tertiaryLabel else IosTheme.colors.accent) {
-                    // 放开到 */* 再由 UploadLimits 按扩展名拦:站方白名单里 zip/7z/md 这些
-                    // 在各设备上的 MIME 映射并不一致,用 MIME 过滤反而会漏掉合法文件。
-                    if (!busy) pickFile.launch(arrayOf("*/*"))
-                }
-                Spacer(Modifier.weight(1f))
-                if (composer.uploading) {
-                    IosActivityIndicator(diameter = 18.dp)
-                    Text("上传中…", style = IosTheme.type.caption,
-                        color = IosTheme.colors.secondaryLabel, modifier = Modifier.padding(start = 6.dp))
-                }
-            }
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End,
-                verticalAlignment = Alignment.CenterVertically) {
-                if (composer.submitting) IosActivityIndicator(diameter = 18.dp)
-                IosTextAction("取消", color = IosTheme.colors.secondaryLabel,
-                    textStyle = IosTheme.type.subheadline) { if (!composer.submitting) onClose() }
-                IosTextAction(
-                    if (target is ComposerTarget.Edit) "保存" else "发送",
-                    color = if (composer.canSubmit) IosTheme.colors.accent else IosTheme.colors.tertiaryLabel,
-                    textStyle = IosTheme.type.subheadline,
-                ) { if (composer.canSubmit) onSubmit() }
             }
         }
     }
+
     LaunchedEffect(target) {
         if (target !is ComposerTarget.Edit) runCatching { focus.requestFocus() }
     }
@@ -1194,61 +1540,85 @@ private fun PostActions(
             }
         }
     }
-    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End, verticalAlignment = Alignment.CenterVertically) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = 2.dp),
+        horizontalArrangement = Arrangement.End,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
         // 只有这一条楼层在提交时才转圈。
-        if (pending) IosActivityIndicator()
+        if (pending) {
+            IosActivityIndicator(diameter = 16.dp)
+            Spacer(Modifier.width(8.dp))
+        }
         if (!compact && (post.canAcceptAnswer || post.canUnacceptAnswer || post.acceptedAnswer)) {
-            Box(Modifier.size(touchSize).semantics { contentDescription = if (post.acceptedAnswer) "取消解决方案" else "设为解决方案" }
-                .clickable(enabled = !busy && (post.canAcceptAnswer || post.canUnacceptAnswer), onClick = onSolution),
-                contentAlignment = Alignment.Center) {
-                PostActionIcon(PostAction.Solution, selected = post.acceptedAnswer)
-            }
+            TiebaPostActionButton(
+                label = "解决方案",
+                action = PostAction.Solution,
+                selected = post.acceptedAnswer,
+                enabled = !busy && (post.canAcceptAnswer || post.canUnacceptAnswer),
+                compact = compact,
+                onClick = onSolution,
+            )
         }
         val selected = post.currentUserReaction?.id
         val canReact = !busy && !post.yours && (selected == null || post.currentUserReaction?.canUndo == true)
-        Box(Modifier.size(touchSize).semantics { contentDescription = "点赞，长按选择表情" }
-            .combinedClickable(enabled = canReact, onClick = { onReact("heart") }, onLongClick = { chooseReaction = true }),
-            contentAlignment = Alignment.Center) {
-            PostActionIcon(PostAction.Like, selected = selected != null)
+        Box {
+            TiebaPostActionButton(
+                label = "点赞",
+                action = PostAction.Like,
+                selected = selected != null,
+                enabled = canReact,
+                compact = compact,
+                onClick = { onReact("heart") },
+                onLongClick = { chooseReaction = true },
+            )
+            if (chooseReaction) {
+                ReactionBubblePopup(
+                    reactions = reactions,
+                    emojiUrls = emojiUrls,
+                    busy = busy,
+                    onReact = onReact,
+                    onDismiss = { chooseReaction = false },
+                )
+            }
         }
-        if (post.canBoost) Box(Modifier.size(touchSize).semantics { contentDescription = "写简评" }
-            .clickable(enabled = !busy) { composeBoost = !composeBoost }, contentAlignment = Alignment.Center) {
-            PostActionIcon(PostAction.Boost, selected = composeBoost)
+        if (canReply) {
+            TiebaPostActionButton(
+                label = "回复",
+                action = PostAction.Reply,
+                selected = false,
+                enabled = !busy,
+                compact = compact,
+                onClick = onReply,
+            )
         }
-        if (canReply) Box(Modifier.size(touchSize).semantics { contentDescription = "回复这条内容" }
-            .clickable(enabled = !busy, onClick = onReply), contentAlignment = Alignment.Center) {
-            PostActionIcon(PostAction.Reply, selected = false)
+        if (post.canBoost) {
+            Box {
+                TiebaPostActionButton(
+                    label = "boost简评",
+                    action = PostAction.Boost,
+                    selected = composeBoost,
+                    enabled = !busy,
+                    compact = compact,
+                    onClick = { composeBoost = !composeBoost },
+                )
+                if (composeBoost) {
+                    BoostBubblePopup(
+                        draft = draft,
+                        onDraftChange = { draft = it },
+                        busy = busy,
+                        onSend = { onBoost(draft) },
+                        onDismiss = { composeBoost = false },
+                    )
+                }
+            }
         }
     }
     error?.let {
         Text(it, style = IosTheme.type.footnote, color = Color(0xFFFF453A))
         IosTextAction("刷新状态", textStyle = IosTheme.type.footnote, onClick = onRefresh)
-    }
-    if (composeBoost) Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(if (compact) IosTheme.colors.card else IosTheme.colors.fieldBackground).padding(12.dp)) {
-        val length = remember(draft) { measureBoost(draft) }
-        val over = length.overVisible || length.overEmoji
-        BasicTextField(draft, onValueChange = { if (it.length <= BoostLength.RAW_INPUT_CAP) draft = it },
-            textStyle = IosTheme.type.body.copy(color = IosTheme.colors.label), modifier = Modifier.fillMaxWidth(),
-            decorationBox = { field -> Box {
-                if (draft.isEmpty()) Text("写一句简评…", color = IosTheme.colors.secondaryLabel)
-                field()
-            } })
-        // 实时计数:服务端对两项分别设限,写超了要让用户当场看见,而不是提交后才报错。
-        Text("可见 ${length.visible}/${BoostLength.MAX_VISIBLE} · 表情 ${length.emoji}/${BoostLength.MAX_EMOJI}",
-            style = IosTheme.type.caption,
-            color = if (over) IosTheme.colors.destructive else IosTheme.colors.secondaryLabel,
-            modifier = Modifier.padding(top = 8.dp))
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End, verticalAlignment = Alignment.CenterVertically) {
-            Box(Modifier.size(width = 64.dp, height = 40.dp).clickable { composeBoost = false }, contentAlignment = Alignment.Center) {
-                Text("取消", style = IosTheme.type.subheadline, color = IosTheme.colors.accent)
-            }
-            val canSend = length.submittable && !busy
-            Box(Modifier.size(width = 64.dp, height = 40.dp).clickable(enabled = canSend) { onBoost(draft) },
-                contentAlignment = Alignment.Center) {
-                Text("发送", style = IosTheme.type.subheadline,
-                    color = if (canSend) IosTheme.colors.accent else IosTheme.colors.tertiaryLabel)
-            }
-        }
     }
     if (post.boosts.isNotEmpty()) Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(6.dp)) {
       val chipBg = if (compact) IosTheme.colors.card else IosTheme.colors.fieldBackground
@@ -1272,21 +1642,6 @@ private fun PostActions(
         if (visibleBoosts < post.boosts.size) IosTextAction("更多简评 (${post.boosts.size - visibleBoosts})", textStyle = IosTheme.type.caption) { visibleBoosts += 20 }
         else if (visibleBoosts > 8) IosTextAction("收起简评", textStyle = IosTheme.type.caption) { visibleBoosts = 8 }
     }
-    if (chooseReaction) Dialog(onDismissRequest = { chooseReaction = false }) {
-        Column(Modifier.clip(RoundedCornerShape(16.dp)).background(IosTheme.colors.card).padding(16.dp)) {
-            Text("选择回应", style = IosTheme.type.title3, modifier = Modifier.padding(bottom = 12.dp))
-            (listOf("heart") + reactions).distinct().chunked(5).forEach { group ->
-                Row {
-                    group.forEach { reaction ->
-                        Box(Modifier.clickable(enabled = !busy) { chooseReaction = false; onReact(reaction) }.padding(10.dp)) {
-                            ReactionIcon(reaction, emojiUrls)
-                        }
-                    }
-                }
-            }
-            IosTextAction("取消") { chooseReaction = false }
-        }
-    }
     deleteId?.let { id -> Dialog(onDismissRequest = { deleteId = null }) {
         Column(Modifier.clip(RoundedCornerShape(16.dp)).background(IosTheme.colors.card).padding(20.dp)) {
             Text("删除这条简评？", style = IosTheme.type.title3)
@@ -1298,22 +1653,295 @@ private fun PostActions(
     } }
 }
 
+/** 向上弹出气泡的 Shape，底部带有指向下方锚点图标的倒三角形指针 */
+private class BubbleShape(
+    private val cornerRadius: Dp = 22.dp,
+    private val arrowWidth: Dp = 14.dp,
+    private val arrowHeight: Dp = 7.dp,
+    private val arrowCenterXProvider: () -> Float,
+) : Shape {
+    override fun createOutline(
+        size: androidx.compose.ui.geometry.Size,
+        layoutDirection: LayoutDirection,
+        density: Density,
+    ): Outline {
+        val arrowW = with(density) { arrowWidth.toPx() }
+        val arrowH = with(density) { arrowHeight.toPx() }
+        val radius = with(density) { cornerRadius.toPx() }
+        val bodyHeight = maxOf(0f, size.height - arrowH)
+
+        val rawCenterX = arrowCenterXProvider()
+        val centerX = if (rawCenterX.isNaN() || rawCenterX <= 0f) size.width / 2f else rawCenterX
+        val arrowLeft = (centerX - arrowW / 2f).coerceIn(radius, maxOf(radius, size.width - radius - arrowW))
+        val arrowRight = arrowLeft + arrowW
+
+        val path = Path().apply {
+            moveTo(radius, 0f)
+            lineTo(size.width - radius, 0f)
+            arcTo(
+                Rect(size.width - 2 * radius, 0f, size.width, 2 * radius),
+                -90f, 90f, false
+            )
+            lineTo(size.width, bodyHeight - radius)
+            arcTo(
+                Rect(size.width - 2 * radius, bodyHeight - 2 * radius, size.width, bodyHeight),
+                0f, 90f, false
+            )
+            lineTo(arrowRight, bodyHeight)
+            lineTo(arrowLeft + arrowW / 2f, size.height)
+            lineTo(arrowLeft, bodyHeight)
+            lineTo(radius, bodyHeight)
+            arcTo(
+                Rect(0f, bodyHeight - 2 * radius, 2 * radius, bodyHeight),
+                90f, 90f, false
+            )
+            lineTo(0f, radius)
+            arcTo(
+                Rect(0f, 0f, 2 * radius, 2 * radius),
+                180f, 90f, false
+            )
+            close()
+        }
+        return Outline.Generic(path)
+    }
+}
+
+/** 向上弹出的气泡定位计算器，保证在屏幕安全范围内，并回传小三角相对于气泡的 X 坐标 */
+private class BubblePopupPositionProvider(
+    private val onArrowCenterCalculated: (Float) -> Unit,
+) : PopupPositionProvider {
+    override fun calculatePosition(
+        anchorBounds: IntRect,
+        windowSize: IntSize,
+        layoutDirection: LayoutDirection,
+        popupContentSize: IntSize,
+    ): IntOffset {
+        val anchorCenterX = anchorBounds.left + anchorBounds.width / 2
+        val margin = 24
+        val idealX = anchorCenterX - popupContentSize.width / 2
+        val x = idealX.coerceIn(margin, maxOf(margin, windowSize.width - popupContentSize.width - margin))
+        val relativeArrowX = (anchorCenterX - x).toFloat()
+        onArrowCenterCalculated(relativeArrowX)
+
+        var y = anchorBounds.top - popupContentSize.height - 6
+        if (y < 40) {
+            y = anchorBounds.bottom + 6
+        }
+        return IntOffset(x, y)
+    }
+}
+
+/**
+ * 长按心形点赞弹出的向上气泡反应选择条。
+ * 还原贴吧/微信向上气泡风格，带指向心形的小箭头。
+ * 如果一行放不下（超过 6 个），自动排成两行。
+ */
 @Composable
-private fun ReactionIcon(name: String, urls: Map<String, String>) {
-    AsyncImage(urls[name] ?: "https://linux.do/images/emoji/twemoji/$name.png?v=15", name, modifier = Modifier.size(20.dp))
+private fun ReactionBubblePopup(
+    reactions: List<String>,
+    emojiUrls: Map<String, String>,
+    busy: Boolean,
+    onReact: (String) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var arrowCenterX by remember { mutableFloatStateOf(0f) }
+    val bubbleShape = remember {
+        BubbleShape(cornerRadius = 22.dp, arrowWidth = 14.dp, arrowHeight = 7.dp) { arrowCenterX }
+    }
+    val positionProvider = remember {
+        BubblePopupPositionProvider { arrowCenterX = it }
+    }
+
+    Popup(
+        popupPositionProvider = positionProvider,
+        onDismissRequest = onDismiss,
+        properties = PopupProperties(focusable = true),
+    ) {
+        val allReactions = (listOf("heart") + reactions).distinct()
+        // 一行最多放 6 个，如果总数 > 6 则分两行展示
+        val isTwoRows = allReactions.size > 6
+        val perRowCount = if (isTwoRows) ((allReactions.size + 1) / 2).coerceIn(4, 6) else allReactions.size
+
+        Box(
+            modifier = Modifier
+                .shadow(elevation = 6.dp, shape = bubbleShape, clip = false)
+                .clip(bubbleShape)
+                .background(IosTheme.colors.card)
+                .padding(bottom = 7.dp) // 预留底部小三角高度
+                .padding(horizontal = 14.dp, vertical = 10.dp),
+        ) {
+            if (isTwoRows) {
+                Column(
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    allReactions.chunked(perRowCount).forEach { rowList ->
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            rowList.forEach { reaction ->
+                                Box(
+                                    modifier = Modifier
+                                        .size(34.dp)
+                                        .clip(CircleShape)
+                                        .clickable(enabled = !busy) {
+                                            onDismiss()
+                                            onReact(reaction)
+                                        },
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    ReactionIcon(reaction, emojiUrls, modifier = Modifier.size(24.dp))
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    allReactions.forEach { reaction ->
+                        Box(
+                            modifier = Modifier
+                                .size(34.dp)
+                                .clip(CircleShape)
+                                .clickable(enabled = !busy) {
+                                    onDismiss()
+                                    onReact(reaction)
+                                },
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            ReactionIcon(reaction, emojiUrls, modifier = Modifier.size(24.dp))
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * 点击 boost 简评向上弹出的气泡输入浮层。
+ * 带有指向 boost 按钮的小三角形，内部含输入框、字数表情计数和发送/取消按钮。
+ */
+@Composable
+private fun BoostBubblePopup(
+    draft: String,
+    onDraftChange: (String) -> Unit,
+    busy: Boolean,
+    onSend: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var arrowCenterX by remember { mutableFloatStateOf(0f) }
+    val bubbleShape = remember {
+        BubbleShape(cornerRadius = 16.dp, arrowWidth = 14.dp, arrowHeight = 7.dp) { arrowCenterX }
+    }
+    val positionProvider = remember {
+        BubblePopupPositionProvider { arrowCenterX = it }
+    }
+
+    Popup(
+        popupPositionProvider = positionProvider,
+        onDismissRequest = onDismiss,
+        properties = PopupProperties(focusable = true),
+    ) {
+        val length = remember(draft) { measureBoost(draft) }
+        val over = length.overVisible || length.overEmoji
+        val canSend = length.submittable && !busy
+
+        Column(
+            modifier = Modifier
+                .width(290.dp)
+                .shadow(elevation = 6.dp, shape = bubbleShape, clip = false)
+                .clip(bubbleShape)
+                .background(IosTheme.colors.card)
+                .padding(bottom = 7.dp) // 预留底部小三角高度
+                .padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 60.dp, max = 110.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(IosTheme.colors.fieldBackground)
+                    .verticalScroll(rememberScrollState())
+                    .padding(8.dp),
+            ) {
+                BasicTextField(
+                    value = draft,
+                    onValueChange = { if (it.length <= BoostLength.RAW_INPUT_CAP) onDraftChange(it) },
+                    textStyle = IosTheme.type.body.copy(color = IosTheme.colors.label),
+                    cursorBrush = SolidColor(IosTheme.colors.accent),
+                    modifier = Modifier.fillMaxWidth(),
+                    decorationBox = { field ->
+                        Box {
+                            if (draft.isEmpty()) {
+                                Text("写一句简评…", style = IosTheme.type.body, color = IosTheme.colors.secondaryLabel)
+                            }
+                            field()
+                        }
+                    },
+                )
+            }
+
+            // 实时计数
+            Text(
+                text = "可见 ${length.visible}/${BoostLength.MAX_VISIBLE} · 表情 ${length.emoji}/${BoostLength.MAX_EMOJI}",
+                style = IosTheme.type.caption,
+                color = if (over) IosTheme.colors.destructive else IosTheme.colors.secondaryLabel,
+            )
+
+            // 底部操作按钮
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.End,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Box(
+                    modifier = Modifier
+                        .clickable(onClick = onDismiss)
+                        .padding(horizontal = 12.dp, vertical = 6.dp),
+                ) {
+                    Text("取消", style = IosTheme.type.subheadline, color = IosTheme.colors.secondaryLabel)
+                }
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(50))
+                        .background(if (canSend) IosTheme.colors.accent else IosTheme.colors.accent.copy(alpha = 0.35f))
+                        .clickable(enabled = canSend, onClick = onSend)
+                        .padding(horizontal = 16.dp, vertical = 6.dp),
+                ) {
+                    Text("发送", style = IosTheme.type.subheadline.copy(fontWeight = FontWeight.Medium), color = Color.White)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ReactionIcon(name: String, urls: Map<String, String>, modifier: Modifier = Modifier.size(20.dp)) {
+    AsyncImage(urls[name] ?: "https://linux.do/images/emoji/twemoji/$name.png?v=15", name, modifier = modifier)
 }
 
 private enum class PostAction { Solution, Like, Boost, Reply, Edit, Delete }
 
 @Composable
-private fun PostActionIcon(action: PostAction, selected: Boolean, tint: Color? = null) {
+private fun PostActionIcon(
+    action: PostAction,
+    selected: Boolean,
+    tint: Color? = null,
+    modifier: Modifier = Modifier.size(20.dp),
+) {
     val color = tint ?: when {
         action == PostAction.Solution && selected -> Color(0xFF30B85B)
         action == PostAction.Delete -> IosTheme.colors.destructive
         selected -> IosTheme.colors.accent
         else -> IosTheme.colors.secondaryLabel
     }
-    Canvas(Modifier.size(20.dp)) {
+    Canvas(modifier) {
         scale(size.width / 24f, size.height / 24f, pivot = Offset.Zero) {
             val shape = Path()
             when (action) {
@@ -1343,12 +1971,21 @@ private fun PostActionIcon(action: PostAction, selected: Boolean, tint: Color? =
                     drawCircle(color, 1.8f, Offset(16f, 8f), style = Stroke(1.4f))
                     drawLine(color, Offset(6f, 18f), Offset(3f, 21f), 1.6f)
                 }
-                // 左弯的回复箭头,和网页端那颗"回复"图标同形。
+                // 贴吧风格镂空左弯回复箭头
                 PostAction.Reply -> {
-                    shape.moveTo(10f, 5f); shape.lineTo(3f, 11f); shape.lineTo(10f, 17f)
-                    shape.lineTo(10f, 13f); shape.cubicTo(17f, 12f, 19f, 15f, 21f, 20f)
-                    shape.cubicTo(21f, 10f, 17f, 8f, 10f, 9f); shape.close()
-                    drawPath(shape, color)
+                    val arrowHead = Path().apply {
+                        moveTo(7.5f, 5f)
+                        lineTo(3.2f, 9.5f)
+                        lineTo(7.5f, 14f)
+                    }
+                    drawPath(arrowHead, color, style = Stroke(1.7f, cap = StrokeCap.Round, join = StrokeJoin.Round))
+                    val arrowBody = Path().apply {
+                        moveTo(3.5f, 9.5f)
+                        lineTo(13f, 9.5f)
+                        cubicTo(17.5f, 9.5f, 20.5f, 12.5f, 20.5f, 16.5f)
+                        lineTo(20.5f, 19.5f)
+                    }
+                    drawPath(arrowBody, color, style = Stroke(1.7f, cap = StrokeCap.Round, join = StrokeJoin.Round))
                 }
                 // 铅笔
                 PostAction.Edit -> {
@@ -1369,6 +2006,49 @@ private fun PostActionIcon(action: PostAction, selected: Boolean, tint: Color? =
                 }
             }
         }
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun TiebaPostActionButton(
+    label: String,
+    action: PostAction,
+    selected: Boolean = false,
+    color: Color = IosTheme.colors.secondaryLabel,
+    enabled: Boolean = true,
+    compact: Boolean = false,
+    onClick: () -> Unit,
+    onLongClick: (() -> Unit)? = null,
+) {
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center,
+        modifier = Modifier
+            .clip(RoundedCornerShape(6.dp))
+            .then(
+                if (onLongClick != null) {
+                    Modifier.combinedClickable(enabled = enabled, onClick = onClick, onLongClick = onLongClick)
+                } else {
+                    Modifier.clickable(enabled = enabled, onClick = onClick)
+                }
+            )
+            .padding(horizontal = if (compact) 6.dp else 10.dp, vertical = 2.dp),
+    ) {
+        PostActionIcon(
+            action = action,
+            selected = selected,
+            tint = if (selected) null else color,
+            modifier = Modifier.size(if (compact) 18.dp else 21.dp),
+        )
+        Spacer(Modifier.height(3.dp))
+        Text(
+            text = label,
+            fontSize = if (compact) 10.sp else 11.sp,
+            color = if (selected) (if (action == PostAction.Like) Color(0xFFFF3B30) else IosTheme.colors.accent) else color,
+            fontWeight = if (selected) FontWeight.Medium else FontWeight.Normal,
+            maxLines = 1,
+        )
     }
 }
 

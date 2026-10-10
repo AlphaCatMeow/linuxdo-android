@@ -16,6 +16,19 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.jsonPrimitive
 import org.linuxdo.android.Config
 
+/** 首页顶部支持切换的 4 个 Feed 类别。默认是 Latest。 */
+enum class HomeFeedType(val label: String, val apiPath: String) {
+    Unread("未读", "/unread.json"),
+    Latest("最新", "/latest.json"),
+    Hot("热门", "/hot.json"),
+    Posted("我的帖子", "/posted.json");
+
+    companion object {
+        fun fromName(name: String?): HomeFeedType =
+            entries.firstOrNull { it.name.equals(name, ignoreCase = true) } ?: Latest
+    }
+}
+
 /**
  * linux.do 的 tags 下发的是对象数组(`[{"id":444,"name":"人工智能"}]`),
  * 而原版 Discourse 多数端点给的是字符串数组。两种都要能解析,否则整个列表会解析失败。
@@ -57,7 +70,16 @@ data class Topic(
     val tags: List<@Serializable(with = TagNameSerializer::class) String> = emptyList(),
     @SerialName("last_poster_username") val lastPosterUsername: String? = null,
     val posters: List<Poster> = emptyList(),
-)
+) {
+    /**
+     * 列表要显示的"总回复数",口径与网页端一致。
+     *
+     * reply_count 只统计挂在楼层下的直接回复(楼中楼),直接回复整个话题的楼层压根不计入,
+     * 所以热门帖常出现"列表显示 3 回复、点进去有 80 楼"。posts_count 含 1 楼主贴,减 1 才是回复数;
+     * 取两者较大值兜住个别端点不下发 posts_count 的情况。
+     */
+    val totalReplies: Int get() = (postsCount - 1).coerceAtLeast(replyCount).coerceAtLeast(0)
+}
 
 @Serializable
 data class Poster(
@@ -71,6 +93,8 @@ data class DiscourseUser(
     val username: String,
     val name: String? = null,
     @SerialName("avatar_template") val avatarTemplate: String? = null,
+    /** 信任等级(Lv0~Lv4)。列表接口在 users[] 里下发,话题详情的楼层里没有。 */
+    @SerialName("trust_level") val trustLevel: Int? = null,
 )
 
 @Serializable
@@ -118,6 +142,7 @@ data class TopicListItem(
     val authorUsername: String?,
     val avatarUrl: String?,
     val category: Category?,
+    val trustLevel: Int? = null,
 )
 
 data class TopicPage(
@@ -342,12 +367,18 @@ fun Post.effectiveReplyToPostNumber(): Int? {
     return DATA_POST_ATTR.find(aside)?.groupValues?.getOrNull(1)?.toIntOrNull()?.takeIf { it > 1 && it < postNumber }
 }
 
-/** 缺失父楼层时保留为根节点,避免分页时漏掉可见回复。1 楼为主贴，不挂载楼中楼子回复。 */
+/**
+ * 缺失父楼层时保留为根节点,避免分页时漏掉可见回复。1 楼为主贴,不挂载楼中楼子回复。
+ *
+ * [descending] 只翻转一级主评论的先后,1 楼永远在首位,楼中楼子回复仍跟着自己的主评论
+ * 并保持对话的时间正序 —— 把一段对话倒过来读是没有意义的。
+ */
 fun threadRows(
     posts: List<Post>,
     collapsed: Set<Long> = emptySet(),
     expanded: Set<Long> = emptySet(),
     previewLimit: Int = DEFAULT_SUB_REPLY_LIMIT,
+    descending: Boolean = false,
 ): List<TreePost> {
     val ordered = posts.distinctBy { it.id }.sortedBy { it.postNumber }
     val byNumber = ordered.associateBy { it.postNumber }
@@ -358,7 +389,12 @@ fun threadRows(
     val result = mutableListOf<TreePost>()
     data class SubNode(val post: Post, val depth: Int, val parentUsername: String?)
 
-    for (root in children[null].orEmpty()) {
+    val allRoots = children[null].orEmpty()
+    val opRoot = allRoots.filter { it.postNumber == 1 }
+    val commentRoots = allRoots.filterNot { it.postNumber == 1 }
+        .let { roots -> if (descending) roots.sortedByDescending { it.postNumber } else roots }
+
+    for (root in opRoot + commentRoots) {
         val rootDirectReplies = children[root.id].orEmpty()
         // 先无视折叠/预览状态统计整棵子树的全部已加载后代及服务端未加载差额，确保预览和收起后条数统计始终准确。
         val allDescendants = mutableListOf<SubNode>()

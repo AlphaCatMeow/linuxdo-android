@@ -30,16 +30,22 @@ class OkHttpTransport(
 ) : Transport {
     override val name: String = NetworkPath.OKHTTP.label
 
-    override suspend fun get(path: String): TransportResult {
-        var result = execute(path)
+    override suspend fun get(path: String, present: Boolean): TransportResult {
+        var result = execute(path, present = present)
         if (result.challenged && revalidate(path)) {
-            result = execute(path)
+            result = execute(path, present = present)
         }
         return result
     }
 
-    override suspend fun write(path: String, method: String, body: String?, csrf: String): TransportResult =
-        execute(path, csrf, method, body)
+    override suspend fun write(
+        path: String,
+        method: String,
+        body: String?,
+        csrf: String,
+        contentType: String,
+        present: Boolean,
+    ): TransportResult = execute(path, csrf, method, body, contentType, present = present)
 
     override suspend fun revalidate(reason: String): Boolean {
         diagnostics.recordSilentRevalidation()
@@ -65,13 +71,28 @@ class OkHttpTransport(
             .header("Accept", "application/json")
             .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
             .header("X-Requested-With", "XMLHttpRequest")
+            .header("Discourse-Present", "true")
+            .header("Origin", Config.BASE_URL)
+            .header("Referer", "${Config.BASE_URL}/")
+            .header("Sec-Fetch-Site", "same-origin")
+            .header("Sec-Fetch-Mode", "cors")
+            .header("Sec-Fetch-Dest", "empty")
+            .header("sec-ch-ua-mobile", "?1")
+            .header("sec-ch-ua-platform", "\"Android\"")
             .header("X-CSRF-Token", csrf)
             .post(body)
             .build()
         return runRequest(request)
     }
 
-    private suspend fun execute(path: String, csrf: String? = null, method: String = "GET", body: String? = null): TransportResult {
+    private suspend fun execute(
+        path: String,
+        csrf: String? = null,
+        method: String = "GET",
+        body: String? = null,
+        contentType: String = Transport.JSON_CONTENT_TYPE,
+        present: Boolean = true,
+    ): TransportResult {
         // 先把 WebView 的现场 Cookie 同步进加密存储,共享客户端的 Interceptor 会读这份快照。
         withContext(Dispatchers.Main) { store.syncFromWebView() }
         val request = Request.Builder()
@@ -79,8 +100,24 @@ class OkHttpTransport(
             .header("Accept", "application/json")
             .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
             .header("X-Requested-With", "XMLHttpRequest")
-            .apply { if (csrf != null) method(method, (body ?: "").toRequestBody("application/json; charset=utf-8".toMediaType()))
-                .header("X-CSRF-Token", csrf) }
+            .apply {
+                if (present) {
+                    header("Discourse-Present", "true")
+                }
+                if (method != "GET") {
+                    method(method, (body ?: "").toRequestBody(contentType.toMediaType()))
+                    header("Origin", Config.BASE_URL)
+                    header("Referer", "${Config.BASE_URL}/")
+                    header("Sec-Fetch-Site", "same-origin")
+                    header("Sec-Fetch-Mode", "cors")
+                    header("Sec-Fetch-Dest", "empty")
+                    header("sec-ch-ua-mobile", "?1")
+                    header("sec-ch-ua-platform", "\"Android\"")
+                }
+                if (csrf != null) {
+                    header("X-CSRF-Token", csrf)
+                }
+            }
             .build()
 
         return runRequest(request)

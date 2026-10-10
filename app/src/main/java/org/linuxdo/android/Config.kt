@@ -20,13 +20,13 @@ object Config {
     const val UNREAD_POLL_INTERVAL_MS = 10_000L
 
     /** TCP/TLS 建连超时。连不上服务器时要尽快报错,而不是让用户干等。 */
-    const val CONNECT_TIMEOUT_MS = 6_000L
+    const val CONNECT_TIMEOUT_MS = 10_000L
 
     /**
      * 登录链路的单次请求总超时(含 DNS)。
      * connectTimeout 只覆盖建连,DNS 解析卡住时不生效,所以登录另外加这层硬上限。
      */
-    const val LOGIN_CALL_TIMEOUT_MS = 6_000L
+    const val LOGIN_CALL_TIMEOUT_MS = 20_000L
 
     /** 隐藏 WebView 静默通过 Cloudflare 挑战的最长等待时间。 */
     const val CHALLENGE_TIMEOUT_MS = 30_000L
@@ -37,8 +37,20 @@ object Config {
     /** 验收③使用的自动刷新间隔。 */
     const val AUTO_REFRESH_INTERVAL_MS = 10 * 60 * 1_000L
 
+    /**
+     * 开启「同步阅读进度与统计」后,在话题里停留多久才算一次有效阅读并静默上报。
+     */
+    const val READ_REPORT_THRESHOLD_MS = 3_500L
+
+    /** 在话题内驻留阅读期间，周期性上报阅读时长的间隔（Discourse time_read 要求两次上报间隔 < 100s 才能累计）。 */
+    const val READ_REPORT_HEARTBEAT_MS = 35_000L
+
+    /** 离开话题时,停留时长比上次上报多出这么久才值得补报一次。 */
+    const val READ_REPORT_TOP_UP_MS = 10_000L
+
     /** Discourse 登录后下发的认证 Cookie 名。 */
     const val SESSION_COOKIE = "_t"
+    const val CF_CLEARANCE_COOKIE = "cf_clearance"
 
     /** 应用版本检查与升级（公开 APK 分发仓库 xuemk/linuxdo-android 根目录 version.json）。 */
     val UPDATE_VERSION_JSON_URLS = listOf(

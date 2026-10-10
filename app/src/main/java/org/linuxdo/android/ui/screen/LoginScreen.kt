@@ -78,19 +78,24 @@ private val TabInactive   = Color(0xFF9AA5BB)
 @Composable
 fun LoginScreen(
     state: LoginUiState,
-    onPasswordLogin: (login: String, password: String, secondFactorToken: String?, secondFactorMethod: Int) -> Unit,
+    onPasswordLogin: (login: String, password: String, secondFactorToken: String?, secondFactorMethod: Int, rememberPassword: Boolean) -> Unit,
     onSendEmailCode: (email: String) -> Unit,
     onEmailCodeLogin: (email: String, token: String, secondFactorToken: String?, secondFactorMethod: Int) -> Unit,
     onDismissError: () -> Unit,
     onResetSecondFactor: () -> Unit = {},
+    onOpenWebLogin: (login: String?, password: String?, secondFactorToken: String?, secondFactorMethod: Int, rememberPassword: Boolean) -> Unit = { _, _, _, _, _ -> },
+    onStartWebAuth: () -> Unit = {},
+    onDismissRiskControl: () -> Unit = {},
+    onCancelWebAuth: () -> Unit = {},
 ) {
     // Tab 选择：0=账号密码，1=验证码
     var tab by rememberSaveable { mutableStateOf(0) }
     var showForgotDialog by rememberSaveable { mutableStateOf(false) }
 
     // 账号密码 Tab 的状态
-    var loginText by rememberSaveable { mutableStateOf("") }
-    var passwordText by rememberSaveable { mutableStateOf("") }
+    var rememberPassword by rememberSaveable { mutableStateOf(state.rememberPassword) }
+    var loginText by rememberSaveable { mutableStateOf(state.savedLogin) }
+    var passwordText by rememberSaveable { mutableStateOf(state.savedPassword) }
     var passwordVisible by rememberSaveable { mutableStateOf(false) }
 
     // 验证码 Tab 的状态
@@ -216,6 +221,7 @@ fun LoginScreen(
                                 passwordText,
                                 secondFactorText.takeIf { state.secondFactorRequired },
                                 secondFactorMethod,
+                                rememberPassword,
                             )
                         }
                     }),
@@ -240,20 +246,42 @@ fun LoginScreen(
                                     passwordText,
                                     secondFactorText.trim(),
                                     secondFactorMethod,
+                                    rememberPassword,
                                 )
                             }
                         },
                     )
                 }
 
-                // 忘记密码
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                // 记住密码与忘记密码
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 10.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(4.dp))
+                            .clickable { rememberPassword = !rememberPassword }
+                            .padding(vertical = 4.dp, horizontal = 2.dp),
+                    ) {
+                        RememberCheckBox(checked = rememberPassword)
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            "记住密码",
+                            fontSize = 13.sp,
+                            color = Color(0xFF1A2340),
+                        )
+                    }
+
                     Text(
                         "忘记密码？",
                         fontSize = 13.sp,
                         color = AccentBlue,
                         modifier = Modifier
-                            .padding(top = 10.dp)
                             .clip(RoundedCornerShape(4.dp))
                             .clickable { showForgotDialog = true }
                             .padding(horizontal = 4.dp, vertical = 2.dp),
@@ -278,6 +306,7 @@ fun LoginScreen(
                             passwordText,
                             secondFactorText.trim().takeIf { state.secondFactorRequired },
                             secondFactorMethod,
+                            rememberPassword,
                         )
                     },
                 )
@@ -393,6 +422,48 @@ fun LoginScreen(
                 )
             }
 
+            Spacer(Modifier.height(18.dp))
+
+            // ── 或 分割线 ──
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(0.8.dp)
+                        .background(Color(0xFFDDE3F0)),
+                )
+                Text(
+                    text = "或",
+                    fontSize = 12.sp,
+                    color = Color(0xFF9AA5BB),
+                    modifier = Modifier.padding(horizontal = 14.dp),
+                )
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(0.8.dp)
+                        .background(Color(0xFFDDE3F0)),
+                )
+            }
+
+            Spacer(Modifier.height(18.dp))
+
+            // ── 网页授权登录按钮 ──
+            WebAuthButton(
+                loading = state.webAuthLoading,
+                enabled = !state.loading && !state.webAuthLoading,
+                onClick = {
+                    keyboard?.hide()
+                    focusManager.clearFocus()
+                    onStartWebAuth()
+                },
+            )
+
             Spacer(Modifier.height(40.dp))
         }
     }
@@ -413,11 +484,26 @@ fun LoginScreen(
     if (state.error != null) {
         AlertDialog(
             onDismissRequest = onDismissError,
-            title = { Text("登录失败") },
+            title = { Text(if (state.isRiskOrCaptchaBlocked) "安全验证提示" else "登录失败") },
             text = { Text(state.error) },
             confirmButton = {
-                TextButton(onClick = onDismissError) { Text("确定") }
+                if (state.isRiskOrCaptchaBlocked) {
+                    TextButton(onClick = {
+                        onDismissError()
+                        val u = if (tab == 0) loginText.trim() else emailText.trim()
+                        val p = if (tab == 0) passwordText else null
+                        val sf = secondFactorText.trim().takeIf { state.secondFactorRequired && it.isNotBlank() }
+                        onOpenWebLogin(u, p, sf, secondFactorMethod, rememberPassword)
+                    }) {
+                        Text("进入安全验证登录", fontWeight = FontWeight.Bold, color = AccentBlue)
+                    }
+                } else {
+                    TextButton(onClick = onDismissError) { Text("确定") }
+                }
             },
+            dismissButton = if (state.isRiskOrCaptchaBlocked) {
+                { TextButton(onClick = onDismissError) { Text("取消") } }
+            } else null,
         )
     }
 
@@ -429,6 +515,58 @@ fun LoginScreen(
             text = { Text("登录邮件已发送至您的邮箱。\n\n请打开邮件，复制链接中 /session/email-login/ 后面的 token 字符串，粘贴到验证码输入框后点击登录。") },
             confirmButton = {
                 TextButton(onClick = onDismissError) { Text("知道了") }
+            },
+        )
+    }
+
+    // L站安全风控提示对话框（403）
+    if (state.showRiskControlDialog) {
+        AlertDialog(
+            onDismissRequest = onDismissRiskControl,
+            title = { Text("L站安全风控提示") },
+            text = {
+                Text("检测到当前登录触发 L 站安全风控 (403)，无法直接通过原生表单登录。\n\n请使用网页授权认证完成登录。")
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    onDismissRiskControl()
+                    onStartWebAuth()
+                }) {
+                    Text("网页授权认证", color = AccentBlue, fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = onDismissRiskControl) {
+                    Text("取消")
+                }
+            },
+        )
+    }
+
+    // 网页授权进行中提示
+    if (state.webAuthLoading) {
+        AlertDialog(
+            onDismissRequest = {},
+            title = { Text("网页授权认证") },
+            text = {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                ) {
+                    IosActivityIndicator(diameter = 28.dp, color = AccentBlue)
+                    Spacer(Modifier.height(16.dp))
+                    Text(
+                        state.webAuthMessage ?: "正在进行网页授权认证...",
+                        fontSize = 14.sp,
+                        textAlign = TextAlign.Center,
+                    )
+                }
+            },
+            confirmButton = {},
+            dismissButton = {
+                TextButton(onClick = onCancelWebAuth) {
+                    Text("取消")
+                }
             },
         )
     }
@@ -808,3 +946,136 @@ private fun EyeIcon(open: Boolean) {
         }
     }
 }
+
+// ── 网页授权登录相关组件 ──────────────────────────────────────────
+
+/** 地球/网页图标（Canvas 手绘，对齐设计图） */
+@Composable
+private fun GlobeIcon(
+    modifier: Modifier = Modifier.size(19.dp),
+    color: Color = AccentBlue,
+) {
+    Canvas(modifier) {
+        val w = size.width
+        val h = size.height
+        val strokeW = 1.6.dp.toPx()
+        val radius = (w.coerceAtMost(h) / 2f) - strokeW / 2f
+        val cx = w / 2f
+        val cy = h / 2f
+
+        // 外圆
+        drawCircle(
+            color = color,
+            radius = radius,
+            center = Offset(cx, cy),
+            style = androidx.compose.ui.graphics.drawscope.Stroke(width = strokeW),
+        )
+        // 赤道水平线
+        drawLine(
+            color = color,
+            start = Offset(cx - radius, cy),
+            end = Offset(cx + radius, cy),
+            strokeWidth = strokeW,
+        )
+        // 本初子午线（垂直中线）
+        drawLine(
+            color = color,
+            start = Offset(cx, cy - radius),
+            end = Offset(cx, cy + radius),
+            strokeWidth = strokeW,
+        )
+        // 经线弧（椭圆）
+        drawOval(
+            color = color,
+            topLeft = Offset(cx - radius * 0.52f, cy - radius),
+            size = androidx.compose.ui.geometry.Size(radius * 1.04f, radius * 2f),
+            style = androidx.compose.ui.graphics.drawscope.Stroke(width = strokeW),
+        )
+    }
+}
+
+/** 网页授权登录药丸按钮（白底蓝边，对齐设计图） */
+@Composable
+private fun WebAuthButton(
+    loading: Boolean,
+    enabled: Boolean,
+    onClick: () -> Unit,
+) {
+    Box(
+        Modifier
+            .fillMaxWidth()
+            .height(50.dp)
+            .clip(RoundedCornerShape(25.dp))
+            .border(
+                width = 1.dp,
+                color = if (enabled) Color(0xFF6B9FFF) else Color(0xFFDDE3F0),
+                shape = RoundedCornerShape(25.dp),
+            )
+            .background(Color.White)
+            .then(if (enabled && !loading) Modifier.clickable(onClick = onClick) else Modifier),
+        contentAlignment = Alignment.Center,
+    ) {
+        if (loading) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                IosActivityIndicator(diameter = 18.dp, color = AccentBlue)
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    "正在授权...",
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = AccentBlue,
+                )
+            }
+        } else {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.Center,
+            ) {
+                GlobeIcon(color = if (enabled) AccentBlue else Color(0xFFBBC4D6))
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    "网页授权登录",
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = if (enabled) AccentBlue else Color(0xFF9AA5BB),
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun RememberCheckBox(checked: Boolean) {
+    Box(
+        modifier = Modifier
+            .size(18.dp)
+            .clip(RoundedCornerShape(4.dp))
+            .background(if (checked) Color(0xFF3F69A8) else Color.White)
+            .border(
+                width = 1.dp,
+                color = if (checked) Color(0xFF3F69A8) else FieldBorder,
+                shape = RoundedCornerShape(4.dp),
+            ),
+        contentAlignment = Alignment.Center,
+    ) {
+        if (checked) {
+            Canvas(modifier = Modifier.size(11.dp)) {
+                val path = Path().apply {
+                    moveTo(size.width * 0.15f, size.height * 0.52f)
+                    lineTo(size.width * 0.42f, size.height * 0.82f)
+                    lineTo(size.width * 0.88f, size.height * 0.22f)
+                }
+                drawPath(
+                    path = path,
+                    color = Color.White,
+                    style = androidx.compose.ui.graphics.drawscope.Stroke(
+                        width = 2.dp.toPx(),
+                        cap = androidx.compose.ui.graphics.StrokeCap.Round,
+                        join = androidx.compose.ui.graphics.StrokeJoin.Round,
+                    ),
+                )
+            }
+        }
+    }
+}
+

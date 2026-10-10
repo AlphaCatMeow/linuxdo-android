@@ -24,12 +24,17 @@ enum class MainTab(val label: String, val root: Route) {
 }
 
 @Composable
-fun TabBar(selected: MainTab, onSelect: (MainTab) -> Unit) {
+fun TabBar(
+    selected: MainTab,
+    homeFeedLabel: String = "最新",
+    onSelect: (MainTab) -> Unit,
+) {
     Column(Modifier.fillMaxWidth().background(IosTheme.colors.card)) {
         IosFullDivider()
         Row(Modifier.height(49.dp)) {
             MainTab.entries.forEach { tab ->
                 val color = if (tab == selected) IosTheme.colors.accent else IosTheme.colors.secondaryLabel
+                val label = if (tab == MainTab.Latest) homeFeedLabel else tab.label
                 Column(Modifier.weight(1f).fillMaxHeight().selectable(tab == selected,
                     role = Role.Tab, onClick = { onSelect(tab) }),
                     horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
@@ -55,7 +60,7 @@ fun TabBar(selected: MainTab, onSelect: (MainTab) -> Unit) {
                             }
                         }
                     }
-                    Text(tab.label, color = color, fontSize = 10.sp, lineHeight = 13.sp)
+                    Text(label, color = color, fontSize = 10.sp, lineHeight = 13.sp)
                 }
             }
         }

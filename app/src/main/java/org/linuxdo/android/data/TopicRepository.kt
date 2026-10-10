@@ -32,6 +32,7 @@ import org.linuxdo.android.net.HttpStatusException
 import org.linuxdo.android.net.LoginRejectedException
 import org.linuxdo.android.net.NeedsInteractiveVerification
 import org.linuxdo.android.net.NetworkTimeoutException
+import org.linuxdo.android.net.RiskControlException
 import org.linuxdo.android.net.SecondFactorRequiredException
 import org.linuxdo.android.net.Transport
 import org.linuxdo.android.net.TransportResult
@@ -78,10 +79,19 @@ private data class SearchResponse(
 class TopicRepository(
     private val transportProvider: () -> Transport,
     private val diagnostics: Diagnostics,
+    private val reading: ReadingStore? = null,
+    private val fallbackTransportProvider: (() -> Transport)? = null,
 ) {
     private val json = Json { ignoreUnknownKeys = true; coerceInputValues = true }
     private val gate = Mutex()
     private var lastRequestAt = 0L
+
+    /**
+     * 阅读进度上报复用的 CSRF Token。
+     * 写请求本来每次都要先 GET 一次 /session/csrf.json,统计这种可丢弃的请求不值得为此翻倍;
+     * 失效(403/挑战)时清空重取即可。
+     */
+    private var cachedCsrfToken: String? = null
 
     /** 分类表全站共用且很少变,整个进程只拉一次。 */
     private var categoryCache: Map<Int, Category>? = null
@@ -112,16 +122,114 @@ class TopicRepository(
         return result.toMap().also { emojiCache = it }
     }
 
+    suspend fun fetchFeed(feed: HomeFeedType, page: Int, awaitCategories: Boolean = true): TopicPage =
+        toPage(json.decodeFromString(request("${feed.apiPath}?page=$page", burst = page == 0)), awaitCategories)
+
     suspend fun fetchLatest(page: Int, awaitCategories: Boolean = true): TopicPage =
-        toPage(json.decodeFromString(request("/latest.json?page=$page", burst = page == 0)), awaitCategories)
+        fetchFeed(HomeFeedType.Latest, page, awaitCategories)
 
     suspend fun fetchCategoryTopics(slug: String, categoryId: Int, page: Int): TopicPage =
         toPage(json.decodeFromString(request("/c/${encode(slug.ifBlank { "category" })}/$categoryId.json?page=$page", burst = page == 0)), awaitCategories = false)
 
-    suspend fun fetchTopic(id: Long, postNumber: Int? = null, burst: Boolean = false): TopicDetail {
+    suspend fun fetchTopic(
+        id: Long,
+        postNumber: Int? = null,
+        burst: Boolean = false,
+        trackVisit: Boolean = true,
+    ): TopicDetail {
         val position = postNumber?.takeIf { it > 1 }?.let { "/$it" }.orEmpty()
-        val body = request("/t/$id$position.json?track_visit=false", burst = burst)
+        val body = request("/t/$id$position.json?track_visit=$trackVisit", burst = burst, present = true)
         return json.decodeFromString<TopicDetail>(body).also { CookedParser.prewarm(it.postStream.posts) }
+    }
+
+    /**
+     * 上报阅读进度(`POST /topics/timings`),让网页端的未读蓝点消失、总结页的
+     * 已读帖子与阅读时长正常增长。只有用户在设置里开启同步开关后才会被调用。
+     *
+     * 走全局 gate 串行节流。此为可丢弃的统计请求，遇 Cloudflare 挑战或服务异常直接返回 false，
+     * 绝不抛异常打断用户正常阅读。
+     */
+    suspend fun recordTopicTimings(topicId: Long, topicTimeMs: Long, postNumbers: List<Int>): Boolean {
+        if (topicId <= 0L) return false
+        val numbers = postNumbers.filter { it > 0 }.distinct().sorted()
+        if (numbers.isEmpty()) {
+            diagnostics.log("阅读进度未上报: 话题 $topicId 没有可见楼层")
+            return false
+        }
+        val topicTime = topicTimeMs.coerceIn(MIN_READ_TIME_MS, MAX_TOPIC_TIME_MS)
+        val perPost = (topicTime / numbers.size).coerceIn(MIN_READ_TIME_MS, MAX_POST_TIME_MS)
+        // Rails 的嵌套参数写法:timings[楼层号]=停留毫秒数。JSON body 在这个端点上不被认。
+        val form = buildString {
+            append("topic_id=").append(topicId)
+            append("&topic_time=").append(topicTime)
+            numbers.forEach { number -> append("&timings%5B").append(number).append("%5D=").append(perPost) }
+        }
+        val primaryTransport = transportProvider()
+        val fallbackTransport = fallbackTransportProvider?.invoke()
+        var currentTransport = primaryTransport
+        var isFallback = false
+
+        repeat(2) { attempt ->
+            val result = try {
+                val csrf = cachedCsrf() ?: run {
+                    diagnostics.log("阅读进度未上报: CSRF Token 获取失败")
+                    return false
+                }
+                gate.withLock {
+                    throttle()
+                    try {
+                        currentTransport.write("/topics/timings", "POST", form, csrf, Transport.FORM_CONTENT_TYPE, present = true)
+                    } finally { lastRequestAt = SystemClock.elapsedRealtime() }
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                diagnostics.log("阅读进度上报异常(已忽略): ${error.javaClass.simpleName} ${error.message.orEmpty().take(80)}")
+                return false
+            }
+            diagnostics.recordStatus(currentTransport.name, result.status, "/topics/timings")
+            when {
+                result.status in 200..299 -> {
+                    val tag = if (isFallback) "(${currentTransport.name} 兜底成功)" else "(路径 ${currentTransport.name})"
+                    diagnostics.log("阅读进度已同步$tag: 话题 $topicId, ${numbers.size} 层(至 #${numbers.last()}), ${topicTime / 1000}s")
+                    return true
+                }
+                result.challenged -> {
+                    cachedCsrfToken = null
+                    if (!isFallback && fallbackTransport != null && fallbackTransport.name != currentTransport.name) {
+                        diagnostics.log("阅读进度上报 ${currentTransport.name} 遭遇 Cloudflare 挑战，尝试 ${fallbackTransport.name} 兜底")
+                        currentTransport = fallbackTransport
+                        isFallback = true
+                    } else {
+                        diagnostics.log("阅读进度上报被 Cloudflare 挑战拦截(已静默放弃)")
+                        return false
+                    }
+                }
+                result.status == 403 || result.status == 422 -> {
+                    // 常规 HTTP 403/422(多为 CSRF 过期失效):清空缓存 token 后重试一次
+                    cachedCsrfToken = null
+                    val isBadCsrf = result.body.contains("BAD CSRF", ignoreCase = true)
+                    val detail = if (isBadCsrf) "CSRF失效" else "HTTP ${result.status}"
+                    if (attempt == 0) {
+                        diagnostics.log("阅读进度上报 $detail，重取 CSRF 重试一次")
+                    } else {
+                        diagnostics.log("阅读进度上报失败($detail): ${result.body.take(80)}")
+                        return false
+                    }
+                }
+                else -> {
+                    diagnostics.log("阅读进度上报失败: HTTP ${result.status} ${result.body.take(80)}")
+                    return false
+                }
+            }
+        }
+        return false
+    }
+
+    private suspend fun cachedCsrf(): String? {
+        cachedCsrfToken?.let { return it }
+        return runCatching { objectRequest("/session/csrf.json").text("csrf") }
+            .getOrNull()?.takeIf { it.isNotBlank() }?.also { cachedCsrfToken = it }
     }
 
     suspend fun fetchPosts(topicId: Long, ids: List<Long>): List<Post> {
@@ -258,7 +366,7 @@ class TopicRepository(
         val unreadByType = mutableMapOf<Int, Int>()
         while (true) {
             val page = json.decodeFromString<UnreadNotificationPage>(
-                request("/notifications.json?filter=unread&limit=$limit&offset=$offset"),
+                request("/notifications.json?filter=unread&limit=$limit&offset=$offset", present = false),
             )
             val fresh = page.notifications.filter { seen.add(it.id) }
             check(page.notifications.isEmpty() || fresh.isNotEmpty()) { "未读通知分页未推进" }
@@ -342,10 +450,16 @@ class TopicRepository(
         )
         val known = categories()
         val posts = response.posts.groupBy { it.topicId }
+        val seen = reading?.seenTopicIds().orEmpty()
         return SearchPage(
             items = response.topics.map { topic ->
                 val author = posts[topic.id]?.firstOrNull()
-                TopicListItem(topic, author?.username, avatarUrlOf(author?.avatarTemplate), known[topic.categoryId])
+                TopicListItem(
+                    topic = if (topic.unseen && topic.id in seen) topic.copy(unseen = false) else topic,
+                    authorUsername = author?.username,
+                    avatarUrl = avatarUrlOf(author?.avatarTemplate),
+                    category = known[topic.categoryId],
+                )
             },
             excerpts = posts.mapValues { (_, matches) -> matches.first().blurb },
             hasMore = response.grouped.more && response.topics.isNotEmpty(),
@@ -569,40 +683,46 @@ class TopicRepository(
         secondFactorToken: String? = null,
         secondFactorMethod: Int = 1,
     ): Boolean = gate.withLock {
-        val deadlineNs = System.nanoTime() + Config.LOGIN_CALL_TIMEOUT_MS * 1_000_000L
         throttle()
         val transport = transportProvider()
-        // 1. 获取 CSRF token
-        val csrf = loginCsrf(transport, deadlineNs)
+        // 1. 获取 CSRF token (独立 20s 超时)
+        val csrfDeadlineNs = System.nanoTime() + Config.LOGIN_CALL_TIMEOUT_MS * 1_000_000L
+        val csrf = loginCsrf(transport, csrfDeadlineNs)
 
-        // 2. 发送登录请求（登录固定两步请求，第二步走突发间隔）
+        // 2. 发送登录请求（独立 20s 超时，登录固定两步请求，第二步走突发间隔）
         throttle(burst = true)
+        val loginDeadlineNs = System.nanoTime() + Config.LOGIN_CALL_TIMEOUT_MS * 1_000_000L
         val fields = mutableMapOf<String, JsonElement>(
             "login" to JsonPrimitive(login),
             "password" to JsonPrimitive(password),
-            "second_factor_method" to JsonPrimitive(secondFactorMethod),
         )
         val trimmedToken = secondFactorToken?.trim().orEmpty()
         if (trimmedToken.isNotEmpty()) {
             fields["second_factor_token"] = JsonPrimitive(trimmedToken)
+            fields["second_factor_method"] = JsonPrimitive(secondFactorMethod)
         }
         val body = JsonObject(fields).toString()
-        val loginResult = loginCall("/session.json", deadlineNs) { transport.write("/session.json", "POST", body, csrf) }
+        val loginResult = loginCall("/session.json", loginDeadlineNs) { transport.write("/session.json", "POST", body, csrf) }
         diagnostics.recordStatus(transport.name, loginResult.status, "/session")
-        if (loginResult.challenged) throw NeedsInteractiveVerification("登录请求被 Cloudflare 拦截")
+        if (loginResult.challenged) throw NeedsInteractiveVerification("登录请求被 Cloudflare 拦截 (403 挑战)")
+        if (loginResult.status == 403) throw RiskControlException(403, "登录请求触发风控 (403)")
         if (loginResult.status == 0) throw NetworkTimeoutException()
-        if (loginResult.status == 429) throw HttpStatusException(429, "请求过于频繁，请稍后再试")
+        if (loginResult.status == 429) throw HttpStatusException(429, "登录尝试过于频繁，请稍后再试")
         val responseObj = try {
             json.parseToJsonElement(loginResult.body).jsonObject
         } catch (e: Exception) {
-            return@withLock loginResult.status in 200..299
+            if (loginResult.status in 200..299) return@withLock true
+            throw HttpStatusException(loginResult.status, "HTTP ${loginResult.status}: ${loginResult.body.take(150)}")
         }
         val error = responseObj["error"]?.jsonPrimitive?.contentOrNull
+            ?: responseObj["message"]?.jsonPrimitive?.contentOrNull
         val reason = responseObj["reason"]?.jsonPrimitive?.contentOrNull
         val totpEnabled = responseObj["totp_enabled"]?.jsonPrimitive?.booleanOrNull == true
         val backupEnabled = responseObj["backup_enabled"]?.jsonPrimitive?.booleanOrNull == true
+        val securityKeyEnabled = responseObj["security_key_enabled"]?.jsonPrimitive?.booleanOrNull == true
         val hasMulti2fa = responseObj["multiple_second_factor_methods"] != null
-        val isSecondFactor = reason == "invalid_second_factor" || totpEnabled || backupEnabled || hasMulti2fa
+        val isSecondFactor = reason?.contains("second_factor") == true ||
+            totpEnabled || backupEnabled || securityKeyEnabled || hasMulti2fa
         if (isSecondFactor) {
             if (trimmedToken.isEmpty()) {
                 diagnostics.log("账号已开启 2FA，等待输入两步验证码")
@@ -618,9 +738,15 @@ class TopicRepository(
         }
         if (!error.isNullOrBlank()) {
             diagnostics.log("登录失败: $error")
-            return@withLock false
+            throw LoginRejectedException(error)
         }
-        responseObj["user"] != null
+        if (loginResult.status !in 200..299) {
+            throw HttpStatusException(loginResult.status, "HTTP ${loginResult.status}: ${loginResult.body.take(150)}")
+        }
+        if (responseObj["user"] == null) {
+            throw LoginRejectedException("登录未返回有效用户凭据，响应: ${loginResult.body.take(150)}")
+        }
+        true
     }
 
     /**
@@ -628,16 +754,18 @@ class TopicRepository(
      * 用户从邮件链接中复制 token，再交由 ViewModel.loginWithEmailCode 处理。
      */
     suspend fun sendEmailLogin(email: String) = gate.withLock {
-        val deadlineNs = System.nanoTime() + Config.LOGIN_CALL_TIMEOUT_MS * 1_000_000L
         throttle()
         val transport = transportProvider()
-        val csrf = loginCsrf(transport, deadlineNs)
+        val csrfDeadlineNs = System.nanoTime() + Config.LOGIN_CALL_TIMEOUT_MS * 1_000_000L
+        val csrf = loginCsrf(transport, csrfDeadlineNs)
         throttle(burst = true)
+        val sendDeadlineNs = System.nanoTime() + Config.LOGIN_CALL_TIMEOUT_MS * 1_000_000L
         val safeEmail = email.replace("\"", "\\\"")
         val body = "{\"login\":\"$safeEmail\"}"
-        val result = loginCall("/u/email-login.json", deadlineNs) { transport.write("/u/email-login.json", "POST", body, csrf) }
+        val result = loginCall("/u/email-login.json", sendDeadlineNs) { transport.write("/u/email-login.json", "POST", body, csrf) }
         diagnostics.recordStatus(transport.name, result.status, "/u/email-login")
         if (result.challenged) throw NeedsInteractiveVerification("发邮件请求被 Cloudflare 拦截")
+        if (result.status == 403) throw RiskControlException(403, "发送登录邮件触发风控 (403)")
         if (result.status == 0) throw NetworkTimeoutException()
         if (result.status !in 200..299) throw HttpStatusException(result.status, result.body.take(120))
     }
@@ -645,6 +773,7 @@ class TopicRepository(
     private suspend fun loginCsrf(transport: Transport, deadlineNs: Long = 0L): String {
         val result = loginCall("/session/csrf.json", deadlineNs) { transport.get("/session/csrf.json") }
         if (result.challenged) throw NeedsInteractiveVerification("CSRF 请求被 Cloudflare 拦截")
+        if (result.status == 403) throw RiskControlException(403, "获取登录凭证触发风控 (403)")
         if (result.status == 0) throw NetworkTimeoutException()
         if (result.status !in 200..299) throw HttpStatusException(result.status, "无法获取 CSRF token")
         return json.parseToJsonElement(result.body).jsonObject["csrf"]
@@ -660,11 +789,12 @@ class TopicRepository(
         secondFactorToken: String? = null,
         secondFactorMethod: Int = 1,
     ) = gate.withLock {
-        val deadlineNs = System.nanoTime() + Config.LOGIN_CALL_TIMEOUT_MS * 1_000_000L
         throttle()
         val transport = transportProvider()
-        val csrf = loginCsrf(transport, deadlineNs)
+        val csrfDeadlineNs = System.nanoTime() + Config.LOGIN_CALL_TIMEOUT_MS * 1_000_000L
+        val csrf = loginCsrf(transport, csrfDeadlineNs)
         throttle(burst = true)
+        val loginDeadlineNs = System.nanoTime() + Config.LOGIN_CALL_TIMEOUT_MS * 1_000_000L
         val path = "/session/email-login/${encode(token)}"
         val trimmed2fa = secondFactorToken?.trim().orEmpty()
         val reqBody = if (trimmed2fa.isNotEmpty()) {
@@ -677,9 +807,10 @@ class TopicRepository(
         } else {
             "{}"
         }
-        val result = loginCall(path, deadlineNs) { transport.write(path, "POST", reqBody, csrf) }
+        val result = loginCall(path, loginDeadlineNs) { transport.write(path, "POST", reqBody, csrf) }
         diagnostics.recordStatus(transport.name, result.status, "/session/email-login")
         if (result.challenged) throw NeedsInteractiveVerification("邮件登录请求被 Cloudflare 拦截")
+        if (result.status == 403) throw RiskControlException(403, "验证码登录触发风控 (403)")
         if (result.status == 0) throw NetworkTimeoutException()
 
         val body = runCatching { json.parseToJsonElement(result.body).jsonObject }.getOrNull()
@@ -766,26 +897,29 @@ class TopicRepository(
     private suspend fun toPage(response: TopicListResponse, awaitCategories: Boolean = true): TopicPage {
         val known = if (awaitCategories) categories() else categoryCache.orEmpty()
         val usersById = response.users.associateBy { it.id }
+        // 本地已读集合优先于服务端 unseen:纯净模式下压根没上报过,服务端当然还认为没读。
+        val seen = reading?.seenTopicIds().orEmpty()
         val items = response.topicList.topics.map { topic ->
             // Discourse 的 posters 顺序固定,第一个是原始发帖人。
             val author = topic.posters.firstOrNull()?.userId?.let { usersById[it] }
             TopicListItem(
-                topic = topic,
+                topic = if (topic.unseen && topic.id in seen) topic.copy(unseen = false) else topic,
                 authorUsername = author?.username ?: topic.lastPosterUsername,
                 avatarUrl = avatarUrlOf(author?.avatarTemplate),
                 category = topic.categoryId?.let { known[it] },
+                trustLevel = author?.trustLevel,
             )
         }
         return TopicPage(items = items, hasMore = response.topicList.moreTopicsUrl != null)
     }
 
-    private suspend fun request(path: String, burst: Boolean = false): String = gate.withLock {
+    private suspend fun request(path: String, burst: Boolean = false, present: Boolean = true): String = gate.withLock {
         var attempt = 0
         while (true) {
             throttle(burst)
             val transport = transportProvider()
             val result = try {
-                transport.get(path)
+                transport.get(path, present = present)
             } finally {
                 lastRequestAt = SystemClock.elapsedRealtime()
             }
@@ -824,5 +958,10 @@ class TopicRepository(
 
         /** 单次加载最多往前扫几轮,避免某一类通知很久没有时无限翻页。 */
         const val MAX_SCAN_ROUNDS = 5
+
+        /** 阅读进度上报的时长边界(毫秒)。服务端会按批次封顶,客户端先规整一遍免得被整条丢弃。 */
+        const val MIN_READ_TIME_MS = 1_000L
+        const val MAX_POST_TIME_MS = 60_000L
+        const val MAX_TOPIC_TIME_MS = 30 * 60 * 1_000L
     }
 }

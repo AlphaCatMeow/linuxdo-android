@@ -9,13 +9,20 @@ class WebViewFetchTransport(
 ) : Transport {
     override val name: String = NetworkPath.WEBVIEW.label
 
-    override suspend fun write(path: String, method: String, body: String?, csrf: String): TransportResult =
-        browser.fetchJson(path, csrf, method, body)
+    /** 路径 B 的 fetch() 走真实 WebView 容器,按调用方指定的 [contentType] 发送。 */
+    override suspend fun write(
+        path: String,
+        method: String,
+        body: String?,
+        csrf: String,
+        contentType: String,
+        present: Boolean,
+    ): TransportResult = browser.fetchJson(path, csrf, method, body, contentType, present = present)
 
-    override suspend fun get(path: String): TransportResult {
-        var result = browser.fetchJson(path)
+    override suspend fun get(path: String, present: Boolean): TransportResult {
+        var result = browser.fetchJson(path, present = present)
         if (result.challenged && revalidate(path)) {
-            result = browser.fetchJson(path)
+            result = browser.fetchJson(path, present = present)
         }
         return result
     }

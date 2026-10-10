@@ -8,11 +8,13 @@ import coil.ImageLoaderFactory
 import coil.disk.DiskCache
 import java.io.File
 import org.linuxdo.android.data.Diagnostics
+import org.linuxdo.android.data.ReadingStore
 import org.linuxdo.android.data.SessionStore
 import org.linuxdo.android.net.BrowserSession
 import org.linuxdo.android.net.NetworkPath
 import org.linuxdo.android.net.OkHttpTransport
 import org.linuxdo.android.net.Transport
+import org.linuxdo.android.net.UserApiKeyAuthService
 import org.linuxdo.android.net.WebViewFetchTransport
 import org.linuxdo.android.net.buildSharedHttpClient
 
@@ -33,11 +35,14 @@ class AppContainer(context: Context) {
     val preferences = context.getSharedPreferences("display_preferences", Context.MODE_PRIVATE)
     val diagnostics = Diagnostics(File(context.filesDir, "diagnostics.log"))
     val sessionStore = SessionStore(context)
+    val reading = ReadingStore(context)
     val userAgent: String = resolveUserAgent(context, sessionStore)
     val browser = BrowserSession(context, userAgent, sessionStore, diagnostics)
 
     /** JSON 请求、图片与附件下载共用,保证 UA 与 Cookie 一致。 */
     val httpClient = buildSharedHttpClient(sessionStore, userAgent)
+
+    val userApiKeyAuthService = UserApiKeyAuthService(sessionStore, httpClient, diagnostics)
 
     val imageLoader: ImageLoader = ImageLoader.Builder(context)
         .okHttpClient(httpClient)
@@ -65,15 +70,19 @@ class AppContainer(context: Context) {
          * 因为 cf_clearance 与 UA 绑定,UA 漂移会触发重新挑战。
          */
         fun resolveUserAgent(context: Context, store: SessionStore): String {
-            store.userAgentOrNull()?.let { return it }
             val normalized = normalize(WebSettings.getDefaultUserAgent(context))
+            val stored = store.userAgentOrNull()
+            // 旧版本把设备段强行改成固定的 Android 10; K。它会与 WebView 自动
+            // 发送的 Client Hints 不一致，CF 可能将同一会话视为指纹漂移。
+            if (!stored.isNullOrBlank() && !stored.contains("Android 10; K")) return stored
             store.saveUserAgent(normalized)
             return normalized
         }
 
         fun normalize(raw: String): String = raw
-            .replace(Regex("\\(Linux; Android [^)]*\\)"), "(Linux; Android 10; K)")
-            .replace("; wv", "")
-            .replace(" Version/4.0", "")
+            .replace(Regex("[;\\s]*\\bwv\\b[;\\s]*(?=\\))"), "")
+            .replace(Regex("Version/[^ ]+ *"), "")
+            .replace(Regex("\\s{2,}"), " ")
+            .trim()
     }
 }
