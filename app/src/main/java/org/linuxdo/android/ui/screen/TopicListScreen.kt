@@ -37,6 +37,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.scale
 import androidx.compose.ui.graphics.graphicsLayer
@@ -282,12 +283,16 @@ internal fun TopicRow(item: TopicListItem, onClick: () -> Unit) {
             Spacer(Modifier.width(10.dp))
             MetaStat(formatCount(topic.views), textWidth = 34.dp) { ViewGlyph(it) }
             Spacer(Modifier.width(10.dp))
-            Text(
-                text = RelativeTime.format(topic.bumpedAt ?: topic.lastPostedAt ?: topic.createdAt),
-                style = IosTheme.type.caption,
-                color = IosTheme.colors.tertiaryLabel,
-                maxLines = 1,
-            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                ClockGlyph(IosTheme.colors.tertiaryLabel)
+                Spacer(Modifier.width(3.dp))
+                Text(
+                    text = RelativeTime.format(topic.bumpedAt ?: topic.lastPostedAt ?: topic.createdAt),
+                    style = IosTheme.type.caption,
+                    color = IosTheme.colors.secondaryLabel,
+                    maxLines = 1,
+                )
+            }
             Spacer(Modifier.weight(1f))
             topic.tags.take(2).forEach { tag ->
                 Spacer(Modifier.width(4.dp))
@@ -466,6 +471,18 @@ private fun ViewGlyph(color: Color) {
             style = Stroke(size.width * 0.11f),
         )
         drawCircle(color, size.width * 0.16f, Offset(size.width / 2f, size.height / 2f))
+    }
+}
+
+/** 小钟表图标。与气泡、眼睛保持相同的 11.dp 紧凑比例。 */
+@Composable
+private fun ClockGlyph(color: Color) {
+    Canvas(Modifier.size(11.dp)) {
+        scale(size.width / 24f, size.height / 24f, pivot = Offset.Zero) {
+            drawCircle(color, radius = 9f, center = Offset(12f, 12f), style = Stroke(2.2f))
+            drawLine(color, Offset(12f, 7.5f), Offset(12f, 12f), strokeWidth = 2.2f, cap = StrokeCap.Round)
+            drawLine(color, Offset(12f, 12f), Offset(15.5f, 12f), strokeWidth = 2.2f, cap = StrokeCap.Round)
+        }
     }
 }
 
