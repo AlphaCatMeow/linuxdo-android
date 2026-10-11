@@ -69,6 +69,7 @@ class CookedParser(private val onUnknown: (String) -> Unit = {}) {
     fun parse(html: String): List<CookedBlock> = blocks(Jsoup.parseBodyFragment(html).body().childNodes())
 
     companion object {
+        private const val CONTENT_IMAGES = "img:not(.emoji):not(.avatar)"
         private val blockCache = LruCache<String, List<CookedBlock>>(600)
 
         fun parseCached(html: String, onUnknown: (String) -> Unit = {}): List<CookedBlock> {
@@ -93,6 +94,10 @@ class CookedParser(private val onUnknown: (String) -> Unit = {}) {
         element.hasClass("meta") ||
             element.hasClass("filename") ||
             element.hasClass("informations")
+
+    /** Emoji and quote-header avatars are small icons that belong inline with the surrounding text. */
+    private fun isInlineImage(element: Element): Boolean =
+        element.hasClass("emoji") || element.hasClass("avatar")
 
     private fun resolvePictureUrls(img: Element): Pair<String, String>? {
         val rawSrc = contentUrl(img.attr("src"))
@@ -138,7 +143,7 @@ class CookedParser(private val onUnknown: (String) -> Unit = {}) {
             if (element != null && isLightboxMeta(element)) continue
             if (element != null && (element.hasClass("lightbox-wrapper") || element.hasClass("lightbox"))) {
                 flush()
-                element.select("img:not(.emoji)").mapNotNullTo(output, ::pictureBlockOf)
+                element.select(CONTENT_IMAGES).mapNotNullTo(output, ::pictureBlockOf)
                 continue
             }
             when (element?.normalName()) {
@@ -165,7 +170,7 @@ class CookedParser(private val onUnknown: (String) -> Unit = {}) {
                     })
                 }
                 "img" -> {
-                    if (element.hasClass("emoji")) pending += inline(element)
+                    if (isInlineImage(element)) pending += inline(element)
                     else {
                         flush()
                         val pic = pictureBlockOf(element)
@@ -178,7 +183,7 @@ class CookedParser(private val onUnknown: (String) -> Unit = {}) {
                     output += blocks(element.childNodes())
                 }
                 else -> {
-                    if (element != null && element.select("img:not(.emoji)").isNotEmpty()) {
+                    if (element != null && element.select(CONTENT_IMAGES).isNotEmpty()) {
                         flush()
                         output += blocks(element.childNodes())
                     } else pending += inline(node)
