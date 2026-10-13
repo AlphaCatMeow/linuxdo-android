@@ -1583,10 +1583,11 @@ private fun PostRow(
             ),
             verticalAlignment = Alignment.CenterVertically,
         ) {
+            val postAvatarUrl = avatarUrlOf(post.avatarTemplate)
             AsyncImage(
-                avatarUrlOf(post.avatarTemplate),
+                postAvatarUrl,
                 post.username,
-                modifier = Modifier.size(32.dp).clip(CircleShape),
+                modifier = Modifier.size(32.dp).clip(avatarShape(post.username, postAvatarUrl, 4.dp)),
                 contentScale = ContentScale.Crop,
             )
             Column(Modifier.weight(1f).padding(start = 10.dp)) {
@@ -1660,10 +1661,11 @@ private fun SubReplyRow(
             ),
             verticalAlignment = Alignment.CenterVertically,
         ) {
+            val subAvatarUrl = avatarUrlOf(post.avatarTemplate)
             AsyncImage(
-                avatarUrlOf(post.avatarTemplate),
+                subAvatarUrl,
                 post.username,
-                modifier = Modifier.size(20.dp).clip(CircleShape),
+                modifier = Modifier.size(20.dp).clip(avatarShape(post.username, subAvatarUrl, 3.dp)),
                 contentScale = ContentScale.Crop,
             )
             Row(
@@ -1840,8 +1842,9 @@ private fun PostActions(
                     .background(chipBg)
                     .combinedClickable(enabled = boost.canDelete && !busy, onClick = {}, onLongClick = { deleteId = boost.id })
                     .padding(horizontal = 5.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-                    AsyncImage(avatarUrlOf(boost.user?.avatarTemplate), boost.user?.username,
-                        modifier = Modifier.size(18.dp).clip(CircleShape))
+                    val boostAvatarUrl = avatarUrlOf(boost.user?.avatarTemplate)
+                    AsyncImage(boostAvatarUrl, boost.user?.username,
+                        modifier = Modifier.size(18.dp).clip(avatarShape(boost.user?.username, boostAvatarUrl, 3.dp)))
                     Box(Modifier.padding(start = 4.dp, end = 3.dp)) {
                         RichParagraph(content.filterIsInstance<CookedBlock.Paragraph>().flatMap { it.runs }, compact = true)
                     }

@@ -52,6 +52,7 @@ import org.linuxdo.android.BuildConfig
 import org.linuxdo.android.net.NetworkPath
 import org.linuxdo.android.ui.design.IosDivider
 import org.linuxdo.android.ui.design.IosGroupCard
+import org.linuxdo.android.ui.design.avatarShape
 import android.content.Intent
 import android.net.Uri
 import androidx.compose.foundation.verticalScroll
@@ -190,7 +191,7 @@ fun ProfileScreen(
                         Box(
                             modifier = Modifier
                                 .size(62.dp)
-                                .clip(CircleShape)
+                                .clip(avatarShape(username, cornerRadius = 8.dp))
                                 .background(Color(0xFFE1F0FF)),
                             contentAlignment = Alignment.Center,
                         ) {
@@ -524,7 +525,7 @@ fun ProfileScreen(
                             Spacer(Modifier.width(10.dp))
                         } else {
                             entry.avatarUrl?.let { url ->
-                                AsyncImage(url, entry.actor, modifier = Modifier.size(32.dp).clip(CircleShape))
+                                AsyncImage(url, entry.actor, modifier = Modifier.size(32.dp).clip(avatarShape(entry.actor, url, 4.dp)))
                                 Spacer(Modifier.width(10.dp))
                             }
                         }
@@ -998,14 +999,14 @@ private fun NotificationAvatarWithBadge(
                 modifier = Modifier
                     .align(Alignment.BottomStart)
                     .size(34.dp)
-                    .clip(CircleShape),
+                    .clip(avatarShape(actor, avatarUrl, 4.dp)),
             )
         } else {
             Box(
                 Modifier
                     .align(Alignment.BottomStart)
                     .size(34.dp)
-                    .clip(CircleShape)
+                    .clip(avatarShape(actor, null, 4.dp))
                     .background(IosTheme.colors.fieldBackground),
                 contentAlignment = Alignment.Center,
             ) {
@@ -1427,24 +1428,28 @@ fun SettingsScreen(
                     }
                 }
 
-                IosDivider()
+                // 3.3 开发者选项与诊断。
+                // 正式包隐藏入口：网络路由切换、日志导出与接口自检属调试能力，不面向普通用户。
+                // 前置分隔线一并隐藏，否则正式包这里会多出一条悬空的尾线。
+                if (BuildConfig.DEBUG) {
+                    IosDivider()
 
-                // 3.3 开发者选项与诊断
-                IosRow(onClick = onDiagnostics) {
-                    SettingIconBadge(bgColor = Color(0xFFF0F0F2)) {
-                        SettingTerminalIcon(tint = Color(0xFF3A3A3C))
+                    IosRow(onClick = onDiagnostics) {
+                        SettingIconBadge(bgColor = Color(0xFFF0F0F2)) {
+                            SettingTerminalIcon(tint = Color(0xFF3A3A3C))
+                        }
+                        Spacer(Modifier.width(12.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text("开发者选项与诊断", style = IosTheme.type.body, fontWeight = FontWeight.SemiBold)
+                            Text(
+                                "网络路由捕获、日志与接口自检",
+                                style = IosTheme.type.footnote,
+                                color = IosTheme.colors.secondaryLabel,
+                                modifier = Modifier.padding(top = 3.dp),
+                            )
+                        }
+                        Text("›", color = IosTheme.colors.tertiaryLabel, style = IosTheme.type.title3)
                     }
-                    Spacer(Modifier.width(12.dp))
-                    Column(Modifier.weight(1f)) {
-                        Text("开发者选项与诊断", style = IosTheme.type.body, fontWeight = FontWeight.SemiBold)
-                        Text(
-                            "网络路由捕获、日志与接口自检",
-                            style = IosTheme.type.footnote,
-                            color = IosTheme.colors.secondaryLabel,
-                            modifier = Modifier.padding(top = 3.dp),
-                        )
-                    }
-                    Text("›", color = IosTheme.colors.tertiaryLabel, style = IosTheme.type.title3)
                 }
             }
         }

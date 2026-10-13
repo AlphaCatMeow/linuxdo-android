@@ -33,6 +33,7 @@ import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.Dp
@@ -41,6 +42,17 @@ import androidx.compose.ui.unit.dp
 import kotlin.math.cos
 import kotlin.math.floor
 import kotlin.math.sin
+
+/**
+ * LINUX DO 社区特色定制头像形状：
+ * 论坛创始人/站长 neo 的头像是微圆角方形，其他用户统一为圆形。
+ */
+fun avatarShape(username: String?, avatarUrl: String? = null, cornerRadius: Dp = 4.dp): Shape {
+    val isNeo = username?.equals("neo", ignoreCase = true) == true ||
+        avatarUrl?.contains("/neo/", ignoreCase = true) == true ||
+        avatarUrl?.contains("user_avatar/linux.do/neo", ignoreCase = true) == true
+    return if (isNeo) RoundedCornerShape(cornerRadius) else CircleShape
+}
 
 @Composable
 fun IosSwitch(checked: Boolean, onCheckedChange: (Boolean) -> Unit, modifier: Modifier = Modifier) {

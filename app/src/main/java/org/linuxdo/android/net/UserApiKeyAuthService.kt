@@ -152,7 +152,7 @@ class UserApiKeyAuthService(
 
     /**
      * 兑换 OTP：
-     * 先取 CSRF，然后不跟随重定向 POST /session/otp/:token，拦截第一跳 302 的 Set-Cookie。
+     * 先取 CSRF 及匹配的 _forum_session，然后不跟随重定向 POST /session/otp/:token，拦截第一跳 302 的 Set-Cookie。
      */
     private suspend fun redeemOtp(otp: String) {
         val csrf = fetchCsrf()
@@ -173,13 +173,40 @@ class UserApiKeyAuthService(
             .header("Accept", "application/json, text/javascript, */*; q=0.01")
             .build()
 
+        var responseCode = 0
         val response = otpClient.newCall(request).execute()
         response.use { resp ->
+            responseCode = resp.code
             diagnostics.log("兑换 OTP 响应码: ${resp.code}")
-            val cookies = Cookie.parseAll(resp.request.url, resp.headers)
-            if (cookies.isNotEmpty()) {
+            if (resp.code !in 200..302) {
+                val errBody = resp.body?.string()?.take(300).orEmpty()
+                diagnostics.log("兑换 OTP 失败响应体: $errBody")
+            }
+            val parsedCookies = Cookie.parseAll(resp.request.url, resp.headers).toMutableList()
+            // 显式提取 Set-Cookie 中的 _t，防止因严格域名匹配丢失
+            val rawSetCookies = resp.headers.values("Set-Cookie")
+            for (raw in rawSetCookies) {
+                val match = Regex("(?:^|;\\s*)_t=([^;]+)").find(raw)
+                if (match != null) {
+                    val tValue = match.groupValues[1].trim()
+                    if (tValue.isNotEmpty() && parsedCookies.none { it.name == Config.SESSION_COOKIE }) {
+                        parsedCookies.add(
+                            Cookie.Builder()
+                                .name(Config.SESSION_COOKIE)
+                                .value(tValue)
+                                .domain(Config.HOST)
+                                .path("/")
+                                .secure()
+                                .httpOnly()
+                                .build()
+                        )
+                    }
+                }
+            }
+
+            if (parsedCookies.isNotEmpty()) {
                 withContext(Dispatchers.Main) {
-                    store.applyResponseCookies(cookies)
+                    store.applyResponseCookies(parsedCookies)
                 }
             }
         }
@@ -189,15 +216,17 @@ class UserApiKeyAuthService(
             store.hasSessionCookie()
         }
         if (!hasSession) {
-            throw IllegalStateException("登录令牌兑换成功但未获取到会话凭证 (_t)，请重试")
+            val errorHint = if (responseCode == 403) "安全防护校验拦截（HTTP 403），请稍后重试"
+                else "登录令牌兑换成功但未获取到会话凭证 (_t)，请重试"
+            throw IllegalStateException(errorHint)
         }
         diagnostics.log("会话凭证 (_t) 已成功持久化")
     }
 
     /**
-     * 获取 CSRF Token
+     * 获取 CSRF Token 并同步保存关联会话 Cookie
      */
-    private fun fetchCsrf(): String? {
+    private suspend fun fetchCsrf(): String? {
         val request = Request.Builder()
             .url("${Config.BASE_URL}/session/csrf.json")
             .header("Accept", "application/json")
@@ -206,6 +235,12 @@ class UserApiKeyAuthService(
 
         return runCatching {
             httpClient.newCall(request).execute().use { resp ->
+                val cookies = Cookie.parseAll(resp.request.url, resp.headers)
+                if (cookies.isNotEmpty()) {
+                    withContext(Dispatchers.Main) {
+                        store.applyResponseCookies(cookies)
+                    }
+                }
                 val body = resp.body?.string().orEmpty()
                 val obj = json.parseToJsonElement(body).jsonObject
                 obj["csrf"]?.jsonPrimitive?.contentOrNull

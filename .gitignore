@@ -22,6 +22,7 @@ keystore.properties
 /.kotlin/
 *.md
 !/README.md
+/待办功能备忘.md
 *.txt
 *.doc
 *.docx

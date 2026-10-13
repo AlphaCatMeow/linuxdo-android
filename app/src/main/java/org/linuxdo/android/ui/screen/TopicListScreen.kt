@@ -75,6 +75,7 @@ import org.linuxdo.android.ui.design.IosLargeTitleScaffold
 import org.linuxdo.android.ui.design.IosLoadingBox
 import org.linuxdo.android.ui.design.IosMetrics
 import org.linuxdo.android.ui.design.IosTheme
+import org.linuxdo.android.ui.design.avatarShape
 import org.linuxdo.android.ui.format.RelativeTime
 
 data class TopicListUiState(
@@ -249,10 +250,27 @@ fun TopicListScreen(
  * 顶栏(作者 + Lv + 分类)、主体(标题 + 按需摘要 + 按需首图)、底栏(回复 / 浏览 / 活动时间 + 标签)。
  */
 @Composable
-internal fun TopicRow(item: TopicListItem, onClick: () -> Unit) {
+fun TopicRow(item: TopicListItem, query: String? = null, onClick: () -> Unit) {
     val topic = item.topic
-    val excerpt = remember(topic.id, topic.excerpt) {
-        topic.excerpt?.let { Jsoup.parseBodyFragment(it).text().trim() }?.takeIf { it.isNotEmpty() }
+    val needle = query?.trim().orEmpty()
+    val accent = IosTheme.colors.accent
+    val excerpt = remember(topic.id, topic.excerpt, needle, accent) {
+        val raw = topic.excerpt?.let { Jsoup.parseBodyFragment(it).text().trim() }?.takeIf { it.isNotEmpty() }
+        if (raw.isNullOrBlank()) null
+        else if (needle.isEmpty()) buildAnnotatedString { append(raw) }
+        else buildAnnotatedString {
+            var start = raw.indexOf(needle, ignoreCase = true)
+            var cursor = 0
+            while (start >= 0) {
+                append(raw.substring(cursor, start))
+                withStyle(SpanStyle(color = accent, fontWeight = FontWeight.SemiBold)) {
+                    append(raw.substring(start, start + needle.length))
+                }
+                cursor = start + needle.length
+                start = raw.indexOf(needle, cursor, ignoreCase = true)
+            }
+            append(raw.substring(cursor))
+        }
     }
     Column(
         Modifier
@@ -274,7 +292,7 @@ internal fun TopicRow(item: TopicListItem, onClick: () -> Unit) {
                     contentScale = ContentScale.Crop,
                     modifier = Modifier
                         .size(24.dp)
-                        .clip(CircleShape)
+                        .clip(avatarShape(item.authorUsername, item.avatarUrl, 3.5.dp))
                         .background(IosTheme.colors.fieldBackground),
                 )
                 Spacer(Modifier.width(6.dp))
@@ -300,7 +318,7 @@ internal fun TopicRow(item: TopicListItem, onClick: () -> Unit) {
         Row {
             Column(Modifier.weight(1f)) {
                 Text(
-                    text = titleWithBadges(topic, IosTheme.colors.accent),
+                    text = titleWithBadges(topic, IosTheme.colors.accent, query),
                     style = IosTheme.type.body,
                     color = IosTheme.colors.label,
                     maxLines = 2,
@@ -313,7 +331,7 @@ internal fun TopicRow(item: TopicListItem, onClick: () -> Unit) {
                         text = text,
                         style = IosTheme.type.footnote,
                         color = IosTheme.colors.secondaryLabel,
-                        maxLines = 2,
+                        maxLines = if (query.isNullOrBlank()) 2 else 3,
                         overflow = TextOverflow.Ellipsis,
                     )
                 }
@@ -334,8 +352,10 @@ internal fun TopicRow(item: TopicListItem, onClick: () -> Unit) {
         Spacer(Modifier.height(7.dp))
         Row(verticalAlignment = Alignment.CenterVertically) {
             MetaStat(formatCount(topic.totalReplies), textWidth = 30.dp) { ReplyGlyph(it) }
-            Spacer(Modifier.width(10.dp))
-            MetaStat(formatCount(topic.views), textWidth = 34.dp) { ViewGlyph(it) }
+            if (topic.views > 0) {
+                Spacer(Modifier.width(10.dp))
+                MetaStat(formatCount(topic.views), textWidth = 34.dp) { ViewGlyph(it) }
+            }
             Spacer(Modifier.width(10.dp))
             Row(verticalAlignment = Alignment.CenterVertically) {
                 ClockGlyph(IosTheme.colors.tertiaryLabel)
@@ -544,7 +564,7 @@ private fun ClockGlyph(color: Color) {
  * 未读蓝点与置顶/关闭标记都内联进标题文本流,和标题共占 2 行配额,
  * 不在标题上方额外占一行 —— 紧凑卡片经不起多一行的开销。
  */
-private fun titleWithBadges(topic: Topic, accent: Color) = buildAnnotatedString {
+private fun titleWithBadges(topic: Topic, accent: Color, query: String? = null) = buildAnnotatedString {
     if (topic.unseen) {
         appendInlineContent(UNSEEN_DOT, "•")
         append(" ")
@@ -559,7 +579,23 @@ private fun titleWithBadges(topic: Topic, accent: Color) = buildAnnotatedString 
         withStyle(SpanStyle(color = accent.copy(alpha = 0.7f), fontSize = 15.sp)) { append("已关闭") }
         append(" ")
     }
-    append(topic.title)
+    val title = topic.title
+    val needle = query?.trim().orEmpty()
+    if (needle.isNotEmpty()) {
+        var start = title.indexOf(needle, ignoreCase = true)
+        var cursor = 0
+        while (start >= 0) {
+            append(title.substring(cursor, start))
+            withStyle(SpanStyle(color = accent, fontWeight = FontWeight.SemiBold)) {
+                append(title.substring(start, start + needle.length))
+            }
+            cursor = start + needle.length
+            start = title.indexOf(needle, cursor, ignoreCase = true)
+        }
+        append(title.substring(cursor))
+    } else {
+        append(title)
+    }
 }
 
 private const val UNSEEN_DOT = "unseen-dot"

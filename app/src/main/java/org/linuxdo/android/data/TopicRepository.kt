@@ -122,87 +122,13 @@ class TopicRepository(
         return result.toMap().also { emojiCache = it }
     }
 
-    private var unreadFeedCursorPage = 0
-    private var unreadHasMorePages = true
-    private var newHasMorePages = true
-
     suspend fun fetchFeed(feed: HomeFeedType, page: Int, awaitCategories: Boolean = true): TopicPage {
-        if (feed == HomeFeedType.Unread) {
-            return fetchUnreadAndNewMerged(page, awaitCategories)
-        }
-        return toPage(json.decodeFromString(request("${feed.apiPath}?page=$page", burst = page == 0)), awaitCategories)
-    }
-
-    /**
-     * 首页「未读」合并拉取 `/unread.json`（跟踪且有新回复的话题）与 `/new.json`（未点开过的新话题），
-     * 并结合本地 [ReadingStore] 排除已在 APP 内读到最新楼层的话题（兼容未开启阅读进度同步的纯净模式）。
-     */
-    private suspend fun fetchUnreadAndNewMerged(page: Int, awaitCategories: Boolean): TopicPage {
-        if (page == 0) {
-            unreadFeedCursorPage = 0
-            unreadHasMorePages = true
-            newHasMorePages = true
-        }
-        val accumulated = mutableListOf<TopicListItem>()
-        var attempts = 0
-        while (attempts < 2 && (unreadHasMorePages || newHasMorePages)) {
-            val cursor = unreadFeedCursorPage++
-            attempts++
-            val unreadResp = if (unreadHasMorePages) {
-                try {
-                    json.decodeFromString<TopicListResponse>(request("/unread.json?page=$cursor", burst = cursor == 0))
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (e: NeedsInteractiveVerification) {
-                    throw e
-                } catch (e: Exception) {
-                    if (!newHasMorePages && attempts == 1) throw e
-                    diagnostics.log("拉取 /unread.json?page=$cursor 失败，降级使用 /new.json: ${e.message}")
-                    unreadHasMorePages = false
-                    null
-                }
-            } else null
-
-            val newResp = if (newHasMorePages) {
-                try {
-                    json.decodeFromString<TopicListResponse>(request("/new.json?page=$cursor", burst = true))
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (e: NeedsInteractiveVerification) {
-                    throw e
-                } catch (e: Exception) {
-                    if (unreadResp == null && attempts == 1) throw e
-                    diagnostics.log("拉取 /new.json?page=$cursor 失败，仅使用 /unread.json: ${e.message}")
-                    newHasMorePages = false
-                    null
-                }
-            } else null
-
-            unreadHasMorePages = unreadResp?.topicList?.moreTopicsUrl != null
-            newHasMorePages = newResp?.topicList?.moreTopicsUrl != null
-
-            val mergedTopics = (unreadResp?.topicList?.topics.orEmpty() + newResp?.topicList?.topics.orEmpty())
-                .distinctBy { it.id }
-                .sortedByDescending { it.bumpedAt ?: it.lastPostedAt ?: it.createdAt.orEmpty() }
-            val mergedUsers = (unreadResp?.users.orEmpty() + newResp?.users.orEmpty())
-                .distinctBy { it.id }
-            val mergedMoreUrl = unreadResp?.topicList?.moreTopicsUrl ?: newResp?.topicList?.moreTopicsUrl
-
-            val pageResult = toPage(
-                response = TopicListResponse(
-                    topicList = TopicListPayload(topics = mergedTopics, moreTopicsUrl = mergedMoreUrl),
-                    users = mergedUsers,
-                ),
-                awaitCategories = awaitCategories,
-                excludeReadUnread = true,
-            )
-            accumulated.addAll(pageResult.items)
-            // 若当前页被本地已读过滤后剩余过少且服务端仍有下一页，自动顺延补拉一页避免首屏空列表
-            if (accumulated.distinctBy { it.topic.id }.size >= 10) break
-        }
-        return TopicPage(
-            items = accumulated.distinctBy { it.topic.id },
-            hasMore = unreadHasMorePages || newHasMorePages,
+        val excludeRead = feed == HomeFeedType.Unread
+        val path = "${feed.apiPath}?page=$page"
+        return toPage(
+            response = json.decodeFromString(request(path, burst = page == 0)),
+            awaitCategories = awaitCategories,
+            excludeReadUnread = excludeRead,
         )
     }
 

@@ -10,6 +10,7 @@ import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -34,18 +35,13 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.scale
-import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalFocusManager
-import androidx.compose.ui.text.SpanStyle
-import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
-import coil.compose.AsyncImage
-import org.jsoup.Jsoup
 import org.linuxdo.android.data.Topic
 import org.linuxdo.android.data.TopicListItem
 import org.linuxdo.android.data.SearchOrder
@@ -219,16 +215,25 @@ fun SearchScreen(
             if (state.query.isNotBlank() && !state.results.initialLoading && state.results.error == null && state.results.items.isEmpty()) {
                 item("empty") { EmptyNotice() }
             }
-            items(state.results.items, key = { it.topic.id }) { item ->
-                SearchResultCard(
-                    item = item,
-                    excerptHtml = state.excerpts[item.topic.id],
-                    query = state.query,
-                    onClick = {
-                        focusManager.clearFocus()
-                        onOpenTopic(item.topic)
-                    },
-                )
+            itemsIndexed(state.results.items, key = { _, item -> item.topic.id }) { index, item ->
+                Column(Modifier.background(IosTheme.colors.card)) {
+                    val topicWithExcerpt = remember(item, state.excerpts[item.topic.id]) {
+                        if (state.excerpts[item.topic.id] != null) {
+                            item.copy(topic = item.topic.copy(excerpt = state.excerpts[item.topic.id]))
+                        } else item
+                    }
+                    TopicRow(
+                        item = topicWithExcerpt,
+                        query = state.query,
+                        onClick = {
+                            focusManager.clearFocus()
+                            onOpenTopic(item.topic)
+                        },
+                    )
+                    if (index < state.results.items.lastIndex) {
+                        IosDivider(startIndent = IosMetrics.screenPadding)
+                    }
+                }
             }
             if (state.results.loadingMore) item("more") { IosLoadingBox() }
         }
@@ -374,176 +379,6 @@ fun SearchScreen(
     }
 }
 
-/**
- * 社区/贴吧风格搜索卡片：
- * 头部作者信息、加粗标题、左侧高亮摘要 + 右侧缩略图、底部操作栏（回复、赞、火箭boost）
- */
-@Composable
-private fun SearchResultCard(
-    item: TopicListItem,
-    excerptHtml: String?,
-    query: String,
-    onClick: () -> Unit,
-) {
-    val topic = item.topic
-    val thumbUrl = remember(topic.imageUrl, excerptHtml) {
-        topic.imageUrl ?: extractFirstImage(excerptHtml)
-    }
-
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 12.dp, vertical = 5.dp)
-            .clip(RoundedCornerShape(12.dp))
-            .background(IosTheme.colors.card)
-            .clickable(onClick = onClick)
-            .padding(14.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        // 第一行：作者头像 + 昵称 + 类别标签
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            AsyncImage(
-                model = item.avatarUrl,
-                contentDescription = item.authorUsername,
-                modifier = Modifier
-                    .size(22.dp)
-                    .clip(CircleShape)
-                    .background(IosTheme.colors.fieldBackground),
-                contentScale = ContentScale.Crop,
-            )
-            Spacer(Modifier.width(8.dp))
-            Text(
-                text = item.authorUsername ?: "匿名用户",
-                style = IosTheme.type.footnote,
-                color = IosTheme.colors.secondaryLabel,
-                maxLines = 1,
-                modifier = Modifier.weight(1f, fill = false),
-            )
-            item.category?.let { cat ->
-                Spacer(Modifier.width(8.dp))
-                CategoryTag(cat)
-            }
-        }
-
-        // 第二行：标题
-        Text(
-            text = topic.title,
-            style = IosTheme.type.headline,
-            fontWeight = FontWeight.Bold,
-            color = IosTheme.colors.label,
-            maxLines = 2,
-        )
-
-        // 第三行：左侧摘要 + 右侧缩略图
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
-            verticalAlignment = Alignment.Top,
-        ) {
-            Box(Modifier.weight(1f)) {
-                SearchExcerpt(excerptHtml, query)
-            }
-            if (!thumbUrl.isNullOrBlank()) {
-                AsyncImage(
-                    model = thumbUrl,
-                    contentDescription = null,
-                    modifier = Modifier
-                        .size(width = 84.dp, height = 58.dp)
-                        .clip(RoundedCornerShape(8.dp))
-                        .background(IosTheme.colors.fieldBackground),
-                    contentScale = ContentScale.Crop,
-                )
-            }
-        }
-
-        Spacer(Modifier.height(2.dp))
-
-        // 第四行：贴吧风格操作栏（回复、赞、火箭boost）
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(20.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            // 回复
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(4.dp),
-            ) {
-                CardReplyIcon(tint = IosTheme.colors.secondaryLabel)
-                val replyCount = (topic.postsCount - 1).coerceAtLeast(0)
-                Text(
-                    text = if (replyCount > 0) "回复 $replyCount" else "回复",
-                    style = IosTheme.type.caption,
-                    color = IosTheme.colors.secondaryLabel,
-                )
-            }
-            // 赞
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(4.dp),
-            ) {
-                CardLikeIcon(tint = IosTheme.colors.secondaryLabel)
-                Text(
-                    text = if (topic.likeCount > 0) "赞 ${topic.likeCount}" else "赞",
-                    style = IosTheme.type.caption,
-                    color = IosTheme.colors.secondaryLabel,
-                )
-            }
-            // 火箭boost
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(4.dp),
-            ) {
-                CardBoostIcon(tint = IosTheme.colors.secondaryLabel)
-                Text(
-                    text = "火箭boost",
-                    style = IosTheme.type.caption,
-                    color = IosTheme.colors.secondaryLabel,
-                )
-            }
-        }
-    }
-}
-
-/** 搜索匹配摘要文本并高亮关键词 */
-@Composable
-private fun SearchExcerpt(html: String?, query: String) {
-    val accent = IosTheme.colors.accent
-    val text = remember(html, query, accent) {
-        val plain = html?.let { Jsoup.parseBodyFragment(it).text() }.orEmpty()
-        buildAnnotatedString {
-            append(plain)
-            val needle = query.trim()
-            if (needle.isNotEmpty()) {
-                var start = plain.indexOf(needle, ignoreCase = true)
-                while (start >= 0) {
-                    addStyle(SpanStyle(color = accent, fontWeight = FontWeight.SemiBold), start, start + needle.length)
-                    start = plain.indexOf(needle, start + needle.length, ignoreCase = true)
-                }
-            }
-        }
-    }
-    if (text.isNotEmpty()) {
-        Text(
-            text = text,
-            style = IosTheme.type.subheadline,
-            color = IosTheme.colors.secondaryLabel,
-            maxLines = 3,
-        )
-    }
-}
-
-/** 提取 HTML 文本中的第一张图片 URL */
-private fun extractFirstImage(html: String?): String? {
-    if (html.isNullOrBlank()) return null
-    return runCatching {
-        val doc = Jsoup.parseBodyFragment(html)
-        doc.select("img").firstOrNull()?.attr("src")?.takeIf { it.isNotBlank() }
-    }.getOrNull()
-}
 
 /** 搜索放大镜图标 */
 @Composable
@@ -654,58 +489,6 @@ private fun SearchOrderIcon(order: SearchOrder, isSelected: Boolean) {
                     }
                 }
             }
-        }
-    }
-}
-
-/** 卡片底部贴吧回复线框图标 */
-@Composable
-private fun CardReplyIcon(tint: Color) {
-    Canvas(Modifier.size(14.dp)) {
-        scale(size.width / 24f, size.height / 24f, pivot = Offset.Zero) {
-            val stroke = Stroke(width = 1.8f, cap = StrokeCap.Round, join = StrokeJoin.Round)
-            val bubble = Path().apply {
-                moveTo(4f, 6f); lineTo(20f, 6f); lineTo(20f, 16f); lineTo(9f, 16f)
-                lineTo(5f, 20f); lineTo(5f, 16f); lineTo(4f, 16f); close()
-            }
-            drawPath(bubble, tint, style = stroke)
-        }
-    }
-}
-
-/** 卡片底部贴吧点赞大拇指线框图标 */
-@Composable
-private fun CardLikeIcon(tint: Color) {
-    Canvas(Modifier.size(14.dp)) {
-        scale(size.width / 24f, size.height / 24f, pivot = Offset.Zero) {
-            val stroke = Stroke(width = 1.8f, cap = StrokeCap.Round, join = StrokeJoin.Round)
-            val thumb = Path().apply {
-                moveTo(7f, 19f); lineTo(3f, 19f); lineTo(3f, 10f); lineTo(7f, 10f)
-                moveTo(7f, 11f); lineTo(10f, 4.5f); lineTo(12f, 4.5f); lineTo(11f, 10f); lineTo(18.5f, 10f)
-                lineTo(17f, 19f); lineTo(7f, 19f)
-            }
-            drawPath(thumb, tint, style = stroke)
-        }
-    }
-}
-
-/** 卡片底部火箭 boost 线框图标 */
-@Composable
-private fun CardBoostIcon(tint: Color) {
-    Canvas(Modifier.size(14.dp)) {
-        scale(size.width / 24f, size.height / 24f, pivot = Offset.Zero) {
-            val stroke = Stroke(width = 1.8f, cap = StrokeCap.Round, join = StrokeJoin.Round)
-            val rocket = Path().apply {
-                moveTo(9f, 15f); lineTo(9f, 10f)
-                cubicTo(12f, 5f, 16f, 3f, 21f, 3f)
-                cubicTo(21f, 8f, 19f, 12f, 14f, 15f)
-                close()
-                moveTo(9f, 10f); lineTo(5f, 10f); lineTo(3f, 15f); lineTo(9f, 15f)
-                moveTo(14f, 15f); lineTo(14f, 19f); lineTo(9f, 21f); lineTo(9f, 15f)
-            }
-            drawPath(rocket, tint, style = stroke)
-            drawCircle(tint, 1.8f, Offset(16f, 8f), style = Stroke(1.4f))
-            drawLine(tint, Offset(6f, 18f), Offset(3f, 21f), 1.6f)
         }
     }
 }
