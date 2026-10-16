@@ -25,10 +25,15 @@ import org.linuxdo.android.data.SessionStore
 class OkHttpTransport(
     private val store: SessionStore,
     private val browser: BrowserSession,
-    private val client: OkHttpClient,
+    private var client: OkHttpClient,
     private val diagnostics: Diagnostics,
 ) : Transport {
     override val name: String = NetworkPath.OKHTTP.label
+
+    /** 动态更新底层 OkHttpClient（DoH 节点切换或开关变更后调用） */
+    fun updateClient(newClient: OkHttpClient) {
+        this.client = newClient
+    }
 
     override suspend fun get(path: String, present: Boolean): TransportResult {
         var result = execute(path, present = present)

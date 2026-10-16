@@ -11,8 +11,12 @@ import kotlinx.serialization.descriptors.SerialDescriptor
 import kotlinx.serialization.encoding.Decoder
 import kotlinx.serialization.encoding.Encoder
 import kotlinx.serialization.json.JsonDecoder
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonPrimitive
 import org.linuxdo.android.Config
 
@@ -26,6 +30,54 @@ enum class HomeFeedType(val label: String, val apiPath: String) {
     companion object {
         fun fromName(name: String?): HomeFeedType =
             entries.firstOrNull { it.name.equals(name, ignoreCase = true) } ?: Latest
+    }
+}
+
+/** 话题列表排序方式，与 Discourse API 参数及 FluxDO 对齐。 */
+enum class TopicSortOrder(val label: String, val apiValue: String?) {
+    Default("默认", null),
+    Activity("活跃度", "activity"),
+    Created("创建时间", "created"),
+    Likes("点赞数", "likes"),
+    Views("浏览量", "views"),
+    Posts("回复数", "posts"),
+    Posters("参与者", "posters");
+
+    companion object {
+        fun fromName(name: String?): TopicSortOrder =
+            entries.firstOrNull { it.name.equals(name, ignoreCase = true) } ?: Default
+    }
+}
+
+/** 辅助悬浮球支持的快捷动作类型。最多配置 5 项，用户可调整顺序与开启状态。 */
+enum class FloatingAction(
+    val id: String,
+    val title: String,
+    val shortLabel: String,
+    val description: String,
+) {
+    CreateTopic("create_topic", "发帖", "发帖", "快速发布新话题"),
+    Sort("sort", "排序", "排序", "切换话题列表排序"),
+    Drafts("drafts", "草稿", "草稿", "查看与编辑草稿"),
+    Search("search", "搜索", "搜索", "全站快捷搜索"),
+    Categories("categories", "分类", "分类", "浏览全部话题分类");
+
+    companion object {
+        val DEFAULT_ACTIONS = listOf(CreateTopic, Sort, Drafts, Search, Categories)
+
+        fun fromId(id: String?): FloatingAction? =
+            entries.firstOrNull { it.id.equals(id, ignoreCase = true) || it.name.equals(id, ignoreCase = true) }
+
+        fun parseActions(serialized: String?): List<FloatingAction> {
+            if (serialized.isNullOrBlank()) return DEFAULT_ACTIONS
+            val list = serialized.split(",")
+                .mapNotNull { fromId(it.trim()) }
+                .distinct()
+            return if (list.isEmpty()) DEFAULT_ACTIONS else list.take(5)
+        }
+
+        fun serializeActions(actions: List<FloatingAction>): String =
+            actions.distinct().take(5).joinToString(",") { it.id }
     }
 }
 
@@ -70,6 +122,7 @@ data class Topic(
     val tags: List<@Serializable(with = TagNameSerializer::class) String> = emptyList(),
     @SerialName("last_poster_username") val lastPosterUsername: String? = null,
     val posters: List<Poster> = emptyList(),
+    @SerialName("notification_level") val notificationLevel: Int? = null,
 ) {
     /**
      * 列表要显示的"总回复数",口径与网页端一致。
@@ -113,7 +166,26 @@ data class Category(
      * 不展开就查不到子分类,列表里那些帖子会没有分类标签。
      */
     @SerialName("subcategory_list") val subcategoryList: List<Category> = emptyList(),
+    @SerialName("allowed_tags") val allowedTags: List<String> = emptyList(),
+    @SerialName("read_restricted") val readRestricted: Boolean = false,
 )
+
+/** 获取该分类支持的固定标签列表；不同分类可能不同，不可自定义随意输入。 */
+fun fixedTagsForCategory(category: Category?): List<String> {
+    if (category != null && category.allowedTags.isNotEmpty()) {
+        return category.allowedTags.distinct()
+    }
+    val name = category?.name.orEmpty()
+    return when {
+        name.contains("资源") || name.contains("福利") -> listOf("软件", "工具", "教程", "福利", "影视", "音乐", "游戏", "电子书", "开源")
+        name.contains("开发") || name.contains("代码") || name.contains("技术") || name.contains("调优") -> listOf("前端", "后端", "Python", "Java", "Docker", "Linux", "开源", "Bug", "架构", "运维")
+        name.contains("AI") || name.contains("人工智能") || name.contains("模型") -> listOf("ChatGPT", "Claude", "Gemini", "DeepSeek", "API", "提示词", "本地部署", "生图")
+        name.contains("问答") || name.contains("求助") || name.contains("快问") -> listOf("求助", "咨询", "配置", "排错", "推荐", "新手")
+        name.contains("运营") || name.contains("站务") || name.contains("公告") -> listOf("公告", "反馈", "建议", "活动", "规则")
+        name.contains("羊毛") || name.contains("打折") -> listOf("活动", "优惠", "免费", "薅羊毛", "限免")
+        else -> listOf("教程", "经验分享", "工具推荐", "求助", "日常", "讨论", "资讯", "测试")
+    }
+}
 
 /** 把嵌套的分类树摊平成一维,便于按 id 查找。 */
 fun flattenCategories(categories: List<Category>): List<Category> =
@@ -136,6 +208,169 @@ fun compactCategoryGroups(categories: List<Category>): List<Pair<Category, List<
     }
 }
 
+fun orderedCategoryGroups(categories: List<Category>, order: List<Long>): List<Pair<Category, List<Category>>> {
+    val positions = order.distinct().withIndex().associate { it.value to it.index }
+    return compactCategoryGroups(categories).sortedBy { positions[it.first.id.toLong()] ?: Int.MAX_VALUE }
+}
+
+@Serializable
+data class CustomSectionLink(
+    val id: String = java.util.UUID.randomUUID().toString(),
+    val icon: String = "🔗",
+    val name: String = "",
+    val url: String = "",
+    val serverId: Long? = null,
+)
+
+@Serializable
+data class CustomSection(
+    val id: String = "custom_section_default",
+    val title: String = "自定义版块",
+    val links: List<CustomSectionLink> = emptyList(),
+    val serverId: Long? = null,
+)
+
+object CustomSectionIconMapper {
+    private val EMOJI_TO_FA = mapOf(
+        "⭐" to "star",
+        "🌟" to "star",
+        "🔥" to "fire",
+        "🚀" to "rocket",
+        "💡" to "lightbulb",
+        "📌" to "thumbtack",
+        "💬" to "comments",
+        "💭" to "comments",
+        "📚" to "book",
+        "📖" to "book",
+        "💻" to "code",
+        "🔧" to "wrench",
+        "🎯" to "bullseye",
+        "☕" to "mug-hot",
+        "❤️" to "heart",
+        "💖" to "heart",
+        "🎉" to "champagne-glasses",
+        "✨" to "wand-magic-sparkles",
+        "⚡" to "bolt",
+        "🔒" to "lock",
+        "⚙️" to "gear",
+        "🔔" to "bell",
+        "📢" to "bullhorn",
+        "🔖" to "bookmark",
+        "🏷️" to "tag",
+        "🌐" to "globe",
+        "🔍" to "magnifying-glass",
+        "🔗" to "link",
+        "📁" to "folder",
+        "📂" to "folder-open",
+        "👤" to "user",
+        "👥" to "users",
+        "🚩" to "flag",
+        "✈️" to "paper-plane",
+        "🎖️" to "certificate",
+    )
+
+    private val FA_TO_EMOJI = mapOf(
+        "star" to "⭐",
+        "fire" to "🔥",
+        "rocket" to "🚀",
+        "lightbulb" to "💡",
+        "thumbtack" to "📌",
+        "comments" to "💬",
+        "comment" to "💬",
+        "book" to "📚",
+        "code" to "💻",
+        "wrench" to "🔧",
+        "bullseye" to "🎯",
+        "mug-hot" to "☕",
+        "heart" to "❤️",
+        "champagne-glasses" to "🎉",
+        "wand-magic-sparkles" to "✨",
+        "bolt" to "⚡",
+        "lock" to "🔒",
+        "gear" to "⚙️",
+        "bell" to "🔔",
+        "bullhorn" to "📢",
+        "bookmark" to "🔖",
+        "tag" to "🏷️",
+        "globe" to "🌐",
+        "magnifying-glass" to "🔍",
+        "search" to "🔍",
+        "link" to "🔗",
+        "external-link" to "🔗",
+        "layer-group" to "📂",
+        "folder" to "📁",
+        "folder-open" to "📂",
+        "user" to "👤",
+        "users" to "👥",
+        "user-group" to "👥",
+        "inbox" to "📥",
+        "flag" to "🚩",
+        "paper-plane" to "✈️",
+        "certificate" to "🎖️",
+        "filter" to "🔎",
+        "circle-info" to "ℹ️",
+        "circle-question" to "❓",
+    )
+
+    /**
+     * 将输入的图标（Emoji 或文本）转为 Discourse PC 端能够合法接受并正常渲染的 FontAwesome 图标名。
+     * 服务端要求 validates :icon, presence: true，兜底为 "link"。
+     */
+    fun toFontAwesome(input: String?): String {
+        val trimmed = input?.trim().orEmpty()
+        if (trimmed.isEmpty()) return "link"
+        if (trimmed.matches(Regex("^[a-z0-9-]+$"))) return trimmed
+        return EMOJI_TO_FA[trimmed] ?: "link"
+    }
+
+    /**
+     * 将 PC 端的 FontAwesome 图标名转换为手机端美观的 Emoji。
+     */
+    fun toDisplayIcon(icon: String?): String {
+        val trimmed = icon?.trim().orEmpty()
+        if (trimmed.isEmpty()) return "🔗"
+        FA_TO_EMOJI[trimmed.lowercase()]?.let { return it }
+        return trimmed
+    }
+}
+
+enum class TopicNotificationLevel(
+    val code: Int,
+    val title: String,
+    val badgeLabel: String,
+    val description: String,
+) {
+    Watching(
+        code = 3,
+        title = "关注",
+        badgeLabel = "关注",
+        description = "您将在此话题有新回复时收到通知，并且会显示新回复数量。",
+    ),
+    Tracking(
+        code = 2,
+        title = "跟踪",
+        badgeLabel = "跟踪",
+        description = "将显示此话题的新回复数量。您会在别人 @ 您或回复您时收到通知。",
+    ),
+    Regular(
+        code = 1,
+        title = "常规",
+        badgeLabel = "常规",
+        description = "您会在别人 @ 您或回复您时收到通知。",
+    ),
+    Muted(
+        code = 0,
+        title = "免打扰",
+        badgeLabel = "免打扰",
+        description = "您永远不会收到有关此话题的任何通知，它也不会出现在最新话题中。",
+    );
+
+    companion object {
+        fun fromCode(code: Int?): TopicNotificationLevel =
+            entries.firstOrNull { it.code == code } ?: Regular
+    }
+}
+
 /** 列表行要展示的全部信息:帖子本体 + 已 join 出的作者与分类。 */
 data class TopicListItem(
     val topic: Topic,
@@ -143,12 +378,54 @@ data class TopicListItem(
     val avatarUrl: String?,
     val category: Category?,
     val trustLevel: Int? = null,
+    val notificationLevel: TopicNotificationLevel? = null,
+    val notificationLevelUpdating: Boolean = false,
 )
 
 data class TopicPage(
     val items: List<TopicListItem>,
     val hasMore: Boolean,
 )
+
+/** 服务端草稿条目（兼容创建新话题草稿与话题回复草稿）。 */
+data class DraftItem(
+    val draftKey: String,
+    val sequence: Long = 0L,
+    val title: String = "",
+    val raw: String = "",
+    val excerpt: String = "",
+    val categoryId: Int? = null,
+    val category: Category? = null,
+    val tags: List<String> = emptyList(),
+    val action: String = "createTopic",
+    val topicId: Long? = null,
+    val replyToPostNumber: Int? = null,
+    val postId: Long? = null,
+    val createdAt: String? = null,
+    val username: String? = null,
+    val avatarUrl: String? = null,
+    val closed: Boolean = false,
+    val archetype: String = "regular",
+) {
+    val isNewTopic: Boolean
+        get() = action == "createTopic" || draftKey.startsWith("new_topic") || topicId == null || topicId <= 0L
+}
+
+sealed class PostResult {
+    data class Success(val post: Post) : PostResult()
+    data object Enqueued : PostResult()
+
+    companion object {
+        fun decode(response: JsonElement, json: Json): PostResult {
+            val root = response as? JsonObject
+                ?: error("提交结果无法确认，请先检查回复是否已发布")
+            val action = (root["action"] as? JsonPrimitive)?.contentOrNull
+            val queued = (root["queued"] as? JsonPrimitive)?.booleanOrNull == true
+            if (action == "enqueued" || root["pending_post"] is JsonObject || queued) return Enqueued
+            return Success(json.decodeFromJsonElement(Post.serializer(), root))
+        }
+    }
+}
 
 @Serializable
 data class Post(
@@ -172,9 +449,20 @@ data class Post(
     @SerialName("accepted_answer") val acceptedAnswer: Boolean = false,
     @SerialName("can_edit") val canEdit: Boolean = false,
     @SerialName("can_delete") val canDelete: Boolean = false,
+    @SerialName("bookmarked") val bookmarked: Boolean = false,
+    @SerialName("bookmark_id") val bookmarkId: Long? = null,
     /** post_stream 里的楼层不带 raw,编辑前要单独取一次。 */
     val raw: String? = null,
 )
+
+enum class PostFlagReason(val id: Int, val title: String, val description: String) {
+    Spam(8, "垃圾信息", "广告、推销或垃圾信息"),
+    Inappropriate(4, "不当内容", "冒犯性、攻击性或违规内容"),
+    OffTopic(3, "跑题内容", "与本话题讨论主题无关"),
+    NotifyModerators(7, "其他问题", "需要版主协助处理，请补充说明");
+
+    val requiresMessage: Boolean get() = this == NotifyModerators
+}
 
 @Serializable
 data class Boost(val id: Long, val cooked: String = "", val user: DiscourseUser? = null,
@@ -328,6 +616,20 @@ data class UploadedFile(
         else "[$fileName|attachment]($shortUrl)"
 }
 
+/**
+ * 待提交或已上传的附件媒体信息。
+ * 用户在发帖/评论时先原样预览缩略图与卡片，确认无误并在提交/保存草稿时自动转化为 Markdown 编码。
+ */
+data class AttachedMedia(
+    val id: String = java.util.UUID.randomUUID().toString(),
+    val name: String,
+    val previewUrl: String,
+    val uploaded: UploadedFile,
+    val isImage: Boolean = true,
+) {
+    fun toMarkdown(): String = uploaded.toMarkdown()
+}
+
 @Serializable
 data class Reaction(val id: String, val count: Int = 0, @SerialName("can_undo") val canUndo: Boolean = false)
 
@@ -358,13 +660,25 @@ private val DATA_TOPIC_ATTR = Regex("""\bdata-topic\s*=\s*["'](\d+)["']""", Rege
  * 优先取服务端显式 reply_to_post_number；若为空（例如通过引用 `[quote="..., post:13"]` 回复），
  * 则从 cooked 首个同话题 quote 块提取 data-post 作为父楼层号，使客户端树形挂载与服务端 reply_count 口径对齐。
  */
-fun Post.effectiveReplyToPostNumber(): Int? {
-    replyToPostNumber?.takeIf { it > 1 }?.let { return it }
+fun Post.effectiveReplyToPostNumber(includeTopicPost: Boolean = false): Int? {
+    val minimum = if (includeTopicPost) 1 else 2
+    replyToPostNumber?.takeIf { it >= minimum && it < postNumber }?.let { return it }
     if (!cooked.contains("quote", ignoreCase = true)) return null
     val aside = ASIDE_TAG.find(cooked)?.value ?: return null
     val quotedTopic = DATA_TOPIC_ATTR.find(aside)?.groupValues?.getOrNull(1)?.toLongOrNull()
     if (quotedTopic != null && topicId > 0L && quotedTopic != topicId) return null
-    return DATA_POST_ATTR.find(aside)?.groupValues?.getOrNull(1)?.toIntOrNull()?.takeIf { it > 1 && it < postNumber }
+    return DATA_POST_ATTR.find(aside)?.groupValues?.getOrNull(1)?.toIntOrNull()?.takeIf { it >= minimum && it < postNumber }
+}
+
+fun flatPostRows(posts: List<Post>, descending: Boolean = false): List<TreePost> {
+    val sorted = posts.distinctBy { it.id }.sortedBy { it.postNumber }
+    val byNumber = sorted.associateBy { it.postNumber }
+    val comments = sorted.filterNot { it.postNumber == 1 }.let { if (descending) it.asReversed() else it }
+    return (sorted.filter { it.postNumber == 1 } + comments).map { post ->
+        val parentNumber = post.effectiveReplyToPostNumber(includeTopicPost = true)
+        val parent = byNumber[parentNumber]
+        TreePost(post, 0, 0, parentNumber != null && parent == null, replyToUsername = parent?.username)
+    }
 }
 
 /**
@@ -510,6 +824,7 @@ data class PostStream(
 @Serializable
 data class TopicDetails(
     @SerialName("can_create_post") val canCreatePost: Boolean = true,
+    @SerialName("notification_level") val notificationLevel: Int = 1,
 )
 
 @Serializable
@@ -571,8 +886,13 @@ internal data class NotificationCountItem(
     @SerialName("notification_type") val type: Int,
     val read: Boolean = true,
 ) {
-    val countsAsUnread: Boolean get() = !read &&
-        (NotificationFilter.Replies.includes(type) || NotificationFilter.Messages.includes(type))
+    /**
+     * 是否计入铃铛与桌面角标。
+     *
+     * 口径跟随用户在通知设置里选的作用域(全部 / 仅回复与互动类),
+     * 与推送下发共用 NotificationScope.includes —— 后台弹过的,前台必须认账。
+     */
+    fun countsAsUnread(scope: NotificationScope): Boolean = !read && scope.includes(type)
 }
 
 @Serializable
@@ -590,9 +910,9 @@ data class UnreadSummary(
     val unreadFilters: Set<NotificationFilter> = emptySet(),
     /**
      * 每个分类各自的未读条数。
-     * 总 count 走的是铃铛口径 —— 只算回复类和私信类(见 NotificationCountItem.countsAsUnread),
-     * 点赞根本不计入。所以判断"某个分类有没有新东西"必须看这里的分项值,用 count 会让
-     * 点赞分类永远判定为没变化。
+     * 总 count 走的是铃铛/角标口径 —— 跟随通知设置的作用域(见 NotificationScope.includes),
+     * 「仅回复与互动类」下点赞不计入。所以判断"某个分类有没有新东西"必须看这里的分项值,
+     * 用 count 会让点赞分类永远判定为没变化。
      */
     val unreadByFilter: Map<NotificationFilter, Int> = emptyMap(),
 )

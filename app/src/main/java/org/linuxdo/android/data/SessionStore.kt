@@ -7,6 +7,7 @@ import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import okhttp3.Cookie
 import org.json.JSONObject
+import kotlinx.serialization.json.Json
 import org.linuxdo.android.Config
 
 /**
@@ -16,7 +17,7 @@ import org.linuxdo.android.Config
  * 只有它为空(例如 WebView 数据被清)时才用加密存储恢复。
  * 涉及 CookieManager 的方法请在主线程调用。
  */
-class SessionStore(context: Context) {
+class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider {
     private val prefs: SharedPreferences = createPrefs(context)
 
     fun storedCookies(): Map<String, String> {
@@ -92,6 +93,9 @@ class SessionStore(context: Context) {
         }
     }
 
+    /** 判断当前是否已登录社区凭据。 */
+    fun hasSession(): Boolean = storedCookies().containsKey(Config.SESSION_COOKIE)
+
     /**
      * 清除一个指定 Cookie，供 CF 重新验证前淘汰可能失效的 clearance 使用。
      * 返回清除后 WebView 里是否已经不存在该 Cookie。
@@ -152,6 +156,9 @@ class SessionStore(context: Context) {
     fun hasSessionCookie(): Boolean = syncFromWebView().containsKey(Config.SESSION_COOKIE)
 
     fun clear() {
+        clearTopicNotificationLevels()
+        clearCurrentUserId()
+        plainPrefs.edit().remove(KEY_LAST_SEEN_NOTIFICATION_ID).apply()
         prefs.edit().remove(KEY_COOKIES).remove(KEY_SAVED_AT).apply()
         val manager = CookieManager.getInstance()
         manager.removeAllCookies(null)
@@ -169,6 +176,55 @@ class SessionStore(context: Context) {
 
     fun saveHomeFeed(feed: String) {
         prefs.edit().putString(KEY_HOME_FEED, feed).apply()
+    }
+
+    fun getTopicSortOrder(): TopicSortOrder =
+        TopicSortOrder.fromName(prefs.getString(KEY_TOPIC_SORT_ORDER, null))
+
+    fun setTopicSortOrder(order: TopicSortOrder) {
+        prefs.edit().putString(KEY_TOPIC_SORT_ORDER, order.name).apply()
+    }
+
+    fun getTopicSortAscending(): Boolean =
+        prefs.getBoolean(KEY_TOPIC_SORT_ASCENDING, false)
+
+    fun setTopicSortAscending(ascending: Boolean) {
+        prefs.edit().putBoolean(KEY_TOPIC_SORT_ASCENDING, ascending).apply()
+    }
+
+    fun isFloatingBallEnabled(): Boolean =
+        plainPrefs.getBoolean(KEY_FLOATING_BALL_ENABLED, true)
+
+    fun setFloatingBallEnabled(enabled: Boolean) {
+        plainPrefs.edit().putBoolean(KEY_FLOATING_BALL_ENABLED, enabled).apply()
+    }
+
+    fun getFloatingBallActions(): List<FloatingAction> =
+        FloatingAction.parseActions(plainPrefs.getString(KEY_FLOATING_BALL_ACTIONS, null))
+
+    fun setFloatingBallActions(actions: List<FloatingAction>) {
+        plainPrefs.edit().putString(KEY_FLOATING_BALL_ACTIONS, FloatingAction.serializeActions(actions)).apply()
+    }
+
+    fun getFloatingBallXRatio(): Float =
+        plainPrefs.getFloat(KEY_FLOATING_BALL_X_RATIO, if (isFloatingBallOnRight()) 0.95f else 0.05f)
+
+    fun setFloatingBallXRatio(ratio: Float) {
+        plainPrefs.edit().putFloat(KEY_FLOATING_BALL_X_RATIO, ratio.coerceIn(0f, 1f)).apply()
+    }
+
+    fun getFloatingBallYRatio(): Float =
+        plainPrefs.getFloat(KEY_FLOATING_BALL_Y_RATIO, 1.0f)
+
+    fun setFloatingBallYRatio(ratio: Float) {
+        plainPrefs.edit().putFloat(KEY_FLOATING_BALL_Y_RATIO, ratio.coerceIn(0f, 1f)).apply()
+    }
+
+    fun isFloatingBallOnRight(): Boolean =
+        plainPrefs.getBoolean(KEY_FLOATING_BALL_ON_RIGHT, true)
+
+    fun setFloatingBallOnRight(onRight: Boolean) {
+        plainPrefs.edit().putBoolean(KEY_FLOATING_BALL_ON_RIGHT, onRight).apply()
     }
 
     fun savedLogin(): String? = prefs.getString(KEY_SAVED_LOGIN, null)
@@ -189,15 +245,372 @@ class SessionStore(context: Context) {
         editor.apply()
     }
 
+    private val plainPrefs: SharedPreferences = context.getSharedPreferences(PREFS_PLAIN_NAME, Context.MODE_PRIVATE)
+    private val json = Json { ignoreUnknownKeys = true }
+
+    fun saveCategoryOrder(ids: List<Long>) {
+        plainPrefs.edit().putString(KEY_CATEGORY_ORDER, ids.filter { it > 0L }.distinct().joinToString(",")).commit()
+    }
+
+    fun loadCategoryOrder(): List<Long> {
+        val raw = plainPrefs.getString(KEY_CATEGORY_ORDER, null) ?: return emptyList()
+        return raw.split(",").mapNotNull { it.trim().toLongOrNull()?.takeIf { id -> id > 0L } }.distinct()
+    }
+
+    fun resetCategoryOrder() {
+        plainPrefs.edit().remove(KEY_CATEGORY_ORDER).commit()
+    }
+
+    fun saveCustomSection(section: CustomSection?) {
+        if (section == null) {
+            plainPrefs.edit().remove(KEY_CUSTOM_SECTION).commit()
+        } else {
+            val raw = json.encodeToString(CustomSection.serializer(), section)
+            plainPrefs.edit().putString(KEY_CUSTOM_SECTION, raw).commit()
+        }
+    }
+
+    fun loadCustomSection(): CustomSection? {
+        val raw = plainPrefs.getString(KEY_CUSTOM_SECTION, null) ?: return null
+        return runCatching {
+            json.decodeFromString(CustomSection.serializer(), raw)
+        }.getOrNull()
+    }
+
+    private val topicNotificationLevels = LinkedHashMap<Long, Int>(16, 0.75f, true).apply {
+        plainPrefs.getString(KEY_TOPIC_NOTIFICATION_LEVELS, null)
+            ?.split(',')
+            ?.forEach { entry ->
+                val parts = entry.split(':')
+                if (parts.size == 2) {
+                    val id = parts[0].trim().toLongOrNull()
+                    val level = parts[1].trim().toIntOrNull()
+                    if (id != null && id > 0L && level != null && level in 0..3) {
+                        put(id, level)
+                    }
+                }
+            }
+        while (size > MAX_NOTIFICATION_LEVELS) remove(keys.first())
+    }
+
+    fun saveTopicNotificationLevel(topicId: Long, level: Int) {
+        if (topicId <= 0L || level !in 0..3) return
+        synchronized(topicNotificationLevels) {
+            topicNotificationLevels.remove(topicId)
+            topicNotificationLevels[topicId] = level
+            while (topicNotificationLevels.size > MAX_NOTIFICATION_LEVELS) {
+                val oldest = topicNotificationLevels.keys.firstOrNull() ?: break
+                topicNotificationLevels.remove(oldest)
+            }
+            val csv = topicNotificationLevels.entries.joinToString(",") { "${it.key}:${it.value}" }
+            plainPrefs.edit().putString(KEY_TOPIC_NOTIFICATION_LEVELS, csv).apply()
+        }
+    }
+
+    private fun clearTopicNotificationLevels() = synchronized(topicNotificationLevels) {
+        topicNotificationLevels.clear()
+        plainPrefs.edit().remove(KEY_TOPIC_NOTIFICATION_LEVELS).apply()
+    }
+
+    fun getTopicNotificationLevel(topicId: Long): Int? = synchronized(topicNotificationLevels) {
+        topicNotificationLevels[topicId]
+    }
+
+    fun allTopicNotificationLevels(): Map<Long, Int> = synchronized(topicNotificationLevels) {
+        topicNotificationLevels.toMap()
+    }
+
+    fun isAutoRefreshIncomingEnabled(): Boolean = AUTOMATIC_NETWORK_FEATURES_AVAILABLE &&
+        getAutoRefreshInterval() != AutoRefreshInterval.OFF
+
+    fun getAutoRefreshInterval(): AutoRefreshInterval {
+        val code = plainPrefs.getInt(KEY_AUTO_REFRESH_INTERVAL, -1)
+        if (code >= 0) return AutoRefreshInterval.fromCode(code)
+        // 兼容旧版 boolean（若用户曾保存过旧版设置）
+        if (plainPrefs.contains(KEY_AUTO_REFRESH_INCOMING)) {
+            val legacy = plainPrefs.getBoolean(KEY_AUTO_REFRESH_INCOMING, false)
+            return if (legacy) AutoRefreshInterval.MIN_1 else AutoRefreshInterval.OFF
+        }
+        // 初次使用默认开启实时 15 秒感知
+        return AutoRefreshInterval.REALTIME
+    }
+
+    fun setAutoRefreshInterval(interval: AutoRefreshInterval) {
+        plainPrefs.edit()
+            .putInt(KEY_AUTO_REFRESH_INTERVAL, interval.code)
+            .putBoolean(KEY_AUTO_REFRESH_INCOMING, interval != AutoRefreshInterval.OFF)
+            .apply()
+    }
+
+    fun setAutoRefreshIncomingEnabled(enabled: Boolean) {
+        setAutoRefreshInterval(if (enabled) AutoRefreshInterval.MIN_1 else AutoRefreshInterval.OFF)
+    }
+
+    fun isBackgroundNotificationEnabled(): Boolean = AUTOMATIC_NETWORK_FEATURES_AVAILABLE &&
+        getNotificationPollInterval() != NotificationPollInterval.OFF
+
+    fun getNotificationPollInterval(): NotificationPollInterval {
+        val code = plainPrefs.getInt(KEY_BG_NOTIFICATION_INTERVAL, -1)
+        if (code >= 0) return NotificationPollInterval.fromCode(code)
+        // 兼容旧版 boolean
+        val legacy = plainPrefs.getBoolean(KEY_BG_NOTIFICATION, false)
+        return if (legacy) NotificationPollInterval.MIN_15 else NotificationPollInterval.OFF
+    }
+
+    fun setNotificationPollInterval(interval: NotificationPollInterval) {
+        val editor = plainPrefs.edit()
+            .putInt(KEY_BG_NOTIFICATION_INTERVAL, interval.code)
+            .putBoolean(KEY_BG_NOTIFICATION, interval != NotificationPollInterval.OFF)
+        if (interval != NotificationPollInterval.OFF) {
+            editor.putInt(KEY_LAST_NON_OFF_INTERVAL, interval.code)
+        }
+        editor.apply()
+    }
+
+    fun setBackgroundNotificationEnabled(enabled: Boolean) {
+        setKeepAliveServiceEnabled(enabled)
+        if (!enabled) {
+            setNotificationPollInterval(NotificationPollInterval.OFF)
+        } else {
+            val lastCode = plainPrefs.getInt(KEY_LAST_NON_OFF_INTERVAL, NotificationPollInterval.MIN_15.code)
+            val restore = NotificationPollInterval.fromCode(lastCode).let {
+                if (it == NotificationPollInterval.OFF) NotificationPollInterval.MIN_15 else it
+            }
+            setNotificationPollInterval(restore)
+        }
+    }
+
+    fun getNotificationScope(): NotificationScope {
+        val code = plainPrefs.getInt(KEY_NOTIFICATION_SCOPE, NotificationScope.INTERACTION_ONLY.code)
+        return NotificationScope.fromCode(code)
+    }
+
+    fun setNotificationScope(scope: NotificationScope) {
+        plainPrefs.edit().putInt(KEY_NOTIFICATION_SCOPE, scope.code).apply()
+    }
+
+    fun isKeepAliveServiceEnabled(): Boolean = AUTOMATIC_NETWORK_FEATURES_AVAILABLE &&
+        plainPrefs.getBoolean(KEY_KEEP_ALIVE_SERVICE, false)
+
+    fun setKeepAliveServiceEnabled(enabled: Boolean) {
+        plainPrefs.edit().putBoolean(KEY_KEEP_ALIVE_SERVICE, enabled).apply()
+    }
+
+    fun getCustomRealtimeSeconds(): Int = plainPrefs.getInt(KEY_CUSTOM_REALTIME_SECONDS, 15).coerceIn(1, 60)
+
+    fun setCustomRealtimeSeconds(seconds: Int) {
+        val valid = seconds.coerceIn(1, 60)
+        plainPrefs.edit().putInt(KEY_CUSTOM_REALTIME_SECONDS, valid).apply()
+    }
+
+    fun getLastSeenNotificationId(): Long = plainPrefs.getLong(KEY_LAST_SEEN_NOTIFICATION_ID, 0L)
+
+    fun setLastSeenNotificationId(id: Long) {
+        plainPrefs.edit().putLong(KEY_LAST_SEEN_NOTIFICATION_ID, id).apply()
+    }
+
+    fun currentUserId(): Long = plainPrefs.getLong(KEY_CURRENT_USER_ID, 0L)
+
+    fun saveCurrentUserId(id: Long) {
+        plainPrefs.edit().putLong(KEY_CURRENT_USER_ID, id).apply()
+    }
+
+    fun clearCurrentUserId() {
+        plainPrefs.edit().remove(KEY_CURRENT_USER_ID).apply()
+    }
+
+    fun hasAutoPromptedBatteryWhitelist(): Boolean =
+        plainPrefs.getBoolean(KEY_AUTO_PROMPTED_BATTERY_WHITELIST, false)
+
+    fun markAutoPromptedBatteryWhitelist() {
+        plainPrefs.edit().putBoolean(KEY_AUTO_PROMPTED_BATTERY_WHITELIST, true).apply()
+    }
+
+    fun getTestSimulatedUnreadCount(): Int = 0
+
+    fun setTestSimulatedUnreadCount(count: Int) {
+        plainPrefs.edit().remove(KEY_TEST_SIM_UNREAD_COUNT).commit()
+    }
+
+    fun incrementTestSimulatedUnreadCount(): Int = 0
+
+    /**
+     * 最近一次按通知作用域算出的桌面角标数,作为角标的单一真相源。
+     *
+     * MessageBus 实时推送只能拿到服务端的「全部未读数」,在「仅回复与互动类」作用域下
+     * 含点赞等被过滤类型,直接写角标会出现「有角标却没有通知」的鬼数字。
+     * 所以实时推送按实际弹出条数在这个值上递增,再由 REST 轮询与前台刷新校准为精确值。
+     */
+    fun getLastBadgeCount(): Int = plainPrefs.getInt(KEY_LAST_BADGE_COUNT, 0).coerceAtLeast(0)
+
+    /**
+     * 写入角标真相源。[force] 仅供实验室的角标实测按钮使用。
+     *
+     * 实测锁定期内拒绝常规来源(未读轮询、推送、本地已读)的写入,
+     * 否则人造数字会在用户按 Home 之前就被真实未读覆盖掉,实测等于没测。
+     */
+    fun setLastBadgeCount(count: Int, force: Boolean = false) {
+        if (!force && isBadgeTestHolding()) return
+        plainPrefs.edit().putInt(KEY_LAST_BADGE_COUNT, count.coerceAtLeast(0)).commit()
+    }
+
+    fun incrementLastBadgeCount(): Int {
+        val next = getLastBadgeCount() + 1
+        setLastBadgeCount(next, force = true)
+        return next
+    }
+
+    /**
+     * 角标实测锁定窗口的到期时刻(墙上时钟)。0 表示未锁定。
+     *
+     * 实验室下发的人造角标数只用于验证厂商桌面接口是否生效,**不进入真实未读口径**,
+     * 所以 APP 内的铃铛与未读计数不受这个窗口影响,只有桌面角标被临时冻结。
+     */
+    fun getBadgeTestHoldUntil(): Long = plainPrefs.getLong(KEY_BADGE_TEST_HOLD_UNTIL, 0L)
+
+    fun setBadgeTestHoldUntil(timestamp: Long) {
+        plainPrefs.edit().putLong(KEY_BADGE_TEST_HOLD_UNTIL, timestamp.coerceAtLeast(0L)).commit()
+    }
+
+    fun isBadgeTestHolding(): Boolean = System.currentTimeMillis() < getBadgeTestHoldUntil()
+
+    fun decrementTestSimulatedUnreadCount(): Int = 0
+
+    fun getPendingTestReplayTag(): String? =
+        plainPrefs.getString(KEY_PENDING_TEST_REPLAY_TAG, null)?.takeIf { it.isNotBlank() }
+
+    fun setPendingTestReplayTag(tag: String?) {
+        plainPrefs.edit().putString(KEY_PENDING_TEST_REPLAY_TAG, tag).commit()
+    }
+
+    fun isTestWaitScreenOnArmed(): Boolean =
+        plainPrefs.getBoolean(KEY_TEST_WAIT_SCREEN_ON, false)
+
+    fun setTestWaitScreenOnArmed(armed: Boolean) {
+        plainPrefs.edit().putBoolean(KEY_TEST_WAIT_SCREEN_ON, armed).commit()
+    }
+
+    /**
+     * App 是否处于前台。
+     *
+     * 由 MainActivity 的 onResume / onStop 维护，供「亮屏最小化」兜底闹钟判断
+     * 是否还需要续约下一跳。进程被杀后标记残留为 false，正好等价于「不在前台」。
+     * 用 commit() 而非 apply()：onStop 之后进程随时可能被冻结或回收，
+     * 异步落盘可能根本来不及写入。
+     */
+    fun isAppInForeground(): Boolean =
+        plainPrefs.getBoolean(KEY_APP_IN_FOREGROUND, false)
+
+    fun setAppInForeground(inForeground: Boolean) {
+        plainPrefs.edit().putBoolean(KEY_APP_IN_FOREGROUND, inForeground).commit()
+    }
+
+    // ── DoH 偏好读写 ─────────────────────────────────────────────────────────────
+
+    /** 是否开启 DoH（默认开启，支持免代理直连） */
+    override fun isDohEnabled(): Boolean = plainPrefs.getBoolean(KEY_DOH_ENABLED, true)
+
+    fun setDohEnabled(enabled: Boolean) {
+        plainPrefs.edit().putBoolean(KEY_DOH_ENABLED, enabled).apply()
+    }
+
+    /**
+     * 当前选中的 DoH 服务器 URL。
+     * 存的是节点的 [org.linuxdo.android.net.DohServer.url]，
+     * null 表示未选择（使用预设默认节点）。
+     */
+    override fun getDohServerUrl(): String? = plainPrefs.getString(KEY_DOH_SERVER_URL, null)
+
+    fun setDohServerUrl(url: String?) {
+        if (url == null) {
+            plainPrefs.edit().remove(KEY_DOH_SERVER_URL).apply()
+        } else {
+            plainPrefs.edit().putString(KEY_DOH_SERVER_URL, url).apply()
+        }
+    }
+
+    /** 是否开启自动故障切换（默认开启） */
+    override fun isDohAutoFailoverEnabled(): Boolean = plainPrefs.getBoolean(KEY_DOH_AUTO_FAILOVER, true)
+
+    fun setDohAutoFailoverEnabled(enabled: Boolean) {
+        plainPrefs.edit().putBoolean(KEY_DOH_AUTO_FAILOVER, enabled).apply()
+    }
+
+    /**
+     * 全部 DoH 节点的 JSON 序列化串（支持增删改查与预设持久化）。
+     * 格式：`[{"url":"https://...","name":"...","isCustom":true},...]`
+     */
+    override fun getDohServersJson(): String? = plainPrefs.getString(KEY_DOH_SERVERS_JSON, null)
+
+    fun setDohServersJson(json: String?) {
+        if (json == null) {
+            plainPrefs.edit().remove(KEY_DOH_SERVERS_JSON).apply()
+        } else {
+            plainPrefs.edit().putString(KEY_DOH_SERVERS_JSON, json).apply()
+        }
+    }
+
+    /**
+     * 用户自定义节点的 JSON 序列化串（旧版兼容）。
+     */
+    override fun getDohCustomServersJson(): String? = plainPrefs.getString(KEY_DOH_CUSTOM_SERVERS_JSON, null)
+
+    fun setDohCustomServersJson(json: String?) {
+        if (json == null) {
+            plainPrefs.edit().remove(KEY_DOH_CUSTOM_SERVERS_JSON).apply()
+        } else {
+            plainPrefs.edit().putString(KEY_DOH_CUSTOM_SERVERS_JSON, json).apply()
+        }
+    }
+
     companion object {
+        const val AUTOMATIC_NETWORK_FEATURES_AVAILABLE = true
         private const val PREFS_NAME = "session_secure"
+        private const val PREFS_PLAIN_NAME = "app_preferences"
+        private const val KEY_CURRENT_USER_ID = "current_user_id"
         private const val KEY_COOKIES = "cookies"
         private const val KEY_SAVED_AT = "saved_at"
         private const val KEY_USER_AGENT = "user_agent"
         private const val KEY_HOME_FEED = "home_feed"
+        private const val KEY_TOPIC_SORT_ORDER = "topic_sort_order"
+        private const val KEY_TOPIC_SORT_ASCENDING = "topic_sort_ascending"
+        private const val KEY_FLOATING_BALL_ENABLED = "floating_ball_enabled"
+        private const val KEY_FLOATING_BALL_ACTIONS = "floating_ball_actions"
+        private const val KEY_FLOATING_BALL_X_RATIO = "floating_ball_x_ratio"
+        private const val KEY_FLOATING_BALL_Y_RATIO = "floating_ball_y_ratio"
+        private const val KEY_FLOATING_BALL_ON_RIGHT = "floating_ball_on_right"
         private const val KEY_SAVED_LOGIN = "saved_login"
+        private const val KEY_LAST_SEEN_NOTIFICATION_ID = "last_seen_notification_id"
         private const val KEY_SAVED_PASSWORD = "saved_password"
         private const val KEY_REMEMBER_PASSWORD = "remember_password"
+        private const val KEY_CATEGORY_ORDER = "category_custom_order"
+        private const val KEY_CUSTOM_SECTION = "custom_section_json"
+        private const val KEY_TOPIC_NOTIFICATION_LEVELS = "topic_notification_levels"
+        private const val KEY_AUTO_REFRESH_INCOMING = "auto_refresh_incoming"
+        private const val KEY_AUTO_REFRESH_INTERVAL = "auto_refresh_interval"
+        private const val KEY_BG_NOTIFICATION = "bg_notification_enabled"
+        private const val KEY_BG_NOTIFICATION_INTERVAL = "bg_notification_interval"
+        private const val KEY_LAST_NON_OFF_INTERVAL = "last_non_off_notification_interval"
+        private const val KEY_NOTIFICATION_SCOPE = "notification_scope"
+        private const val KEY_KEEP_ALIVE_SERVICE = "keep_alive_service_enabled"
+        private const val KEY_CUSTOM_REALTIME_SECONDS = "custom_realtime_seconds"
+        private const val KEY_AUTO_PROMPTED_BATTERY_WHITELIST = "auto_prompted_battery_whitelist_v130"
+        // 带版本后缀：旧版实验室「设为 99」会把 99 写进这里并被当成真实未读累加，
+        // 换 key 让历史残留在升级后直接作废，无需用户手动归零。
+        private const val KEY_TEST_SIM_UNREAD_COUNT = "test_sim_unread_count_v131"
+        private const val KEY_LAST_BADGE_COUNT = "last_badge_count"
+        private const val KEY_BADGE_TEST_HOLD_UNTIL = "badge_test_hold_until"
+        private const val KEY_PENDING_TEST_REPLAY_TAG = "pending_test_replay_tag"
+        private const val KEY_TEST_WAIT_SCREEN_ON = "test_wait_screen_on"
+        private const val KEY_APP_IN_FOREGROUND = "app_in_foreground"
+        private const val MAX_NOTIFICATION_LEVELS = 1000
+
+        // ── DoH 相关偏好 ──────────────────────────────────────────────────────────
+        const val KEY_DOH_ENABLED = "doh_enabled"
+        const val KEY_DOH_SERVER_URL = "doh_server_url"
+        const val KEY_DOH_AUTO_FAILOVER = "doh_auto_failover"
+        const val KEY_DOH_SERVERS_JSON = "doh_servers_json"
+        const val KEY_DOH_CUSTOM_SERVERS_JSON = "doh_custom_servers_json"
 
         fun parseCookieHeader(raw: String?): Map<String, String> =
             raw.orEmpty().split(";").mapNotNull { part ->
@@ -231,3 +644,69 @@ class SessionStore(context: Context) {
         }
     }
 }
+
+enum class AutoRefreshInterval(val code: Int, val label: String, val seconds: Long) {
+    OFF(0, "关闭", 0L),
+    REALTIME(1, "实时 (15秒)", 15L),
+    MIN_1(2, "1 分钟", 60L),
+    MIN_2(3, "2 分钟", 120L),
+    MIN_5(4, "5 分钟", 300L),
+    MIN_10(5, "10 分钟", 600L),
+    MIN_15(6, "15 分钟", 900L);
+
+    companion object {
+        fun fromCode(code: Int): AutoRefreshInterval = entries.firstOrNull { it.code == code } ?: OFF
+    }
+}
+
+enum class NotificationPollInterval(val code: Int, val label: String, val seconds: Long) {
+    OFF(0, "关闭", 0L),
+    REALTIME(1, "实时", 15L),
+    MIN_1(2, "1 分钟", 60L),
+    MIN_2(3, "2 分钟", 120L),
+    MIN_5(4, "5 分钟", 300L),
+    MIN_10(5, "10 分钟", 600L),
+    MIN_15(6, "15 分钟", 900L);
+
+    fun getDisplayLabel(store: SessionStore?): String = when (this) {
+        REALTIME -> if (store != null) "实时 (${store.getCustomRealtimeSeconds()}秒)" else "实时"
+        else -> label
+    }
+
+    fun getEffectiveSeconds(store: SessionStore?): Long = when (this) {
+        REALTIME -> (store?.getCustomRealtimeSeconds() ?: seconds.toInt()).toLong()
+        else -> seconds
+    }
+
+    companion object {
+        fun fromCode(code: Int): NotificationPollInterval = entries.firstOrNull { it.code == code } ?: OFF
+    }
+}
+
+enum class NotificationScope(val code: Int, val label: String, val description: String) {
+    INTERACTION_ONLY(0, "仅回复与互动类通知", "仅推送与您直接相关的回复、@提及、引用、私信与简评"),
+    ALL(1, "全部通知", "包含关注发帖、话题动态、点赞与全部社区消息");
+
+    /**
+     * 该作用域是否接收此类型通知。
+     *
+     * 推送下发、桌面角标与铃铛计数共用这一个判定 —— 三者各算一套口径,
+     * 就会出现「后台弹了通知、前台一打开就把角标刷成 0」。
+     */
+    fun includes(notificationType: Int): Boolean = when (this) {
+        ALL -> true
+        INTERACTION_ONLY -> notificationType in INTERACTION_TYPES
+    }
+
+    companion object {
+        /**
+         * 严格与我直接相关的回复与互动类型：
+         * 1:提及, 2:回复, 3:引用, 4:编辑, 6:私信, 7:邀请私信, 15:群组提及, 16:群私信, 29:聊天提及, 30:聊天消息, 33:聊天引用, 43:简评。
+         * 注意：9 为 posted (关注话题中他人回帖/发帖)，14 为插件杂项，35 为问答公区评论，均属于全站/话题动态，绝非个人互动。
+         */
+        private val INTERACTION_TYPES = setOf(1, 2, 3, 4, 6, 7, 15, 16, 29, 30, 33, 43)
+
+        fun fromCode(code: Int): NotificationScope = entries.firstOrNull { it.code == code } ?: INTERACTION_ONLY
+    }
+}
+

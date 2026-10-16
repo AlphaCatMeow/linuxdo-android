@@ -16,3 +16,6 @@ dependencyResolutionManagement {
 
 rootProject.name = "linuxdo-android"
 include(":app")
+if (file("tunnel").isDirectory) {
+    include(":tunnel")
+}

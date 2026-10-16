@@ -13,8 +13,9 @@ android {
         applicationId = "org.linuxdo.android"
         minSdk = 26
         targetSdk = 36
-        versionCode = 10
-        versionName = "1.2.0"
+        versionCode = 11
+        versionName = "1.3.0"
+        ndk { abiFilters += "arm64-v8a" }
     }
 
     buildTypes {
@@ -53,6 +54,10 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
 
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    // DoH (DNS over HTTPS) 支持：纯 Kotlin 实现，无本地库，增量 < 30KB
+    implementation("com.squareup.okhttp3:okhttp-dnsoverhttps:4.12.0")
+    // 原生 DoH + ECH 安全直连 SDK（闭源二进制 AAR，包含深度混淆网络层与 native 动态库）
+    implementation(files("libs/tunnel-release.aar"))
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
@@ -61,4 +66,9 @@ dependencies {
     implementation("io.coil-kt:coil-compose:2.7.0")
     // 解析 Discourse 的 cooked HTML 为块模型;纯 Java,无传递依赖。
     implementation("org.jsoup:jsoup:1.18.1")
+    // 后台定期任务(低频只读静默探测未读通知)
+    implementation("androidx.work:work-runtime-ktx:2.9.1")
+    // WebView 代理导流:ProxyController 只存在于该库,framework 的 WebView 没有公开代理 API。
+    // zero-doh-local-proxy-tunnel 方案的 WebView 侧接入(task 3.1)强依赖它。
+    implementation("androidx.webkit:webkit:1.12.1")
 }

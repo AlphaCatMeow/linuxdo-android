@@ -16,8 +16,19 @@ sealed interface Route : Serializable {
     data object Profile : Route
     data object Diagnostics : Route
     data object Settings : Route
+    data class SettingsDetail(val page: SettingsPage) : Route
     data object Notifications : Route
     data class UserTopics(val username: String, val title: String, val isBookmark: Boolean = false) : Route
+    data object Drafts : Route
+}
+
+/** 设置的二级子页。标题同时用作首页品目名与子页导航栏标题。 */
+enum class SettingsPage(val title: String) {
+    Appearance("外观"),
+    Reading("阅读与浏览"),
+    FloatingBall("辅助悬浮球"),
+    Notifications("通知与保活"),
+    Network("网络与缓存"),
 }
 
 /**

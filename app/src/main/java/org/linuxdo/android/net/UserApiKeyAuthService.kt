@@ -34,9 +34,14 @@ import org.linuxdo.android.data.SessionStore
  */
 class UserApiKeyAuthService(
     private val store: SessionStore,
-    private val httpClient: OkHttpClient,
+    private var httpClient: OkHttpClient,
     private val diagnostics: Diagnostics,
 ) {
+    /** 动态更新底层的 OkHttpClient（DoH 节点切换或开关变更后调用） */
+    fun updateClient(newClient: OkHttpClient) {
+        this.httpClient = newClient
+    }
+
     private var pendingPrivateKey: PrivateKey? = null
     private var pendingNonce: String? = null
 

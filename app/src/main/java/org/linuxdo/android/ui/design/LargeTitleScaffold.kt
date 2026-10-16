@@ -4,6 +4,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -72,6 +73,7 @@ fun IosLargeTitleScaffold(
     trailing: @Composable () -> Unit = {},
     customLargeTitle: (@Composable () -> Unit)? = null,
     customCollapsedTitle: (@Composable () -> Unit)? = null,
+    floatingOverlay: (@Composable BoxScope.() -> Unit)? = null,
     content: LazyListScope.() -> Unit,
 ) {
     ScrollToTopOnRequest(listState, scrollToTopRequest)
@@ -139,6 +141,8 @@ fun IosLargeTitleScaffold(
             customTitle = customCollapsedTitle,
             modifier = Modifier.align(Alignment.TopStart),
         )
+
+        floatingOverlay?.invoke(this)
     }
 }
 

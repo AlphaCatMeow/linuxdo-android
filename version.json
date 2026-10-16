@@ -1,15 +1,19 @@
 {
-  "versionCode": 10,
-  "versionName": "1.2.0",
+  "versionCode": 12,
+  "versionName": "1.3.0",
   "forceUpdate": false,
   "minVersionCode": 1,
-  "title": "v1.2.0 版本更新",
+  "title": "v1.3.0 版本更新",
   "changelog": [
-    "1、整体 UI 重构，全面升级首页、分类、搜索、详情与个人中心交互体验",
-    "2、增加支持安全登录认证（原生人机验证与网页授权认证）",
-    "3、新增浏览帖子数与阅读时长同步功能（默认关闭，开启可能触发掉盾）",
-    "4、支持评论正倒序切换、Emoji 表情面板、分类等级下拉切换及多项细节修复"
+    "1、集成原生 DoH + ECH TLS 传输网络层，直连访问免代理不阻断",
+    "2、支持 DoH 节点多路测速、自动代次故障转移与 VPN 状态感知自动暂停",
+    "3、全新双态智能通知保活体系，支持 MessageBus 长轮询与 Doze 闹钟唤醒",
+    "4、新增回复正文摘要补全与桌面应用角标全系统兼容",
+    "5、支持自定义版块与 Web 端双向同步、分类自定义拖拽排序与话题免打扰",
+    "6、新增应用内 APK 流式下载与自动安装更新、草稿箱同步及多项性能优化"
   ],
-  "apkUrl": "https://github.com/xuemk/linuxdo-android/releases/download/v1.2.0/linuxdo-1.2.0-release.apk"
+  "apkUrl": "https://github.com/xuemk/linuxdo-android/releases/download/v1.3.0/linuxdo-1.3.0-release.apk",
+  "apkSha256": "dd7d893ac391cd6cfe30ab84a3dbd0470f9438e12817eb548451d494ca8cc61b"
 }
+
 

@@ -61,7 +61,12 @@ object Config {
     const val UPDATE_RELEASES_API_URL = "https://api.github.com/repos/xuemk/linuxdo-android/releases/latest"
     const val UPDATE_RELEASES_PAGE_URL = "https://github.com/xuemk/linuxdo-android/releases/latest"
 
-    /** 远端 version.json 尚未推送到仓库时的本地兜底清单（与根目录 version.json 保持一致，便于本地预演测试）。 */
+    /**
+     * 远端 version.json 尚未推送到仓库时的本地兜底清单（与根目录 version.json 保持一致，便于本地预演测试）。
+     *
+     * `apkSha256` 为可选字段：填了就在应用内下载完成后校验，不匹配拒绝安装；
+     * 留空或省略则跳过校验，不阻塞发版流程。
+     */
     const val FALLBACK_VERSION_MANIFEST_JSON = """
         {
           "versionCode": 10,
@@ -75,7 +80,8 @@ object Config {
             "3、新增浏览帖子数与阅读时长同步功能（默认关闭，开启可能触发掉盾）",
             "4、支持评论正倒序切换、Emoji 表情面板、分类等级下拉切换及多项细节修复"
           ],
-          "apkUrl": "https://github.com/xuemk/linuxdo-android/releases/download/v1.2.0/linuxdo-1.2.0-release.apk"
+          "apkUrl": "https://github.com/xuemk/linuxdo-android/releases/download/v1.2.0/linuxdo-1.2.0-release.apk",
+          "apkSha256": ""
         }
     """
 }

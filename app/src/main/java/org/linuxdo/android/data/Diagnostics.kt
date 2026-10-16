@@ -1,5 +1,6 @@
 package org.linuxdo.android.data
 
+import android.os.SystemClock
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -23,6 +24,7 @@ data class DiagnosticsStats(
 class Diagnostics(private val logFile: File) {
     private val timeFormat = SimpleDateFormat("MM-dd HH:mm:ss", Locale.US)
     private val lock = Any()
+    private val recentEvents = LinkedHashMap<String, Pair<String, Long>>()
 
     private val _lines = MutableStateFlow(loadTail())
     val lines: StateFlow<List<String>> = _lines.asStateFlow()
@@ -41,6 +43,32 @@ class Diagnostics(private val logFile: File) {
             formatted
         }
         _lines.update { (it + line).takeLast(MAX_MEMORY_LINES) }
+    }
+
+    fun readLatestLines(limit: Int = MAX_MEMORY_LINES): List<String> = synchronized(lock) {
+        val safeLimit = limit.coerceAtLeast(0)
+        if (safeLimit == 0) return@synchronized emptyList()
+        runCatching {
+            if (logFile.exists()) logFile.readLines(Charsets.UTF_8).takeLast(safeLimit) else emptyList()
+        }.getOrDefault(emptyList()).ifEmpty {
+            _lines.value.takeLast(safeLimit)
+        }
+    }
+
+    /** 相同后台状态每分钟最多记录一次，状态变化和手动检查立即记录。 */
+    fun logThrottled(key: String, message: String, force: Boolean = false) {
+        val shouldLog = synchronized(lock) {
+            val now = SystemClock.elapsedRealtime()
+            val previous = recentEvents[key]
+            if (!force && previous != null && previous.first == message && now - previous.second < 60_000L) {
+                false
+            } else {
+                recentEvents[key] = message to now
+                if (recentEvents.size > 128) recentEvents.remove(recentEvents.keys.first())
+                true
+            }
+        }
+        if (shouldLog) log(message)
     }
 
     fun recordStatus(pathName: String, status: Int, requestPath: String) {
@@ -67,7 +95,7 @@ class Diagnostics(private val logFile: File) {
     }
 
     private companion object {
-        const val MAX_MEMORY_LINES = 80
+        const val MAX_MEMORY_LINES = 300
         const val KEEP_FILE_LINES = 2_000
         const val MAX_FILE_BYTES = 512 * 1024L
     }

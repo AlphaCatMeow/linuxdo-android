@@ -114,7 +114,7 @@ class CookedParser(private val onUnknown: (String) -> Unit = {}) {
                 contentUrl(anchor.attr("href")) ?: contentUrl(anchor.attr("data-download-href"))
             }
         val originalUrl = lightboxHref ?: srcsetBest ?: rawSrc ?: return null
-        val displayUrl = srcsetBest ?: lightboxHref ?: rawSrc ?: originalUrl
+        val displayUrl = rawSrc ?: srcsetBest ?: lightboxHref ?: originalUrl
         return displayUrl to originalUrl
     }
 

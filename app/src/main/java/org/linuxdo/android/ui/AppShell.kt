@@ -1,6 +1,8 @@
 package org.linuxdo.android.ui
 
 import android.app.Dialog
+import android.content.Intent
+import android.net.Uri
 import android.graphics.Color as AndroidColor
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
@@ -52,6 +54,7 @@ import androidx.lifecycle.repeatOnLifecycle
 import kotlinx.coroutines.delay
 import org.linuxdo.android.net.BrowserSession
 import org.linuxdo.android.Config
+import org.linuxdo.android.data.NotificationPollInterval
 import org.linuxdo.android.data.compactCategoryGroups
 import org.linuxdo.android.ui.design.IosActivityIndicator
 import org.linuxdo.android.ui.design.IosMetrics
@@ -86,10 +89,21 @@ fun AppShell(viewModel: MainViewModel, browser: BrowserSession) {
     val themeMode by viewModel.themeMode.collectAsStateWithLifecycle()
     val lifecycle = LocalLifecycleOwner.current.lifecycle
 
-    LaunchedEffect(lifecycle, state.screen, state.latest.initialLoading) {
+    val notificationPollInterval by viewModel.notificationPollInterval.collectAsStateWithLifecycle()
+    val customRealtimeSeconds by viewModel.customRealtimeSeconds.collectAsStateWithLifecycle()
+
+    LaunchedEffect(lifecycle, state.screen, state.latest.initialLoading, notificationPollInterval, customRealtimeSeconds) {
         if (state.screen == Screen.List && !state.latest.initialLoading) lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
             viewModel.refreshUnread(force = true)
-            while (true) { delay(Config.UNREAD_POLL_INTERVAL_MS); viewModel.refreshUnread() }
+            val pollDelayMs = when (notificationPollInterval) {
+                NotificationPollInterval.REALTIME -> (customRealtimeSeconds * 1000L).coerceAtLeast(1000L)
+                NotificationPollInterval.OFF -> Config.UNREAD_POLL_INTERVAL_MS
+                else -> (notificationPollInterval.seconds * 1000L).coerceIn(5_000L, Config.UNREAD_POLL_INTERVAL_MS)
+            }
+            while (true) {
+                delay(pollDelayMs)
+                viewModel.refreshUnread()
+            }
         }
     }
 
@@ -178,6 +192,13 @@ fun AppShell(viewModel: MainViewModel, browser: BrowserSession) {
                 UpdateDialog(
                     currentVersion = updateState.currentVersion,
                     info = updateInfo,
+                    stage = updateState.apkStage,
+                    downloadedBytes = updateState.apkDownloadedBytes,
+                    totalBytes = updateState.apkTotalBytes,
+                    errorMessage = updateState.apkError,
+                    onStartDownload = viewModel::startApkUpdate,
+                    onRetryAfterPermission = viewModel::retryApkUpdateAfterPermission,
+                    onCancelDownload = viewModel::cancelApkUpdate,
                     onDismiss = viewModel::dismissUpdateDialog,
                 )
             }
@@ -301,10 +322,43 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
     val profile by viewModel.profile.collectAsStateWithLifecycle()
     val notificationFilter by viewModel.notificationFilter.collectAsStateWithLifecycle()
     val composer by viewModel.composer.collectAsStateWithLifecycle()
+    val topicCreator by viewModel.topicCreator.collectAsStateWithLifecycle()
+    val drafts by viewModel.drafts.collectAsStateWithLifecycle()
+    val topicSortOrder by viewModel.topicSortOrder.collectAsStateWithLifecycle()
+    val topicSortAscending by viewModel.topicSortAscending.collectAsStateWithLifecycle()
+    val floatingBallEnabled by viewModel.floatingBallEnabled.collectAsStateWithLifecycle()
+    val floatingBallActions by viewModel.floatingBallActions.collectAsStateWithLifecycle()
+    val floatingBallXRatio by viewModel.floatingBallXRatio.collectAsStateWithLifecycle()
+    val floatingBallYRatio by viewModel.floatingBallYRatio.collectAsStateWithLifecycle()
+    val floatingBallOnRight by viewModel.floatingBallOnRight.collectAsStateWithLifecycle()
     val treeView by viewModel.treeView.collectAsStateWithLifecycle()
     val syncReadProgress by viewModel.syncReadProgress.collectAsStateWithLifecycle()
     val themeMode by viewModel.themeMode.collectAsStateWithLifecycle()
     val updateState by viewModel.updateState.collectAsStateWithLifecycle()
+    val autoRefreshIncoming by viewModel.autoRefreshIncoming.collectAsStateWithLifecycle()
+    val autoRefreshInterval by viewModel.autoRefreshInterval.collectAsStateWithLifecycle()
+    val backgroundNotification by viewModel.backgroundNotification.collectAsStateWithLifecycle()
+    val notificationPollInterval by viewModel.notificationPollInterval.collectAsStateWithLifecycle()
+    val notificationScope by viewModel.notificationScope.collectAsStateWithLifecycle()
+    val customRealtimeSeconds by viewModel.customRealtimeSeconds.collectAsStateWithLifecycle()
+    val keepAliveService by viewModel.keepAliveService.collectAsStateWithLifecycle()
+    val pendingNotificationTarget by viewModel.pendingNotificationTarget.collectAsStateWithLifecycle()
+    // ── DoH 状态 ─────────────────────────────────────────────────────────────────
+    val dohEnabled by viewModel.dohEnabled.collectAsStateWithLifecycle()
+    val dohServers by viewModel.dohServers.collectAsStateWithLifecycle()
+    val selectedDohServerUrl by viewModel.selectedDohServerUrl.collectAsStateWithLifecycle()
+    val dohAutoFailover by viewModel.dohAutoFailover.collectAsStateWithLifecycle()
+    val dohLatencies by viewModel.dohLatencies.collectAsStateWithLifecycle()
+    val dohSummaries by viewModel.dohSummaries.collectAsStateWithLifecycle()
+    val isTestingAllDoh by viewModel.isTestingAllDoh.collectAsStateWithLifecycle()
+
+    LaunchedEffect(pendingNotificationTarget) {
+        val target = pendingNotificationTarget ?: return@LaunchedEffect
+        selected = MainTab.Latest
+        stacks.getValue(MainTab.Latest).push(Route.TopicDetail(target.topicId, "", target.postNumber))
+        viewModel.clearPendingNotificationTarget()
+    }
+
     val browsing = state.screen == Screen.List
     var detailOverlay by rememberSaveable { mutableStateOf(false) }
     val openNotifications = {
@@ -317,7 +371,7 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
         Box(Modifier.weight(1f)) {
             holder.SaveableStateProvider(selected.name) {
                 key(selected) {
-                    IosNavHost(stack, interactive = browsing) { route ->
+                    IosNavHost(stack, interactive = browsing && !topicCreator.open) { route ->
                         val active = browsing && stack.current == route
                         LaunchedEffect(route, active) {
                             if (active) when (route) {
@@ -328,6 +382,10 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                     viewModel.loadCategory(route.categoryId, route.slug)
                                 }
                                 is Route.UserTopics -> viewModel.loadUserTopics(route.username, route.isBookmark)
+                                Route.Drafts -> {
+                                    if (!categories.loaded && !categories.loading) viewModel.loadCategories()
+                                    viewModel.loadDrafts(refresh = true)
+                                }
                                 else -> Unit
                             }
                         }
@@ -344,6 +402,29 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                 currentFeed = state.homeFeed,
                                 onFeedSelect = viewModel::switchHomeFeed,
                                 hasUnread = state.unreadCount > 0,
+                                onApplyIncoming = { viewModel.applyIncomingTopics(state.homeFeed) },
+                                onSetNotificationLevel = { topic, level ->
+                                    viewModel.setTopicNotificationLevel(topic.id, level)
+                                },
+                                onCreateTopic = if (state.username != null) ({ viewModel.openTopicCreator(null) }) else null,
+                                onBookmarkTopic = { topic, onResult ->
+                                    viewModel.bookmarkTopicFromList(topic.id, onResult)
+                                },
+                                onFlagTopic = { topic, reasonId, message, onSuccess, onError ->
+                                    viewModel.submitTopicFlagFromList(topic.id, reasonId, message, onSuccess, onError)
+                                },
+                                sortOrder = topicSortOrder,
+                                sortAscending = topicSortAscending,
+                                onSortChange = { viewModel.setTopicSort(it) },
+                                floatingBallEnabled = floatingBallEnabled,
+                                floatingBallActions = floatingBallActions,
+                                floatingBallXRatio = floatingBallXRatio,
+                                floatingBallYRatio = floatingBallYRatio,
+                                floatingBallOnRight = floatingBallOnRight,
+                                onFloatingBallPositionChange = viewModel::updateFloatingBallPosition,
+                                onNavigateToDrafts = { stack.push(Route.Drafts) },
+                                onNavigateToSearch = { selected = MainTab.Search },
+                                onNavigateToCategories = { selected = MainTab.Categories },
                             )
 
                             is Route.TopicDetail -> {
@@ -385,6 +466,7 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                     onReloadFromStart = { viewModel.reloadFromStart(route.topicId) },
                                     onCreatedPostShown = { viewModel.clearCreatedPost(route.topicId) },
                                     onAttach = viewModel::attachToComposer,
+                                    onRemoveComposerAttachment = viewModel::removeComposerAttachment,
                                     topicId = route.topicId,
                                     onOpenTopic = { id, title, postNumber ->
                                         stack.push(Route.TopicDetail(id, title, postNumber))
@@ -394,13 +476,39 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                     onToggleOrder = { viewModel.toggleCommentOrder(route.topicId) },
                                     onPostsVisible = { viewModel.onPostsVisible(route.topicId, it) },
                                     onOverlayActive = { detailOverlay = it },
+                                    onSetNotificationLevel = { viewModel.setTopicNotificationLevel(route.topicId, it) },
+                                    signedIn = state.username != null,
+                                    onToggleBookmark = { viewModel.toggleBookmark(route.topicId, it) },
+                                    onOpenFlagDialog = { viewModel.openFlagDialog(route.topicId, it) },
+                                    onCloseFlagDialog = { viewModel.closeFlagDialog(route.topicId) },
+                                    onSubmitFlag = { postId, reasonId, message ->
+                                        viewModel.submitFlag(route.topicId, postId, reasonId, message)
+                                    },
                                 )
                             }
-                            Route.CategoryList -> CategoryListScreen(categories,
-                                onRetry = { viewModel.loadCategories(retry = true) },
-                                onOpen = { stack.push(Route.CategoryTopics(it.id, it.slug, it.name)) },
-                                scrollToTopRequest = scrollToTopRequest,
-                                trailing = { UnreadBell(state.unreadCount, openNotifications) })
+                            Route.CategoryList -> {
+                                val customSection by viewModel.customSection.collectAsStateWithLifecycle()
+                                val context = LocalContext.current
+                                CategoryListScreen(
+                                    state = categories,
+                                    customSection = customSection,
+                                    onRetry = { viewModel.loadCategories(retry = true) },
+                                    onOpen = { stack.push(Route.CategoryTopics(it.id, it.slug, it.name)) },
+                                    onOpenTopic = { topicId, title, postNumber ->
+                                        stack.push(Route.TopicDetail(topicId, title, postNumber))
+                                    },
+                                    onOpenWebUrl = { url ->
+                                        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                                        runCatching { context.startActivity(intent) }
+                                    },
+                                    onSaveCustomSection = viewModel::saveCustomSection,
+                                    onDeleteCustomSection = viewModel::deleteCustomSection,
+                                    scrollToTopRequest = scrollToTopRequest,
+                                    onSaveOrder = viewModel::saveCategoryOrder,
+                                    onResetOrder = viewModel::resetCategoryOrder,
+                                    trailing = { UnreadBell(state.unreadCount, openNotifications) },
+                                )
+                            }
 
                             is Route.CategoryTopics -> {
                                 val variants = remember(categories.items, route.categoryId) {
@@ -431,6 +539,28 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                             viewModel.loadCategory(target.id, target.slug)
                                         }
                                     },
+                                    onSetNotificationLevel = { topic, level ->
+                                        viewModel.setTopicNotificationLevel(topic.id, level)
+                                    },
+                                    onCreateTopic = if (state.username != null) ({ viewModel.openTopicCreator(route.categoryId.toInt()) }) else null,
+                                    onBookmarkTopic = { topic, onResult ->
+                                        viewModel.bookmarkTopicFromList(topic.id, onResult)
+                                    },
+                                    onFlagTopic = { topic, reasonId, message, onSuccess, onError ->
+                                        viewModel.submitTopicFlagFromList(topic.id, reasonId, message, onSuccess, onError)
+                                    },
+                                    sortOrder = topicSortOrder,
+                                    sortAscending = topicSortAscending,
+                                    onSortChange = { viewModel.setTopicSort(it, currentCategoryId = route.categoryId, currentCategorySlug = route.slug) },
+                                    floatingBallEnabled = floatingBallEnabled,
+                                    floatingBallActions = floatingBallActions,
+                                    floatingBallXRatio = floatingBallXRatio,
+                                    floatingBallYRatio = floatingBallYRatio,
+                                    floatingBallOnRight = floatingBallOnRight,
+                                    onFloatingBallPositionChange = viewModel::updateFloatingBallPosition,
+                                    onNavigateToDrafts = { stack.push(Route.Drafts) },
+                                    onNavigateToSearch = { selected = MainTab.Search },
+                                    onNavigateToCategories = { selected = MainTab.Categories },
                                 )
                             }
 
@@ -445,6 +575,8 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                 onOpenUserTopics = { username, title, isBookmark ->
                                     stack.push(Route.UserTopics(username, title, isBookmark))
                                 },
+                                draftCount = drafts.items.size.toString(),
+                                onOpenDrafts = { stack.push(Route.Drafts) },
                                 onDiagnostics = { stack.push(Route.Diagnostics) },
                                 onSettings = { stack.push(Route.Settings) },
                                 onLogout = viewModel::logout,
@@ -455,6 +587,24 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                 unreadFilters = state.unreadFilters,
                                 scrollToTopRequest = scrollToTopRequest,
                                 trailing = { UnreadBell(state.unreadCount, openNotifications) })
+
+                            Route.Drafts -> DraftsScreen(
+                                state = drafts,
+                                categories = categories.items,
+                                onBack = { stack.pop() },
+                                onRefresh = { viewModel.loadDrafts(refresh = true) },
+                                onEditDraft = { draft ->
+                                    if (draft.topicId != null && draft.topicId > 0L) {
+                                        stack.pop()
+                                        stack.push(Route.TopicDetail(draft.topicId, draft.title, draft.replyToPostNumber))
+                                        viewModel.openReplyWithDraft(draft)
+                                    } else {
+                                        viewModel.openDraftInCreator(draft)
+                                    }
+                                },
+                                onDeleteDraft = viewModel::deleteDraft,
+                                trailing = { UnreadBell(state.unreadCount, openNotifications) },
+                            )
 
                             is Route.UserTopics -> {
                                 val key = "${if (route.isBookmark) "bookmark" else "created"}:${route.username}"
@@ -467,22 +617,81 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                     onBack = { stack.pop() },
                                     active = active,
                                     trailing = { UnreadBell(state.unreadCount, openNotifications) },
+                                    onSetNotificationLevel = { topic, level ->
+                                        viewModel.setTopicNotificationLevel(topic.id, level)
+                                    },
+                                    onBookmarkTopic = { topic, onResult ->
+                                        viewModel.bookmarkTopicFromList(topic.id, onResult)
+                                    },
+                                    onFlagTopic = { topic, reasonId, message, onSuccess, onError ->
+                                        viewModel.submitTopicFlagFromList(topic.id, reasonId, message, onSuccess, onError)
+                                    },
+                                    sortOrder = topicSortOrder,
+                                    sortAscending = topicSortAscending,
+                                    onSortChange = { viewModel.setTopicSort(it) },
+                                    floatingBallEnabled = floatingBallEnabled,
+                                    floatingBallActions = floatingBallActions,
+                                    floatingBallXRatio = floatingBallXRatio,
+                                    floatingBallYRatio = floatingBallYRatio,
+                                    floatingBallOnRight = floatingBallOnRight,
+                                    onFloatingBallPositionChange = viewModel::updateFloatingBallPosition,
+                                    onNavigateToDrafts = { stack.push(Route.Drafts) },
+                                    onNavigateToSearch = { selected = MainTab.Search },
+                                    onNavigateToCategories = { selected = MainTab.Categories },
                                 )
                             }
 
 
-                            Route.Settings -> SettingsScreen(
+                            Route.Settings, is Route.SettingsDetail -> SettingsScreen(
+                                page = (route as? Route.SettingsDetail)?.page,
+                                onOpenPage = { stack.push(Route.SettingsDetail(it)) },
                                 treeView = treeView,
                                 onTreeView = viewModel::setTreeView,
                                 onBack = { stack.pop() },
                                 themeMode = themeMode,
                                 onThemeMode = viewModel::setThemeMode,
+                                floatingBallEnabled = floatingBallEnabled,
+                                onFloatingBallEnabled = viewModel::setFloatingBallEnabled,
+                                floatingBallActions = floatingBallActions,
+                                onFloatingBallActions = viewModel::setFloatingBallActions,
                                 updateState = updateState,
                                 onCheckUpdate = { viewModel.checkForUpdates(manual = true) },
                                 syncReadProgress = syncReadProgress,
                                 onSyncReadProgress = viewModel::setSyncReadProgress,
                                 onDiagnostics = { stack.push(Route.Diagnostics) },
                                 onLogout = viewModel::logout,
+                                autoRefreshIncoming = autoRefreshIncoming,
+                                onAutoRefreshIncoming = viewModel::setAutoRefreshIncoming,
+                                autoRefreshInterval = autoRefreshInterval,
+                                onAutoRefreshInterval = viewModel::setAutoRefreshInterval,
+                                backgroundNotification = backgroundNotification,
+                                onBackgroundNotification = viewModel::setBackgroundNotification,
+                                notificationPollInterval = notificationPollInterval,
+                                onNotificationPollInterval = viewModel::setNotificationPollInterval,
+                                customRealtimeSeconds = customRealtimeSeconds,
+                                onCustomRealtimeSeconds = viewModel::setCustomRealtimeSeconds,
+                                notificationScope = notificationScope,
+                                onNotificationScope = viewModel::setNotificationScope,
+                                keepAliveService = keepAliveService,
+                                onKeepAliveService = viewModel::setKeepAliveService,
+                                onTestNotification = viewModel::testPushNotification,
+                                // ── DoH ──────────────────────────────────────────
+                                dohEnabled = dohEnabled,
+                                onDohEnabled = viewModel::setDohEnabled,
+                                dohServers = dohServers,
+                                selectedDohServerUrl = selectedDohServerUrl,
+                                onDohServerSelected = viewModel::setDohServerSelected,
+                                dohAutoFailover = dohAutoFailover,
+                                onDohAutoFailover = viewModel::setDohAutoFailover,
+                                dohLatencies = dohLatencies,
+                                dohSummaries = dohSummaries,
+                                isTestingAllDoh = isTestingAllDoh,
+                                onTestDohServer = viewModel::testDohServer,
+                                onTestAllDohServers = viewModel::testAllDohServers,
+                                onAddCustomDohServer = viewModel::addCustomDohServer,
+                                onUpdateDohServer = viewModel::updateDohServer,
+                                onDeleteDohServer = viewModel::deleteDohServer,
+                                onResetDohServers = viewModel::resetDohServersToDefault,
                             )
 
                             Route.Notifications -> ProfileScreen(state.username, profile, viewModel::loadProfile,
@@ -505,9 +714,31 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                     }
                 }
             }
+
+            if (topicCreator.open) {
+                TopicCreatorSheet(
+                    state = topicCreator,
+                    categories = categories.items,
+                    onTitleChange = viewModel::updateTopicCreatorTitle,
+                    onRawChange = viewModel::updateTopicCreatorRaw,
+                    onCategoryChange = viewModel::updateTopicCreatorCategory,
+                    onTagsChange = viewModel::updateTopicCreatorTags,
+                    onSearchTags = viewModel::searchTopicCreatorTags,
+                    onAttach = viewModel::attachToTopicCreator,
+                    onRemoveAttachment = viewModel::removeTopicCreatorAttachment,
+                    onSaveDraft = viewModel::saveTopicDraft,
+                    onSubmit = {
+                        viewModel.submitTopicCreator { topicId, title, postNumber ->
+                            stack.push(Route.TopicDetail(topicId, title, postNumber))
+                        }
+                    },
+                    onClose = viewModel::closeTopicCreator,
+                    onClearNotice = viewModel::clearTopicCreatorNotice,
+                )
+            }
         }
         val isKeyboardOpen = WindowInsets.ime.getBottom(LocalDensity.current) > 0
-        if (!composer.open && !detailOverlay && !isKeyboardOpen) {
+        if (!composer.open && !topicCreator.open && !detailOverlay && !isKeyboardOpen) {
             TabBar(selected, homeFeedLabel = state.homeFeed.label) { tab ->
                 if (browsing) {
                     if (tab == selected) {

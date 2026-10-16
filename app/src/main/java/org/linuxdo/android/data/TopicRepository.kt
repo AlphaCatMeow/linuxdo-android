@@ -21,6 +21,7 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonElement
 import java.net.URI
 import kotlinx.serialization.json.booleanOrNull
@@ -37,6 +38,18 @@ import org.linuxdo.android.net.SecondFactorRequiredException
 import org.linuxdo.android.net.Transport
 import org.linuxdo.android.net.TransportResult
 import org.linuxdo.android.ui.html.CookedParser
+
+data class DiscourseTagInfo(
+    val name: String,
+    val text: String = name,
+    val count: Int = 0,
+)
+
+data class DiscourseTagSearchResult(
+    val results: List<DiscourseTagInfo> = emptyList(),
+    val requiredTagName: String? = null,
+    val requiredTagMinCount: Int = 1,
+)
 
 @Serializable
 private data class TopicListPayload(
@@ -80,6 +93,7 @@ class TopicRepository(
     private val transportProvider: () -> Transport,
     private val diagnostics: Diagnostics,
     private val reading: ReadingStore? = null,
+    private val sessionStore: SessionStore? = null,
     private val fallbackTransportProvider: (() -> Transport)? = null,
 ) {
     private val json = Json { ignoreUnknownKeys = true; coerceInputValues = true }
@@ -122,21 +136,58 @@ class TopicRepository(
         return result.toMap().also { emojiCache = it }
     }
 
-    suspend fun fetchFeed(feed: HomeFeedType, page: Int, awaitCategories: Boolean = true): TopicPage {
+    suspend fun fetchFeed(
+        feed: HomeFeedType,
+        page: Int,
+        awaitCategories: Boolean = true,
+        present: Boolean = true,
+        order: String? = null,
+        ascending: Boolean? = null,
+    ): TopicPage {
         val excludeRead = feed == HomeFeedType.Unread
-        val path = "${feed.apiPath}?page=$page"
-        return toPage(
-            response = json.decodeFromString(request(path, burst = page == 0)),
+        val query = buildList {
+            add("page=$page")
+            if (!order.isNullOrBlank()) add("order=$order")
+            if (ascending != null) add("ascending=$ascending")
+        }.joinToString("&")
+        val path = "${feed.apiPath}?$query"
+        val result = toPage(
+            response = json.decodeFromString(request(path, burst = page == 0, present = present)),
             awaitCategories = awaitCategories,
             excludeReadUnread = excludeRead,
         )
+        return if (feed == HomeFeedType.Latest) result.copy(
+            items = result.items.filterNot { it.notificationLevel == TopicNotificationLevel.Muted },
+        ) else result
     }
 
-    suspend fun fetchLatest(page: Int, awaitCategories: Boolean = true): TopicPage =
-        fetchFeed(HomeFeedType.Latest, page, awaitCategories)
+    suspend fun fetchLatest(page: Int, awaitCategories: Boolean = true, present: Boolean = true): TopicPage =
+        fetchFeed(HomeFeedType.Latest, page, awaitCategories, present = present)
 
-    suspend fun fetchCategoryTopics(slug: String, categoryId: Int, page: Int): TopicPage =
-        toPage(json.decodeFromString(request("/c/${encode(slug.ifBlank { "category" })}/$categoryId.json?page=$page", burst = page == 0)), awaitCategories = false)
+    suspend fun fetchCategoryTopics(
+        slug: String,
+        categoryId: Int,
+        page: Int,
+        present: Boolean = true,
+        order: String? = null,
+        ascending: Boolean? = null,
+    ): TopicPage {
+        val query = buildList {
+            add("page=$page")
+            if (!order.isNullOrBlank()) add("order=$order")
+            if (ascending != null) add("ascending=$ascending")
+        }.joinToString("&")
+        return toPage(
+            json.decodeFromString(
+                request(
+                    "/c/${encode(slug.ifBlank { "category" })}/$categoryId.json?$query",
+                    burst = page == 0,
+                    present = present,
+                )
+            ),
+            awaitCategories = false,
+        )
+    }
 
     suspend fun fetchUserCreatedTopics(username: String, page: Int): TopicPage =
         toPage(json.decodeFromString(request("/topics/created-by/${encode(username)}.json?page=$page", burst = page == 0)), awaitCategories = false)
@@ -180,6 +231,9 @@ class TopicRepository(
                     ?: (elem as? JsonObject)?.text("name")?.takeIf { it.isNotBlank() }
             }
 
+            val cachedLevel = sessionStore?.getTopicNotificationLevel(topicId)
+            val notificationLevel = cachedLevel?.let { TopicNotificationLevel.fromCode(it) }
+
             TopicListItem(
                 topic = Topic(
                     id = topicId,
@@ -198,6 +252,7 @@ class TopicRepository(
                 avatarUrl = avatarUrlOf(avatar),
                 category = categoryId?.let { known[it] },
                 trustLevel = null,
+                notificationLevel = notificationLevel,
             )
         }.distinctBy { it.topic.id }
 
@@ -215,7 +270,9 @@ class TopicRepository(
     ): TopicDetail {
         val position = postNumber?.takeIf { it > 1 }?.let { "/$it" }.orEmpty()
         val body = request("/t/$id$position.json?track_visit=$trackVisit", burst = burst, present = true)
-        return json.decodeFromString<TopicDetail>(body).also { CookedParser.prewarm(it.postStream.posts) }
+        return json.decodeFromString<TopicDetail>(body).also {
+            CookedParser.prewarm(it.postStream.posts)
+        }
     }
 
     /**
@@ -302,10 +359,17 @@ class TopicRepository(
         return false
     }
 
+    private suspend fun obtainCsrf(forceRefresh: Boolean = false): String {
+        if (!forceRefresh) {
+            cachedCsrfToken?.takeIf { it.isNotBlank() }?.let { return it }
+        }
+        val token = objectRequest("/session/csrf.json").text("csrf").also { require(it.isNotBlank()) }
+        cachedCsrfToken = token
+        return token
+    }
+
     private suspend fun cachedCsrf(): String? {
-        cachedCsrfToken?.let { return it }
-        return runCatching { objectRequest("/session/csrf.json").text("csrf") }
-            .getOrNull()?.takeIf { it.isNotBlank() }?.also { cachedCsrfToken = it }
+        return runCatching { obtainCsrf() }.getOrNull()
     }
 
     suspend fun fetchPosts(topicId: Long, ids: List<Long>): List<Post> {
@@ -347,9 +411,14 @@ class TopicRepository(
 
     /**
      * 发表回复。replyToPostNumber 为 null 时回复整个话题,否则回复指定楼层。
-     * POST /posts.json 返回的是裸 post 对象。
+     * POST /posts.json 返回的是裸 post 对象或 enqueued 状态。
      */
-    suspend fun createPost(topicId: Long, raw: String, replyToPostNumber: Int? = null): Post {
+    suspend fun createPost(
+        topicId: Long,
+        raw: String,
+        replyToPostNumber: Int? = null,
+        draftKey: String? = null,
+    ): PostResult {
         val trimmed = raw.trim()
         require(trimmed.isNotBlank()) { "回复内容不能为空" }
         val fields = mutableMapOf<String, JsonElement>(
@@ -357,7 +426,260 @@ class TopicRepository(
             "topic_id" to JsonPrimitive(topicId),
         )
         replyToPostNumber?.takeIf { it > 0 }?.let { fields["reply_to_post_number"] = JsonPrimitive(it) }
-        return json.decodeFromString(mutate("/posts.json", "POST", JsonObject(fields).toString()))
+        draftKey?.takeIf { it.isNotBlank() }?.let { fields["draft_key"] = JsonPrimitive(it) }
+        val responseText = mutate("/posts.json", "POST", JsonObject(fields).toString())
+        return PostResult.decode(json.parseToJsonElement(responseText), json)
+    }
+
+    /**
+     * 创建新话题。
+     * POST /posts.json
+     */
+    suspend fun createTopic(
+        title: String,
+        raw: String,
+        categoryId: Int? = null,
+        tags: List<String> = emptyList(),
+        draftKey: String? = "new_topic",
+    ): PostResult {
+        val trimmedTitle = title.trim()
+        val trimmedRaw = raw.trim()
+        require(trimmedTitle.isNotBlank()) { "请输入话题标题" }
+        require(trimmedRaw.isNotBlank()) { "请输入话题内容" }
+        val fields = mutableMapOf<String, JsonElement>(
+            "title" to JsonPrimitive(trimmedTitle),
+            "raw" to JsonPrimitive(trimmedRaw),
+            "archetype" to JsonPrimitive("regular"),
+        )
+        categoryId?.takeIf { it > 0 }?.let { fields["category"] = JsonPrimitive(it) }
+        val cleanTags = tags.map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+        if (cleanTags.isNotEmpty()) {
+            fields["tags"] = JsonArray(cleanTags.map { JsonPrimitive(it) })
+        }
+        draftKey?.takeIf { it.isNotBlank() }?.let { fields["draft_key"] = JsonPrimitive(it) }
+        val responseText = mutate("/posts.json", "POST", JsonObject(fields).toString())
+        return PostResult.decode(json.parseToJsonElement(responseText), json)
+    }
+
+    /**
+     * 照搬 FluxDO (DiscourseService.searchTags) 搜索与过滤分类标签。
+     * GET /tags/filter/search?q={query}&limit=8&categoryId={categoryId}&filterForInput=true
+     */
+    suspend fun searchTags(
+        categoryId: Int?,
+        query: String = "",
+        selectedTags: List<String> = emptyList(),
+        limit: Int = 8,
+        filterForInput: Boolean = true,
+    ): DiscourseTagSearchResult {
+        val params = mutableListOf<String>()
+        params.add("q=${encode(query)}")
+        if (filterForInput) {
+            params.add("filterForInput=true")
+        }
+        params.add("limit=$limit")
+        if (categoryId != null && categoryId > 0) {
+            params.add("categoryId=$categoryId")
+        }
+        for (tag in selectedTags) {
+            if (tag.isNotBlank()) {
+                params.add("selected_tags[]=${encode(tag)}")
+            }
+        }
+        val path = "/tags/filter/search?${params.joinToString("&")}"
+        return runCatching {
+            val responseText = request(path)
+            val root = json.parseToJsonElement(responseText) as? JsonObject
+            val resultsArray = root?.get("results") as? JsonArray
+            val results = resultsArray.orEmpty().mapNotNull { elem ->
+                (elem as? JsonObject)?.let { obj ->
+                    val name = obj.text("name")
+                    val text = obj.text("text").ifBlank { name }
+                    val count = obj.number("count")?.toInt() ?: 0
+                    if (name.isNotBlank()) DiscourseTagInfo(name = name, text = text, count = count) else null
+                }
+            }
+            val reqObj = root?.get("required_tag_group") as? JsonObject
+            val reqName = reqObj?.text("name")
+            val reqMin = reqObj?.number("min_count")?.toInt() ?: 1
+
+            if (results.isNotEmpty()) {
+                DiscourseTagSearchResult(results = results, requiredTagName = reqName, requiredTagMinCount = reqMin)
+            } else {
+                val cat = if (categoryId != null) categoryCache?.get(categoryId) else null
+                val fallbackList = fixedTagsForCategory(cat)
+                    .filter { query.isBlank() || it.contains(query, ignoreCase = true) }
+                    .map { DiscourseTagInfo(name = it, text = it, count = 0) }
+                DiscourseTagSearchResult(results = fallbackList)
+            }
+        }.getOrElse {
+            val cat = if (categoryId != null) categoryCache?.get(categoryId) else null
+            val fallbackList = fixedTagsForCategory(cat)
+                .filter { query.isBlank() || it.contains(query, ignoreCase = true) }
+                .map { DiscourseTagInfo(name = it, text = it, count = 0) }
+            DiscourseTagSearchResult(results = fallbackList)
+        }
+    }
+
+    suspend fun fetchCategoryTags(categoryId: Int?, query: String = "", limit: Int = 8): List<String> {
+        return searchTags(categoryId, query, limit = limit).results.map { it.name }
+    }
+
+    /**
+     * 拉取当前用户的草稿列表（与 PC 端 `/my/activity/drafts` 打通）。
+     * GET /drafts.json
+     */
+    suspend fun fetchDrafts(burst: Boolean = false): List<DraftItem> {
+        val root = objectRequest("/drafts.json?offset=0&limit=50", burst = burst)
+        val draftObjs = root.objects("drafts")
+        val known = categoryCache ?: categories()
+        return draftObjs.mapNotNull { obj ->
+            val draftKey = obj.text("draft_key").takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            val sequence = obj.text("sequence").toLongOrNull() ?: 0L
+            val dataRaw = obj.text("data")
+            val dataObj = runCatching {
+                if (dataRaw.isNotBlank()) json.parseToJsonElement(dataRaw).jsonObject else null
+            }.getOrNull()
+
+            val raw = dataObj?.text("reply").orEmpty()
+            val topicId = obj.number("topic_id") ?: dataObj?.number("topic_id")
+            val action = dataObj?.text("action")?.takeIf { it.isNotBlank() }
+                ?: if (topicId != null && topicId > 0L) "reply" else "createTopic"
+            val title = dataObj?.text("title")?.takeIf { it.isNotBlank() }
+                ?: Jsoup.parseBodyFragment(obj.text("title")).text()
+            val categoryId = dataObj?.text("categoryId")?.toIntOrNull()
+                ?: dataObj?.text("category_id")?.toIntOrNull()
+                ?: obj.text("category_id").toIntOrNull()
+            val tags = (dataObj?.get("tags") as? JsonArray).orEmpty().mapNotNull { elem ->
+                (elem as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() }
+                    ?: (elem as? JsonObject)?.text("name")?.takeIf { it.isNotBlank() }
+                    ?: (elem as? JsonObject)?.text("id")?.takeIf { it.isNotBlank() }
+            }
+            val replyToPostNumber = dataObj?.text("postId")?.toIntOrNull()?.takeIf { it > 0 }
+                ?: obj.text("post_number").toIntOrNull()?.takeIf { it > 0 }
+            val postId = dataObj?.number("postId")
+            val excerptSource = obj.text("excerpt").ifBlank { raw }
+            val excerpt = Jsoup.parseBodyFragment(excerptSource).text().trim()
+            val createdAt = obj.text("created_at").ifBlank { null }
+            val username = obj.text("username").ifBlank { obj.text("name") }.ifBlank { null }
+            val avatarUrl = avatarUrlOf(obj.text("avatar_template"))
+            val closed = (obj["closed"] as? JsonPrimitive)?.booleanOrNull == true
+            val archetype = obj.text("archetype").ifBlank { dataObj?.text("archetypeId").orEmpty() }.ifBlank { "regular" }
+
+            DraftItem(
+                draftKey = draftKey,
+                sequence = sequence,
+                title = title,
+                raw = raw,
+                excerpt = excerpt,
+                categoryId = categoryId,
+                category = categoryId?.let { known[it] },
+                tags = tags,
+                action = action,
+                topicId = topicId,
+                replyToPostNumber = replyToPostNumber,
+                postId = postId,
+                createdAt = createdAt,
+                username = username,
+                avatarUrl = avatarUrl,
+                closed = closed,
+                archetype = archetype,
+            )
+        }
+    }
+
+    /**
+     * 保存草稿至 Discourse 服务端（POST /drafts.json）。
+     * 若遇到 409 Conflict（跨端编辑导致 sequence 过期），自动拉取最新 sequence 重试一次。
+     */
+    suspend fun saveDraft(
+        draftKey: String = "new_topic",
+        sequence: Long = 0L,
+        title: String = "",
+        raw: String,
+        categoryId: Int? = null,
+        tags: List<String> = emptyList(),
+        action: String = "createTopic",
+        topicId: Long? = null,
+        replyToPostNumber: Int? = null,
+    ): Long {
+        val cleanTags = tags.map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+        val dataMap = mutableMapOf<String, JsonElement>(
+            "reply" to JsonPrimitive(raw),
+            "action" to JsonPrimitive(action),
+            "title" to JsonPrimitive(title.trim()),
+            "categoryId" to (categoryId?.takeIf { it > 0 }?.let { JsonPrimitive(it) } ?: JsonNull),
+            "tags" to JsonArray(cleanTags.map { JsonPrimitive(it) }),
+            "archetypeId" to JsonPrimitive("regular"),
+            "metaData" to JsonNull,
+            "composerTime" to JsonPrimitive(1500),
+            "typingTime" to JsonPrimitive(1200),
+        )
+        if (topicId != null && topicId > 0L) {
+            dataMap["topic_id"] = JsonPrimitive(topicId)
+        }
+        if (replyToPostNumber != null && replyToPostNumber > 0) {
+            dataMap["postId"] = JsonPrimitive(replyToPostNumber)
+        }
+        val dataString = JsonObject(dataMap).toString()
+
+        suspend fun doSave(seq: Long): Long {
+            val payload = JsonObject(
+                mapOf(
+                    "draft_key" to JsonPrimitive(draftKey),
+                    "sequence" to JsonPrimitive(seq),
+                    "data" to JsonPrimitive(dataString),
+                ),
+            ).toString()
+            val responseText = mutate("/drafts.json", "POST", payload)
+            val root = runCatching { json.parseToJsonElement(responseText).jsonObject }.getOrNull()
+            return root?.text("draft_sequence")?.toLongOrNull() ?: (seq + 1L)
+        }
+
+        return try {
+            doSave(sequence)
+        } catch (e: HttpStatusException) {
+            if (e.status == 409) {
+                val latestSeq = runCatching {
+                    fetchDrafts(burst = true).firstOrNull { it.draftKey == draftKey }?.sequence
+                }.getOrNull() ?: 0L
+                doSave(latestSeq)
+            } else {
+                throw e
+            }
+        }
+    }
+
+    /**
+     * 删除服务端草稿（DELETE /drafts/{draft_key}.json）。
+     */
+    suspend fun deleteDraft(draftKey: String, sequence: Long = 0L) {
+        require(draftKey.isNotBlank()) { "草稿标识不能为空" }
+        suspend fun doDelete(seq: Long) {
+            val payload = JsonObject(
+                mapOf(
+                    "draft_key" to JsonPrimitive(draftKey),
+                    "sequence" to JsonPrimitive(seq),
+                ),
+            ).toString()
+            mutate(
+                "/drafts/${encode(draftKey)}.json?draft_key=${encode(draftKey)}&sequence=$seq",
+                "DELETE",
+                payload,
+            )
+        }
+        try {
+            doDelete(sequence)
+        } catch (e: HttpStatusException) {
+            if (e.status == 409) {
+                val latestSeq = runCatching {
+                    fetchDrafts(burst = true).firstOrNull { it.draftKey == draftKey }?.sequence
+                }.getOrNull() ?: return
+                doDelete(latestSeq)
+            } else {
+                throw e
+            }
+        }
     }
 
     /** 编辑楼层。PUT /posts/{id}.json 返回的 post 被包在 `{"post":{...}}` 里,要解一层。 */
@@ -375,6 +697,84 @@ class TopicRepository(
     suspend fun deletePost(postId: Long) { mutate("/posts/$postId.json", "DELETE") }
 
     /**
+     * 解析指定话题的 1 楼 Post ID（供列表页长按直接添加书签或举报使用）。
+     */
+    suspend fun fetchTopicFirstPostId(topicId: Long): Long {
+        require(topicId > 0L) { "话题不存在" }
+        val detail = fetchTopic(topicId, burst = true, trackVisit = false)
+        return detail.postStream.posts.firstOrNull { it.postNumber == 1 }?.id
+            ?: detail.postStream.posts.firstOrNull()?.id
+            ?: detail.postStream.stream.firstOrNull()
+            ?: error("无法获取该话题的首楼信息")
+    }
+
+    /**
+     * 为楼层添加书签。
+     * POST /bookmarks.json
+     * 返回新建的书签 ID。
+     */
+    suspend fun bookmarkPost(postId: Long): Long {
+        require(postId > 0L) { "楼层不存在" }
+        val body = JsonObject(mapOf(
+            "bookmarkable_id" to JsonPrimitive(postId),
+            "bookmarkable_type" to JsonPrimitive("Post"),
+        )).toString()
+        val response = json.parseToJsonElement(mutate("/bookmarks.json", "POST", body)).jsonObject
+        return (response["id"] as? JsonPrimitive)?.longOrNull?.takeIf { it > 0L }
+            ?: error("书签结果无法确认，请刷新楼层后检查收藏状态")
+    }
+
+    /**
+     * 从话题列表直接为话题添加书签。
+     */
+    suspend fun bookmarkTopic(topicId: Long, knownFirstPostId: Long? = null): Long {
+        val firstPostId = knownFirstPostId?.takeIf { it > 0L } ?: fetchTopicFirstPostId(topicId)
+        return bookmarkPost(firstPostId)
+    }
+
+    /**
+     * 删除书签。
+     * DELETE /bookmarks/{id}.json
+     */
+    suspend fun unbookmarkPost(bookmarkId: Long) {
+        require(bookmarkId > 0L) { "缺少书签信息，请刷新楼层后再取消收藏" }
+        mutate("/bookmarks/$bookmarkId.json", "DELETE")
+    }
+
+    /**
+     * 举报楼层。
+     * POST /post_actions.json
+     */
+    suspend fun flagPost(postId: Long, reasonId: Int, message: String? = null) {
+        require(postId > 0L) { "楼层不存在" }
+        val reason = PostFlagReason.entries.firstOrNull { it.id == reasonId }
+        require(reason != null) { "请选择有效的举报原因" }
+        require(!reason.requiresMessage || !message.isNullOrBlank()) { "请补充需要版主处理的问题" }
+        val fields = mutableMapOf<String, JsonElement>(
+            "id" to JsonPrimitive(postId),
+            "post_action_type_id" to JsonPrimitive(reasonId),
+            "flag_topic" to JsonPrimitive(false),
+        )
+        if (reason.requiresMessage && !message.isNullOrBlank()) {
+            fields["message"] = JsonPrimitive(message.trim())
+        }
+        mutate("/post_actions.json", "POST", JsonObject(fields).toString())
+    }
+
+    /**
+     * 设置话题通知级别 (0: 免打扰, 1: 常规, 2: 跟踪, 3: 关注)。
+     * POST /t/{topic_id}/notifications.json
+     */
+    suspend fun setTopicNotificationLevel(topicId: Long, level: Int) {
+        require(topicId > 0L && level in 0..3) { "无效的话题通知级别" }
+        val body = JsonObject(mapOf(
+            "notification_level" to JsonPrimitive(level),
+        )).toString()
+        mutate("/t/$topicId/notifications.json", "POST", body)
+        sessionStore?.saveTopicNotificationLevel(topicId, level)
+    }
+
+    /**
      * 上传一个文件,返回可直接写进正文 raw 的结果。
      *
      * Discourse 的发帖接口只收纯文本,附件要分两步:先 POST /uploads.json 拿 short_url
@@ -384,10 +784,11 @@ class TopicRepository(
     suspend fun uploadFile(fileName: String, mimeType: String, bytes: ByteArray): UploadedFile {
         UploadLimits.rejectReason(fileName, bytes.size.toLong())?.let { throw LoginRejectedException(it) }
         var revalidated = false
+        var csrfRefreshed = false
         while (true) {
-            val csrf = objectRequest("/session/csrf.json").text("csrf").also { require(it.isNotBlank()) }
+            val csrf = obtainCsrf(forceRefresh = csrfRefreshed)
             val result = gate.withLock {
-                throttle()
+                throttle(burst = true)
                 val transport = transportProvider()
                 try {
                     transport.upload(
@@ -400,6 +801,8 @@ class TopicRepository(
             if (result.challenged) {
                 if (!revalidated && transportProvider().revalidate("/uploads.json")) {
                     revalidated = true
+                    csrfRefreshed = true
+                    cachedCsrfToken = null
                     continue
                 }
                 throw NeedsInteractiveVerification("上传需要重新验证")
@@ -408,6 +811,13 @@ class TopicRepository(
                 // 路径 B 的"不支持上传"也走这里,它把原因放在 body 里。
                 throw result.body.takeIf { it.isNotBlank() && !it.startsWith("java.") }
                     ?.let { LoginRejectedException(it) } ?: NetworkTimeoutException()
+            }
+            if ((result.status == 403 || result.status == 422) && !csrfRefreshed &&
+                (result.body.contains("BAD CSRF", ignoreCase = true) || result.body.contains("csrf", ignoreCase = true))
+            ) {
+                cachedCsrfToken = null
+                csrfRefreshed = true
+                continue
             }
             val payload = runCatching { json.parseToJsonElement(result.body).jsonObject }.getOrNull()
             if (result.status !in 200..299) {
@@ -434,23 +844,17 @@ class TopicRepository(
     suspend fun fetchPostRaw(postId: Long): String =
         objectRequest("/posts/$postId.json").text("raw")
 
-    suspend fun fetchUnreadSummary(): UnreadSummary {
-        val seen = mutableSetOf<Long>()
-        val limit = 60
-        var offset = 0
-        var count = 0
+    suspend fun fetchUnreadSummary(scope: NotificationScope): UnreadSummary {
+        // Discourse 的 /notifications.json 不支持 filter=unread 参数；不带 recent=true 时会返回账号
+        // 自注册以来的全量历史分页，导致 while 循环把多年前未逐条点击的陈年记录累加为 99+ 且耗时十余秒。
+        // 统一使用 recent=true&limit=50&silent=true，与网页端顶栏铃铛及后台 NotificationWorker 严格同源。
+        val page = json.decodeFromString<UnreadNotificationPage>(
+            request("/notifications.json?recent=true&limit=50&silent=true", present = false),
+        )
+        val fresh = page.notifications.distinctBy { it.id }
+        val count = fresh.count { it.countsAsUnread(scope) }
         val unreadByType = mutableMapOf<Int, Int>()
-        while (true) {
-            val page = json.decodeFromString<UnreadNotificationPage>(
-                request("/notifications.json?filter=unread&limit=$limit&offset=$offset", present = false),
-            )
-            val fresh = page.notifications.filter { seen.add(it.id) }
-            check(page.notifications.isEmpty() || fresh.isNotEmpty()) { "未读通知分页未推进" }
-            count += fresh.count { it.countsAsUnread }
-            fresh.filter { !it.read }.forEach { unreadByType[it.type] = (unreadByType[it.type] ?: 0) + 1 }
-            if (!page.hasMore(offset, limit)) break
-            offset += limit
-        }
+        fresh.filter { !it.read }.forEach { unreadByType[it.type] = (unreadByType[it.type] ?: 0) + 1 }
         // 按分类汇总。NotificationFilter.All.includes() 对所有类型都成立,所以 All 项
         // 拿到的是"全部类型的未读总数" —— 比铃铛口径的 count 更适合判断全部分类有没有变化。
         val byFilter = NotificationFilter.entries.associateWith { filter ->
@@ -463,7 +867,7 @@ class TopicRepository(
         )
     }
 
-    suspend fun unreadCount(): Int = fetchUnreadSummary().count
+    suspend fun unreadCount(scope: NotificationScope): Int = fetchUnreadSummary(scope).count
 
 
     suspend fun markNotificationRead(id: Long) {
@@ -488,10 +892,11 @@ class TopicRepository(
      */
     private suspend fun mutate(path: String, method: String, body: String? = null): String {
         var revalidated = false
+        var csrfRefreshed = false
         while (true) {
-            val csrf = objectRequest("/session/csrf.json").text("csrf").also { require(it.isNotBlank()) }
+            val csrf = obtainCsrf(forceRefresh = csrfRefreshed)
             val result = gate.withLock {
-                throttle()
+                throttle(burst = true)
                 val transport = transportProvider()
                 try { transport.write(path, method, body, csrf) } finally { lastRequestAt = SystemClock.elapsedRealtime() }
             }
@@ -500,11 +905,20 @@ class TopicRepository(
                 // clearChallenge 最长要等 30 秒,绝不能占着 gate 等 —— 那会把所有请求堵死。
                 if (!revalidated && transportProvider().revalidate(path)) {
                     revalidated = true
+                    csrfRefreshed = true
+                    cachedCsrfToken = null
                     continue
                 }
                 throw NeedsInteractiveVerification("提交需要重新验证")
             }
             if (result.status == 0) throw NetworkTimeoutException()
+            if ((result.status == 403 || result.status == 422) && !csrfRefreshed &&
+                (result.body.contains("BAD CSRF", ignoreCase = true) || result.body.contains("csrf", ignoreCase = true))
+            ) {
+                cachedCsrfToken = null
+                csrfRefreshed = true
+                continue
+            }
             if (result.status !in 200..299) {
                 val serverMessage = runCatching {
                     (json.parseToJsonElement(result.body).jsonObject["errors"] as? JsonArray)
@@ -530,11 +944,15 @@ class TopicRepository(
         return SearchPage(
             items = response.topics.map { topic ->
                 val author = posts[topic.id]?.firstOrNull()
+                val cachedLevel = sessionStore?.getTopicNotificationLevel(topic.id)
+                val effectiveLevelCode = cachedLevel ?: topic.notificationLevel?.takeIf { it in 0..3 && it != 1 }
+                val notificationLevel = effectiveLevelCode?.let { TopicNotificationLevel.fromCode(it) }
                 TopicListItem(
                     topic = if (topic.unseen && topic.id in seen) topic.copy(unseen = false) else topic,
                     authorUsername = author?.username,
                     avatarUrl = avatarUrlOf(author?.avatarTemplate),
                     category = known[topic.categoryId],
+                    notificationLevel = notificationLevel,
                 )
             },
             excerpts = posts.mapValues { (_, matches) -> matches.first().blurb },
@@ -789,6 +1207,137 @@ class TopicRepository(
     }
 
     /**
+     * 从服务端拉取自定义侧边栏分区（与 PC 端打通）。
+     * 若用户在 PC 端配置了自定义侧边栏分区，拉取并将其中的 FontAwesome 图标还原为移动端高颜值 Emoji。
+     */
+    suspend fun fetchCustomSidebarSection(): CustomSection? {
+        val raw = try {
+            request("/sidebar_sections.json")
+        } catch (error: Exception) {
+            diagnostics.log("拉取自定义侧边栏分区失败: ${error.message}")
+            return null
+        }
+        val root = runCatching { json.parseToJsonElement(raw).jsonObject }.getOrNull() ?: return null
+        val sections = root.objects("sidebar_sections")
+        // 查找属于用户的自定义版块：section_type != "community"，且 public != true
+        val customSectionObj = sections.firstOrNull { sec ->
+            val type = sec.text("section_type")
+            val isPublic = (sec.get("public") as? JsonPrimitive)?.booleanOrNull == true
+            type != "community" && !isPublic
+        } ?: return null
+
+        val serverId = customSectionObj.number("id")
+        val title = customSectionObj.text("title").ifBlank { "自定义版块" }
+        val linkObjs = customSectionObj.objects("links")
+        val links = linkObjs.map { linkObj ->
+            val linkServerId = linkObj.number("id")
+            CustomSectionLink(
+                id = linkServerId?.toString() ?: java.util.UUID.randomUUID().toString(),
+                icon = CustomSectionIconMapper.toDisplayIcon(linkObj.text("icon")),
+                name = linkObj.text("name"),
+                url = linkObj.text("value"),
+                serverId = linkServerId,
+            )
+        }
+        return CustomSection(
+            id = "custom_section_server_${serverId ?: "default"}",
+            title = title,
+            links = links,
+            serverId = serverId,
+        )
+    }
+
+    /**
+     * 将自定义版块保存/同步至 Discourse 服务端（与 PC 端打通）。
+     * [oldServerLinkIds] 用于在更新时告知后端已删除的 link 需要带上 _destroy: true。
+     */
+    suspend fun saveCustomSidebarSection(
+        section: CustomSection,
+        oldServerLinkIds: List<Long> = emptyList(),
+    ): CustomSection {
+        val serverId = section.serverId
+        val linksArray = mutableListOf<JsonObject>()
+
+        // 现存条目
+        section.links.forEach { link ->
+            val linkMap = mutableMapOf<String, JsonElement>(
+                "name" to JsonPrimitive(link.name),
+                "value" to JsonPrimitive(link.url),
+                "icon" to JsonPrimitive(CustomSectionIconMapper.toFontAwesome(link.icon)),
+            )
+            if (link.serverId != null && link.serverId > 0L) {
+                linkMap["id"] = JsonPrimitive(link.serverId)
+            }
+            linksArray.add(JsonObject(linkMap))
+        }
+
+        // 被删除的条目（通知 Rails 删除对应记录）
+        val currentServerIds = section.links.mapNotNull { it.serverId }.toSet()
+        oldServerLinkIds.filter { it !in currentServerIds }.forEach { removedId ->
+            linksArray.add(
+                JsonObject(
+                    mapOf(
+                        "id" to JsonPrimitive(removedId),
+                        "_destroy" to JsonPrimitive(true),
+                        "name" to JsonPrimitive(""),
+                        "value" to JsonPrimitive(""),
+                        "icon" to JsonPrimitive("link"),
+                    ),
+                ),
+            )
+        }
+
+        val payload = JsonObject(
+            mapOf(
+                "title" to JsonPrimitive(section.title),
+                "links" to JsonArray(linksArray),
+            ),
+        ).toString()
+
+        val responseBody = if (serverId != null && serverId > 0L) {
+            mutate("/sidebar_sections/$serverId.json", "PUT", payload)
+        } else {
+            mutate("/sidebar_sections.json", "POST", payload)
+        }
+
+        // 解析返回结果中的新 ID
+        val returnedObj = runCatching {
+            val element = json.parseToJsonElement(responseBody).jsonObject
+            (element["sidebar_section"] as? JsonObject) ?: element
+        }.getOrNull()
+
+        val newServerId = returnedObj?.number("id") ?: serverId
+        val returnedLinks = returnedObj?.objects("links").orEmpty()
+        val mappedLinks = section.links.mapIndexed { index, link ->
+            val matching = returnedLinks.getOrNull(index)
+                ?: returnedLinks.firstOrNull { it.text("name") == link.name && it.text("value") == link.url }
+            val linkServerId = matching?.number("id") ?: link.serverId
+            link.copy(
+                serverId = linkServerId,
+                id = linkServerId?.toString() ?: link.id,
+            )
+        }
+
+        return section.copy(
+            id = "custom_section_server_${newServerId ?: "default"}",
+            serverId = newServerId,
+            links = mappedLinks,
+        )
+    }
+
+    /**
+     * 从服务端删除自定义侧边栏分区。
+     */
+    suspend fun deleteCustomSidebarSection(serverId: Long) {
+        if (serverId <= 0L) return
+        try {
+            mutate("/sidebar_sections/$serverId.json", "DELETE")
+        } catch (e: Exception) {
+            diagnostics.log("删除服务端自定义侧边栏分区失败: ${e.message}")
+        }
+    }
+
+    /**
      * 使用账号密码登录（支持两步验证 2FA：TOTP 动态口令与备用恢复码）。
      * 流程：GET /session/csrf → POST /session。
      * 成功返回 true，凭据错误返回 false，需要两步验证抛 SecondFactorRequiredException，
@@ -1026,12 +1575,16 @@ class TopicRepository(
             // Discourse 的 posters 顺序固定,第一个是原始发帖人。
             val author = topic.posters.firstOrNull()?.userId?.let { usersById[it] }
             val locallyRead = reading?.isUnreadExcluded(topic.id, topic.postsCount) == true
+            val cachedLevel = sessionStore?.getTopicNotificationLevel(topic.id)
+            val effectiveLevelCode = cachedLevel ?: topic.notificationLevel?.takeIf { it in 0..3 && it != 1 }
+            val notificationLevel = effectiveLevelCode?.let { TopicNotificationLevel.fromCode(it) }
             TopicListItem(
                 topic = if (topic.unseen && locallyRead) topic.copy(unseen = false) else topic,
                 authorUsername = author?.username ?: topic.lastPosterUsername,
                 avatarUrl = avatarUrlOf(author?.avatarTemplate),
                 category = topic.categoryId?.let { known[it] },
                 trustLevel = author?.trustLevel,
+                notificationLevel = notificationLevel,
             )
         }
         return TopicPage(items = items, hasMore = response.topicList.moreTopicsUrl != null)

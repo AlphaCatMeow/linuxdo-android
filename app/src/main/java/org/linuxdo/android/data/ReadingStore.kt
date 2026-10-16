@@ -41,7 +41,7 @@ class ReadingStore(context: Context) {
     }
 
     @Volatile
-    var syncReadProgress: Boolean = prefs.getBoolean(KEY_SYNC_READ_PROGRESS, false)
+    var syncReadProgress: Boolean = prefs.getBoolean(KEY_SYNC_READ_PROGRESS, true)
         private set
 
     fun setSyncReadProgress(enabled: Boolean) {

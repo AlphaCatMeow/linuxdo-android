@@ -27,3 +27,7 @@ keystore.properties
 *.doc
 *.docx
 *.pdf
+/tunnel/
+*.so
+*.aar
+!/app/libs/tunnel-release.aar
