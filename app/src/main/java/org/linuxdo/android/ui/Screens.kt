@@ -2481,45 +2481,50 @@ fun SettingsScreen(
                         fontWeight = FontWeight.SemiBold,
                         modifier = Modifier.weight(1f),
                     )
-                    when {
-                        updateState.checking -> IosActivityIndicator(diameter = 18.dp)
-                        else -> {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Box {
-                                    Box(
-                                        modifier = Modifier
-                                            .clip(RoundedCornerShape(6.dp))
-                                            .background(IosTheme.colors.fieldBackground)
-                                            .padding(horizontal = 8.dp, vertical = 3.dp),
-                                    ) {
-                                        Text(
-                                            "v${updateState.currentVersion}",
-                                            style = IosTheme.type.caption.copy(fontSize = 12.sp),
-                                            color = IosTheme.colors.secondaryLabel,
-                                            fontWeight = FontWeight.Medium,
-                                        )
-                                    }
-                                    if (updateState.updateInfo != null) {
-                                        Box(
-                                            modifier = Modifier
-                                                .size(8.dp)
-                                                .align(Alignment.TopEnd)
-                                                .offset(x = 3.dp, y = (-3).dp)
-                                                .clip(CircleShape)
-                                                .background(Color(0xFFFF3B30)),
-                                        )
-                                    }
-                                }
-                                Spacer(Modifier.width(6.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Box {
+                            Box(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(6.dp))
+                                    .background(IosTheme.colors.fieldBackground)
+                                    .padding(horizontal = 8.dp, vertical = 3.dp),
+                            ) {
                                 Text(
-                                    if (updateState.updateInfo != null) "可更新" else "已是最新",
-                                    style = IosTheme.type.subheadline,
-                                    color = if (updateState.updateInfo != null) Color(0xFFFF3B30) else IosTheme.colors.secondaryLabel,
+                                    "v${updateState.currentVersion}",
+                                    style = IosTheme.type.caption.copy(fontSize = 12.sp),
+                                    color = IosTheme.colors.secondaryLabel,
+                                    fontWeight = FontWeight.Medium,
                                 )
-                                Spacer(Modifier.width(8.dp))
-                                Text("›", color = IosTheme.colors.tertiaryLabel, style = IosTheme.type.title3)
+                            }
+                            if (updateState.updateInfo != null) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(8.dp)
+                                        .align(Alignment.TopEnd)
+                                        .offset(x = 3.dp, y = (-3).dp)
+                                        .clip(CircleShape)
+                                        .background(Color(0xFFFF3B30)),
+                                )
                             }
                         }
+                        Spacer(Modifier.width(6.dp))
+                        if (updateState.manualChecking) {
+                            IosActivityIndicator(diameter = 14.dp)
+                            Spacer(Modifier.width(4.dp))
+                            Text(
+                                "检查中...",
+                                style = IosTheme.type.subheadline,
+                                color = IosTheme.colors.secondaryLabel,
+                            )
+                        } else {
+                            Text(
+                                if (updateState.updateInfo != null) "可更新" else "已是最新",
+                                style = IosTheme.type.subheadline,
+                                color = if (updateState.updateInfo != null) Color(0xFFFF3B30) else IosTheme.colors.secondaryLabel,
+                            )
+                        }
+                        Spacer(Modifier.width(8.dp))
+                        Text("›", color = IosTheme.colors.tertiaryLabel, style = IosTheme.type.title3)
                     }
                 }
 

@@ -655,7 +655,7 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                 floatingBallActions = floatingBallActions,
                                 onFloatingBallActions = viewModel::setFloatingBallActions,
                                 updateState = updateState,
-                                onCheckUpdate = { viewModel.checkForUpdates(manual = true) },
+                                onCheckUpdate = viewModel::onVersionItemClick,
                                 syncReadProgress = syncReadProgress,
                                 onSyncReadProgress = viewModel::setSyncReadProgress,
                                 onDiagnostics = { stack.push(Route.Diagnostics) },

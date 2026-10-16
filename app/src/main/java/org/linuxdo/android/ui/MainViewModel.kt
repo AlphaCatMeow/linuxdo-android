@@ -97,6 +97,7 @@ data class UpdateUiState(
     val currentVersion: String = BuildConfig.VERSION_NAME.substringBefore("-"),
     val currentVersionCode: Int = BuildConfig.VERSION_CODE,
     val checking: Boolean = false,
+    val manualChecking: Boolean = false,
     val updateInfo: UpdateInfo? = null,
     val showDialog: Boolean = false,
     val statusMessage: String? = null,
@@ -662,7 +663,65 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     )
     val loginUiState: StateFlow<LoginUiState> = _loginUiState.asStateFlow()
 
-    private val _updateState = MutableStateFlow(UpdateUiState())
+    private fun loadCachedUpdateInfo(): UpdateInfo? {
+        val prefs = container.preferences
+        val latestVersion = prefs.getString("cached_update_version", null)?.takeIf { it.isNotBlank() } ?: return null
+        val currentVersion = BuildConfig.VERSION_NAME.substringBefore("-")
+        if (compareVersions(latestVersion, currentVersion) <= 0) {
+            clearCachedUpdateInfo()
+            return null
+        }
+        return UpdateInfo(
+            latestVersion = latestVersion,
+            title = prefs.getString("cached_update_title", "").orEmpty(),
+            changelog = prefs.getString("cached_update_changelog", "").orEmpty(),
+            downloadUrl = prefs.getString("cached_update_download_url", "").orEmpty(),
+            releasePageUrl = prefs.getString("cached_update_release_url", "").orEmpty(),
+            mandatory = prefs.getBoolean("cached_update_mandatory", false),
+            apkSha256 = prefs.getString("cached_update_apk_sha256", null),
+        )
+    }
+
+    private fun saveCachedUpdateInfo(info: UpdateInfo) {
+        container.preferences.edit {
+            putString("cached_update_version", info.latestVersion)
+            putString("cached_update_title", info.title)
+            putString("cached_update_changelog", info.changelog)
+            putString("cached_update_download_url", info.downloadUrl)
+            putString("cached_update_release_url", info.releasePageUrl)
+            putBoolean("cached_update_mandatory", info.mandatory)
+            putString("cached_update_apk_sha256", info.apkSha256)
+            putLong("cached_update_check_time", System.currentTimeMillis())
+        }
+    }
+
+    private fun clearCachedUpdateInfo() {
+        container.preferences.edit {
+            remove("cached_update_version")
+            remove("cached_update_title")
+            remove("cached_update_changelog")
+            remove("cached_update_download_url")
+            remove("cached_update_release_url")
+            remove("cached_update_mandatory")
+            remove("cached_update_apk_sha256")
+            remove("cached_update_check_time")
+        }
+    }
+
+    fun onVersionItemClick() {
+        val currentInfo = _updateState.value.updateInfo
+        if (currentInfo != null) {
+            _updateState.update { it.copy(showDialog = true) }
+        } else {
+            checkForUpdates(manual = true)
+        }
+    }
+
+    private val _updateState = MutableStateFlow(
+        UpdateUiState(
+            updateInfo = loadCachedUpdateInfo(),
+        )
+    )
     val updateState: StateFlow<UpdateUiState> = _updateState.asStateFlow()
 
     private var apkUpdateJob: Job? = null
@@ -774,11 +833,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      * 3. 回退 Release 正文包含 `[force]`、`[mandatory]`、`[必升]`、`[min_version: X.Y.Z]` 或 `[min_code: N]`
      */
     fun checkForUpdates(manual: Boolean = false) {
-        if (_updateState.value.checking) return
+        if (_updateState.value.checking) {
+            if (manual) {
+                viewModelScope.launch(Dispatchers.Main) {
+                    Toast.makeText(getApplication(), "正在检查更新中，请稍候...", Toast.LENGTH_SHORT).show()
+                }
+            }
+            return
+        }
         viewModelScope.launch {
             _updateState.update {
                 it.copy(
                     checking = true,
+                    manualChecking = manual,
                     statusMessage = if (manual) "正在检查新版本..." else it.statusMessage,
                 )
             }
@@ -855,26 +922,35 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }
                 if (info != null) {
+                    saveCachedUpdateInfo(info)
                     val ignoredVersion = container.preferences.getString("ignored_update_version", null)
                     val shouldPopup = info.mandatory || manual || ignoredVersion != info.latestVersion
                     diagnostics.log("检测到新版本: v${info.latestVersion} (必升=${info.mandatory})")
                     _updateState.update {
                         it.copy(
                             checking = false,
+                            manualChecking = false,
                             updateInfo = info,
                             showDialog = shouldPopup,
                             statusMessage = "发现新版本 v${info.latestVersion}",
                         )
                     }
                 } else {
+                    clearCachedUpdateInfo()
                     diagnostics.log("版本检查完成: 当前已是最新 (v$currentVersion)")
                     _updateState.update {
                         it.copy(
                             checking = false,
+                            manualChecking = false,
                             updateInfo = null,
                             showDialog = false,
                             statusMessage = if (manual) "当前已是最新版本 (v$currentVersion)" else null,
                         )
+                    }
+                    if (manual) {
+                        withContext(Dispatchers.Main) {
+                            Toast.makeText(getApplication(), "当前已是最新版本 (v$currentVersion)", Toast.LENGTH_SHORT).show()
+                        }
                     }
                 }
             } catch (error: CancellationException) {
@@ -884,8 +960,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 _updateState.update {
                     it.copy(
                         checking = false,
+                        manualChecking = false,
                         statusMessage = if (manual) "检查更新失败，请稍后重试" else it.statusMessage,
                     )
+                }
+                if (manual) {
+                    withContext(Dispatchers.Main) {
+                        Toast.makeText(getApplication(), "检查更新失败，请检查网络", Toast.LENGTH_SHORT).show()
+                    }
                 }
             }
         }
