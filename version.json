@@ -9,11 +9,11 @@
     "2、支持 DoH 节点多路测速、自动代次故障转移与 VPN 状态感知自动暂停",
     "3、全新双态智能通知保活体系，支持 MessageBus 长轮询与 Doze 闹钟唤醒",
     "4、新增回复正文摘要补全与桌面应用角标全系统兼容",
-    "5、支持自定义版块与 Web 端双向同步、分类自定义拖拽排序与话题免打扰",
-    "6、新增应用内 APK 流式下载与自动安装更新、草稿箱同步及多项性能优化"
+    "5、评论区图文混排编辑、输入框自动选中聚焦、表情优化与草稿箱同步",
+    "6、支持分类列表动态感知新话题、四级动图头像与已注销账号昵称显示优化"
   ],
   "apkUrl": "https://github.com/xuemk/linuxdo-android/releases/download/v1.3.0/linuxdo-1.3.0-release.apk",
-  "apkSha256": "f7a3ab02cc85745c8e0ca609ec1a3d0c099d8b2571fc30c6a59c18dca6622c13"
+  "apkSha256": "8fff8069858e7a69df46a6c2d3db90ad41bd91972de1caa0fb6a30b9de8c441e"
 }
 
 

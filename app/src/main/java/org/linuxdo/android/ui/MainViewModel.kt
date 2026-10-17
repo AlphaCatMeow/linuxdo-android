@@ -614,6 +614,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private var autoProbeJob: Job? = null
+    private var activeCategory: Pair<Int, String>? = null
+
+    fun setActiveCategory(categoryId: Int?, slug: String? = null) {
+        activeCategory = if (categoryId != null && !slug.isNullOrBlank()) {
+            categoryId to slug
+        } else {
+            null
+        }
+    }
 
     private fun restartAutoProbeLoop() {
         autoProbeJob?.cancel()
@@ -622,7 +631,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         autoProbeJob = viewModelScope.launch {
             while (isActive) {
                 delay(interval.seconds * 1000L)
-                probeIncomingTopics(_state.value.homeFeed)
+                val currentCategory = activeCategory
+                if (currentCategory != null) {
+                    probeIncomingTopics(_state.value.homeFeed, categoryId = currentCategory.first)
+                } else {
+                    probeIncomingTopics(_state.value.homeFeed)
+                }
             }
         }
     }
@@ -3617,7 +3631,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     if (currentCategoryState.items.isEmpty()) return@launch
                     val currentIds = currentCategoryState.items.map { it.topic.id }.toSet()
                     val category = _categories.value.items.firstOrNull { it.id == categoryId }
-                    val slug = category?.slug ?: "c"
+                    val slug = category?.slug ?: activeCategory?.takeIf { it.first == categoryId }?.second ?: "c"
                     val sortOrder = _topicSortOrder.value.apiValue
                     val sortAscending = _topicSortAscending.value.takeIf { sortOrder != null }
                     val freshPage = repository.fetchCategoryTopics(slug, categoryId, 0, present = false, order = sortOrder, ascending = sortAscending)

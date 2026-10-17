@@ -522,6 +522,14 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                         emptyList()
                                     }
                                 }
+                                DisposableEffect(route.categoryId, route.slug, active) {
+                                    if (active) {
+                                        viewModel.setActiveCategory(route.categoryId, route.slug)
+                                    }
+                                    onDispose {
+                                        viewModel.setActiveCategory(null)
+                                    }
+                                }
                                 TopicListScreen(
                                     title = route.name,
                                     state = categoryTopics[route.categoryId] ?: TopicListUiState(),
@@ -531,6 +539,7 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                     onBack = { stack.pop() },
                                     active = active,
                                     trailing = { UnreadBell(state.unreadCount, openNotifications) },
+                                    onApplyIncoming = { viewModel.applyIncomingTopics(state.homeFeed, categoryId = route.categoryId) },
                                     categoryVariants = variants,
                                     currentCategoryId = route.categoryId,
                                     onSelectCategoryVariant = { target ->
