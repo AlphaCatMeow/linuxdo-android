@@ -1048,7 +1048,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     ): UpdateInfo? {
         val root = runCatching { Json.parseToJsonElement(rawJson).jsonObject }.getOrNull() ?: return null
         val tagName = root["tag_name"]?.jsonPrimitive?.contentOrNull?.trim().orEmpty()
-        val latestVersion = tagName.removePrefix("v").removePrefix("V").substringBefore("-").trim()
+        val latestVersion = tagName.removePrefix("v").removePrefix("V").trim()
         if (latestVersion.isEmpty() || compareVersions(latestVersion, currentVersion) <= 0) {
             return null
         }
@@ -1135,14 +1135,21 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun compareVersions(v1: String, v2: String): Int {
-        val parts1 = v1.split(".").map { it.filter(Char::isDigit).toIntOrNull() ?: 0 }
-        val parts2 = v2.split(".").map { it.filter(Char::isDigit).toIntOrNull() ?: 0 }
+        val s1 = v1.removePrefix("v").removePrefix("V").trim()
+        val s2 = v2.removePrefix("v").removePrefix("V").trim()
+        val parts1 = s1.substringBefore("-").split(".").map { it.filter(Char::isDigit).toIntOrNull() ?: 0 }
+        val parts2 = s2.substringBefore("-").split(".").map { it.filter(Char::isDigit).toIntOrNull() ?: 0 }
         val maxLen = maxOf(parts1.size, parts2.size)
         for (i in 0 until maxLen) {
             val a = parts1.getOrElse(i) { 0 }
             val b = parts2.getOrElse(i) { 0 }
             if (a != b) return a.compareTo(b)
         }
+        // 当数字一致时（如 1.3.0 与 1.3.0-beta），正式版高于预发尝鲜版 (SemVer 规范)
+        val isPre1 = s1.contains("beta", ignoreCase = true) || s1.contains("alpha", ignoreCase = true) || s1.contains("preview", ignoreCase = true)
+        val isPre2 = s2.contains("beta", ignoreCase = true) || s2.contains("alpha", ignoreCase = true) || s2.contains("preview", ignoreCase = true)
+        if (!isPre1 && isPre2) return 1
+        if (isPre1 && !isPre2) return -1
         return 0
     }
 
