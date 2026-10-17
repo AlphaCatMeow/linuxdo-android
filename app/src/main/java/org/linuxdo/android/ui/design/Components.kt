@@ -24,10 +24,18 @@ import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.text.font.FontWeight
+import coil.compose.AsyncImage
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.semantics.Role
@@ -52,6 +60,59 @@ fun avatarShape(username: String?, avatarUrl: String? = null, cornerRadius: Dp =
         avatarUrl?.contains("/neo/", ignoreCase = true) == true ||
         avatarUrl?.contains("user_avatar/linux.do/neo", ignoreCase = true) == true
     return if (isNeo) RoundedCornerShape(cornerRadius) else CircleShape
+}
+
+/**
+ * 统一的用户头像组件：
+ * 1. 优先加载动图/高优头像 avatarUrl（如 GIF 动画头像），对齐 fluxdo；
+ * 2. 若动图加载失败或无动图，自动无缝降级加载静态头像 fallbackUrl；
+ * 3. 若均无法加载或 URL 为空，优雅展示带用户名首字母的大写占位图，绝不出现空白方块；
+ * 4. 自动应用站长 neo 方形角与普通用户圆形裁切。
+ */
+@Composable
+fun UserAvatar(
+    avatarUrl: String?,
+    fallbackUrl: String? = null,
+    username: String?,
+    modifier: Modifier = Modifier,
+    cornerRadius: Dp = 4.dp,
+    contentScale: ContentScale = ContentScale.Crop,
+) {
+    var failedPrimary by remember(avatarUrl) { mutableStateOf(false) }
+    var failedFallback by remember(fallbackUrl) { mutableStateOf(false) }
+    val effectiveUrl = if (failedPrimary || avatarUrl.isNullOrBlank()) fallbackUrl else avatarUrl
+    val shape = avatarShape(username, effectiveUrl ?: avatarUrl, cornerRadius)
+
+    Box(
+        modifier = modifier
+            .clip(shape)
+            .background(IosTheme.colors.fieldBackground),
+        contentAlignment = Alignment.Center,
+    ) {
+        if (!effectiveUrl.isNullOrBlank() && !failedFallback) {
+            AsyncImage(
+                model = effectiveUrl,
+                contentDescription = username,
+                modifier = Modifier.fillMaxSize(),
+                contentScale = contentScale,
+                onError = {
+                    if (!failedPrimary && !fallbackUrl.isNullOrBlank() && fallbackUrl != avatarUrl) {
+                        failedPrimary = true
+                    } else {
+                        failedFallback = true
+                    }
+                },
+            )
+        } else {
+            val initial = username?.trimStart('@')?.firstOrNull()?.uppercase() ?: "★"
+            Text(
+                text = initial,
+                style = IosTheme.type.footnote,
+                fontWeight = FontWeight.Bold,
+                color = IosTheme.colors.secondaryLabel,
+            )
+        }
+    }
 }
 
 @Composable

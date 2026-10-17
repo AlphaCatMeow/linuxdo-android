@@ -125,6 +125,7 @@ import org.linuxdo.android.ui.design.IosLargeTitleScaffold
 import org.linuxdo.android.ui.design.IosLoadingBox
 import org.linuxdo.android.ui.design.IosMetrics
 import org.linuxdo.android.ui.design.IosTheme
+import org.linuxdo.android.ui.design.UserAvatar
 import org.linuxdo.android.ui.design.avatarShape
 import org.linuxdo.android.ui.format.RelativeTime
 
@@ -965,14 +966,12 @@ fun PinnedGroupCard(
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
-                AsyncImage(
-                    model = head.avatarUrl,
-                    contentDescription = head.authorUsername,
-                    contentScale = ContentScale.Crop,
-                    modifier = Modifier
-                        .size(24.dp)
-                        .clip(avatarShape(head.authorUsername, head.avatarUrl, 3.5.dp))
-                        .background(IosTheme.colors.fieldBackground),
+                UserAvatar(
+                    avatarUrl = head.avatarUrl,
+                    fallbackUrl = head.staticAvatarUrl,
+                    username = head.authorUsername,
+                    modifier = Modifier.size(24.dp),
+                    cornerRadius = 3.5.dp,
                 )
                 Spacer(Modifier.width(6.dp))
                 Text(
@@ -1133,14 +1132,12 @@ fun TopicRow(
                 Modifier.weight(1f),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                AsyncImage(
-                    model = item.avatarUrl,
-                    contentDescription = item.authorUsername,
-                    contentScale = ContentScale.Crop,
-                    modifier = Modifier
-                        .size(24.dp)
-                        .clip(avatarShape(item.authorUsername, item.avatarUrl, 3.5.dp))
-                        .background(IosTheme.colors.fieldBackground),
+                UserAvatar(
+                    avatarUrl = item.avatarUrl,
+                    fallbackUrl = item.staticAvatarUrl,
+                    username = item.authorUsername,
+                    modifier = Modifier.size(24.dp),
+                    cornerRadius = 3.5.dp,
                 )
                 Spacer(Modifier.width(6.dp))
                 Text(

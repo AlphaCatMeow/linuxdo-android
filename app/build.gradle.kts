@@ -64,6 +64,8 @@ dependencies {
 
     // 头像与帖内图片:必须复用带固定 UA + Cookie 的 OkHttpClient,否则图片会被 Cloudflare 拦。
     implementation("io.coil-kt:coil-compose:2.7.0")
+    implementation("io.coil-kt:coil-gif:2.7.0")
+    implementation("io.coil-kt:coil-svg:2.7.0")
     // 解析 Discourse 的 cooked HTML 为块模型;纯 Java,无传递依赖。
     implementation("org.jsoup:jsoup:1.18.1")
     // 后台定期任务(低频只读静默探测未读通知)

@@ -378,6 +378,7 @@ data class TopicListItem(
     val authorUsername: String?,
     val authorName: String? = null,
     val avatarUrl: String?,
+    val staticAvatarUrl: String? = null,
     val category: Category?,
     val trustLevel: Int? = null,
     val notificationLevel: TopicNotificationLevel? = null,
@@ -963,7 +964,8 @@ fun avatarUrlOf(
     size: Int = 120,
 ): String? {
     if (!animatedAvatar.isNullOrBlank()) {
-        val animPath = if (animatedAvatar.startsWith("//")) "https:$animatedAvatar" else animatedAvatar
+        val replaced = animatedAvatar.replace("{size}", size.toString())
+        val animPath = if (replaced.startsWith("//")) "https:$replaced" else replaced
         return if (animPath.startsWith("http", ignoreCase = true)) animPath
         else Config.BASE_URL + (if (animPath.startsWith("/")) animPath else "/$animPath")
     }

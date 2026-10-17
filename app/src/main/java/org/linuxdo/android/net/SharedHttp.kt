@@ -136,7 +136,9 @@ private class SessionHeaderInterceptor(
             return chain.proceed(original.newBuilder().removeHeader("Cookie").removeHeader("X-CSRF-Token").build())
         }
 
-        val builder = original.newBuilder().header("User-Agent", userAgent)
+        val builder = original.newBuilder()
+            .header("User-Agent", userAgent)
+            .header("Referer", "${Config.BASE_URL}/")
         // 这里运行在 OkHttp 的 IO 线程,不能调 syncFromWebView() —— 它要在主线程访问
         // CookieManager。只读加密存储里的快照,快照由 Transport 在每次 JSON 请求前刷新。
         val cookies = store.storedCookies()

@@ -255,6 +255,7 @@ class TopicRepository(
                 authorUsername = author,
                 authorName = authorName,
                 avatarUrl = avatarUrlOf(avatar, animAvatar, size = 64),
+                staticAvatarUrl = avatarUrlOf(avatar, null, size = 64),
                 category = categoryId?.let { known[it] },
                 trustLevel = null,
                 notificationLevel = notificationLevel,
@@ -957,6 +958,7 @@ class TopicRepository(
                     authorUsername = author?.username,
                     authorName = author?.name,
                     avatarUrl = avatarUrlOf(author?.avatarTemplate, author?.animatedAvatar, size = 64),
+                    staticAvatarUrl = avatarUrlOf(author?.avatarTemplate, null, size = 64),
                     category = known[topic.categoryId],
                     notificationLevel = notificationLevel,
                 )
@@ -1591,6 +1593,7 @@ class TopicRepository(
                 authorUsername = author?.username ?: topic.lastPosterUsername,
                 authorName = author?.name,
                 avatarUrl = avatarUrlOf(author?.avatarTemplate, author?.animatedAvatar, size = 64),
+                staticAvatarUrl = avatarUrlOf(author?.avatarTemplate, null, size = 64),
                 category = topic.categoryId?.let { known[it] },
                 trustLevel = author?.trustLevel,
                 notificationLevel = notificationLevel,

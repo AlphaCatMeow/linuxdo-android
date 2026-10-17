@@ -3,8 +3,12 @@ package org.linuxdo.android
 import android.app.Application
 import android.content.Context
 import android.webkit.WebSettings
+import android.os.Build
 import coil.ImageLoader
 import coil.ImageLoaderFactory
+import coil.decode.GifDecoder
+import coil.decode.ImageDecoderDecoder
+import coil.decode.SvgDecoder
 import coil.disk.DiskCache
 import coil.memory.MemoryCache
 import java.io.File
@@ -121,6 +125,14 @@ class AppContainer(context: Context) {
 
     val imageLoader: ImageLoader = ImageLoader.Builder(context)
         .callFactory(dynamicCallFactory)
+        .components {
+            if (Build.VERSION.SDK_INT >= 28) {
+                add(ImageDecoderDecoder.Factory(enforceMinimumFrameDelay = true))
+            } else {
+                add(GifDecoder.Factory(enforceMinimumFrameDelay = true))
+            }
+            add(SvgDecoder.Factory())
+        }
         .memoryCache {
             MemoryCache.Builder(context)
                 .maxSizePercent(0.25)

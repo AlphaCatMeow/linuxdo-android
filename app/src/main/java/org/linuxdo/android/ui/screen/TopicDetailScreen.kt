@@ -2230,11 +2230,13 @@ private fun PostRow(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             val postAvatarUrl = avatarUrlOf(post.avatarTemplate, post.animatedAvatar)
-            AsyncImage(
-                postAvatarUrl,
-                post.username,
-                modifier = Modifier.size(32.dp).clip(avatarShape(post.username, postAvatarUrl, 4.dp)),
-                contentScale = ContentScale.Crop,
+            val staticAvatarUrl = avatarUrlOf(post.avatarTemplate, null)
+            UserAvatar(
+                avatarUrl = postAvatarUrl,
+                fallbackUrl = staticAvatarUrl,
+                username = post.username,
+                modifier = Modifier.size(32.dp),
+                cornerRadius = 4.dp,
             )
             Column(Modifier.weight(1f).padding(start = 10.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -2362,11 +2364,13 @@ private fun SubReplyRow(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             val subAvatarUrl = avatarUrlOf(post.avatarTemplate, post.animatedAvatar)
-            AsyncImage(
-                subAvatarUrl,
-                post.username,
-                modifier = Modifier.size(20.dp).clip(avatarShape(post.username, subAvatarUrl, 3.dp)),
-                contentScale = ContentScale.Crop,
+            val subStaticAvatarUrl = avatarUrlOf(post.avatarTemplate, null)
+            UserAvatar(
+                avatarUrl = subAvatarUrl,
+                fallbackUrl = subStaticAvatarUrl,
+                username = post.username,
+                modifier = Modifier.size(20.dp),
+                cornerRadius = 3.dp,
             )
             Row(
                 Modifier.weight(1f).padding(start = 6.dp),
@@ -2655,8 +2659,14 @@ private fun PostActions(
                     .combinedClickable(enabled = boost.canDelete && !busy, onClick = {}, onLongClick = { deleteId = boost.id })
                     .padding(horizontal = 5.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
                     val boostAvatarUrl = avatarUrlOf(boost.user?.avatarTemplate, boost.user?.animatedAvatar)
-                    AsyncImage(boostAvatarUrl, boost.user?.username,
-                        modifier = Modifier.size(18.dp).clip(avatarShape(boost.user?.username, boostAvatarUrl, 3.dp)))
+                    val boostStaticAvatarUrl = avatarUrlOf(boost.user?.avatarTemplate, null)
+                    UserAvatar(
+                        avatarUrl = boostAvatarUrl,
+                        fallbackUrl = boostStaticAvatarUrl,
+                        username = boost.user?.username,
+                        modifier = Modifier.size(18.dp),
+                        cornerRadius = 3.dp,
+                    )
                     Box(Modifier.padding(start = 4.dp, end = 3.dp)) {
                         RichParagraph(content.filterIsInstance<CookedBlock.Paragraph>().flatMap { it.runs }, compact = true)
                     }
