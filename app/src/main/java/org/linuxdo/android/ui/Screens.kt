@@ -4547,6 +4547,19 @@ internal class RichMarkdownEditorView(context: Context) : EditText(context) {
         setHintTextColor(hintColor)
     }
 
+    fun requestInputFocus() {
+        isFocusable = true
+        isFocusableInTouchMode = true
+        requestFocus()
+        text?.let { ed ->
+            setSelection(ed.length)
+        }
+        post {
+            val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as? android.view.inputmethod.InputMethodManager
+            imm?.showSoftInput(this, android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT)
+        }
+    }
+
     fun insertToken(token: String) {
         val ed = text ?: return
         val start = selectionStart.coerceAtLeast(0)

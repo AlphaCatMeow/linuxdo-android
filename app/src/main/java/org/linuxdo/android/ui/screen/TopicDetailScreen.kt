@@ -1795,6 +1795,14 @@ private fun ComposerSheet(
         }
     }
 
+    // 弹框打开时默认选中输入框并弹出软键盘
+    LaunchedEffect(editorView, composer.loadingDraft) {
+        if (!composer.loadingDraft && editorView != null) {
+            kotlinx.coroutines.delay(120)
+            editorView?.requestInputFocus()
+        }
+    }
+
     LaunchedEffect(composer.attachments) {
         editorView?.syncAttachments(composer.attachments)
     }
@@ -1919,6 +1927,7 @@ private fun ComposerSheet(
                                 setOnRemoveAttachmentListener { mediaId -> onRemoveAttachment(mediaId) }
                                 setOnPreviewImageListener { previewUrl -> previewingImage = previewUrl }
                                 editorView = this
+                                post { requestInputFocus() }
                             }
                         },
                         update = { view ->
@@ -2220,7 +2229,7 @@ private fun PostRow(
             ),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            val postAvatarUrl = avatarUrlOf(post.avatarTemplate)
+            val postAvatarUrl = avatarUrlOf(post.avatarTemplate, post.animatedAvatar)
             AsyncImage(
                 postAvatarUrl,
                 post.username,
@@ -2229,7 +2238,12 @@ private fun PostRow(
             )
             Column(Modifier.weight(1f).padding(start = 10.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(post.username, style = IosTheme.type.subheadline, fontWeight = FontWeight.SemiBold)
+                    val displayName = post.displayName.ifBlank { post.username }
+                    Text(displayName, style = IosTheme.type.subheadline, fontWeight = FontWeight.SemiBold)
+                    if (!post.name.isNullOrBlank() && post.name != post.username) {
+                        Spacer(Modifier.width(4.dp))
+                        Text("@${post.username}", style = IosTheme.type.caption, color = IosTheme.colors.secondaryLabel)
+                    }
                     if (isTopicAuthor) {
                         Spacer(Modifier.width(4.dp))
                         AuthorBadge()
@@ -2347,7 +2361,7 @@ private fun SubReplyRow(
             ),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            val subAvatarUrl = avatarUrlOf(post.avatarTemplate)
+            val subAvatarUrl = avatarUrlOf(post.avatarTemplate, post.animatedAvatar)
             AsyncImage(
                 subAvatarUrl,
                 post.username,
@@ -2359,7 +2373,7 @@ private fun SubReplyRow(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
-                    text = post.username,
+                    text = post.displayName.ifBlank { post.username },
                     style = IosTheme.type.footnote,
                     fontWeight = FontWeight.SemiBold,
                     color = IosTheme.colors.secondaryLabel,
@@ -2640,7 +2654,7 @@ private fun PostActions(
                     .background(chipBg)
                     .combinedClickable(enabled = boost.canDelete && !busy, onClick = {}, onLongClick = { deleteId = boost.id })
                     .padding(horizontal = 5.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-                    val boostAvatarUrl = avatarUrlOf(boost.user?.avatarTemplate)
+                    val boostAvatarUrl = avatarUrlOf(boost.user?.avatarTemplate, boost.user?.animatedAvatar)
                     AsyncImage(boostAvatarUrl, boost.user?.username,
                         modifier = Modifier.size(18.dp).clip(avatarShape(boost.user?.username, boostAvatarUrl, 3.dp)))
                     Box(Modifier.padding(start = 4.dp, end = 3.dp)) {

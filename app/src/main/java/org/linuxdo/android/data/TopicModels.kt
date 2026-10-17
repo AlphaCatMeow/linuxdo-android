@@ -146,6 +146,7 @@ data class DiscourseUser(
     val username: String,
     val name: String? = null,
     @SerialName("avatar_template") val avatarTemplate: String? = null,
+    @SerialName("animated_avatar") val animatedAvatar: String? = null,
     /** 信任等级(Lv0~Lv4)。列表接口在 users[] 里下发,话题详情的楼层里没有。 */
     @SerialName("trust_level") val trustLevel: Int? = null,
 )
@@ -375,12 +376,17 @@ enum class TopicNotificationLevel(
 data class TopicListItem(
     val topic: Topic,
     val authorUsername: String?,
+    val authorName: String? = null,
     val avatarUrl: String?,
     val category: Category?,
     val trustLevel: Int? = null,
     val notificationLevel: TopicNotificationLevel? = null,
     val notificationLevelUpdating: Boolean = false,
-)
+) {
+    /** 优先展示论坛昵称（如“用户已注销”），无昵称则回退到用户名（如“NullUser”），对齐 fluxdo */
+    val displayName: String
+        get() = authorName?.trim()?.takeIf { it.isNotEmpty() } ?: authorUsername.orEmpty()
+}
 
 data class TopicPage(
     val items: List<TopicListItem>,
@@ -431,7 +437,9 @@ sealed class PostResult {
 data class Post(
     val id: Long,
     val username: String = "",
+    val name: String? = null,
     @SerialName("avatar_template") val avatarTemplate: String? = null,
+    @SerialName("animated_avatar") val animatedAvatar: String? = null,
     @SerialName("post_number") val postNumber: Int = 0,
     @SerialName("created_at") val createdAt: String? = null,
     val cooked: String = "",
@@ -453,7 +461,11 @@ data class Post(
     @SerialName("bookmark_id") val bookmarkId: Long? = null,
     /** post_stream 里的楼层不带 raw,编辑前要单独取一次。 */
     val raw: String? = null,
-)
+) {
+    /** 优先展示论坛昵称（如“用户已注销”），无昵称则回退到用户名（如“NullUser”），对齐 fluxdo */
+    val displayName: String
+        get() = name?.trim()?.takeIf { it.isNotEmpty() } ?: username
+}
 
 enum class PostFlagReason(val id: Int, val title: String, val description: String) {
     Spam(8, "垃圾信息", "广告、推销或垃圾信息"),
@@ -941,12 +953,25 @@ data class ProfilePage(
 )
 
 /**
- * avatar_template 形如 `/user_avatar/linux.do/foo/{size}/123_2.png`,
- * 需要替换 {size} 并补全为绝对地址。
+ * 头像地址解析：优先使用动图 animated_avatar（针对四级用户及管理组），对齐 fluxdo；
+ * 静态 avatar_template 形如 `/user_avatar/linux.do/foo/{size}/123_2.png`，
+ * 替换 {size} 并补全为绝对地址。默认尺寸使用标准 120。
  */
-fun avatarUrlOf(template: String?, size: Int = 144): String? {
+fun avatarUrlOf(
+    template: String?,
+    animatedAvatar: String? = null,
+    size: Int = 120,
+): String? {
+    if (!animatedAvatar.isNullOrBlank()) {
+        val animPath = if (animatedAvatar.startsWith("//")) "https:$animatedAvatar" else animatedAvatar
+        return if (animPath.startsWith("http", ignoreCase = true)) animPath
+        else Config.BASE_URL + (if (animPath.startsWith("/")) animPath else "/$animPath")
+    }
     if (template.isNullOrBlank()) return null
     val path = template.replace("{size}", size.toString())
     if (path.startsWith("//")) return "https:$path"
-    return if (path.startsWith("http", ignoreCase = true)) path else Config.BASE_URL + path
+    return if (path.startsWith("http", ignoreCase = true)) path
+    else Config.BASE_URL + (if (path.startsWith("/")) path else "/$path")
 }
+
+fun avatarUrlOf(template: String?, size: Int): String? = avatarUrlOf(template, null, size)

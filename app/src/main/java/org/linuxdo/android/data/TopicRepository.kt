@@ -220,6 +220,10 @@ class TopicRepository(
             val userObj = (bm["user"] as? JsonObject) ?: (bm["post_user"] as? JsonObject)
             val author = userObj?.text("username")?.takeIf { it.isNotBlank() }
                 ?: bm.text("username").ifBlank { bm.text("post_username") }.ifBlank { null }
+            val authorName = userObj?.text("name")?.takeIf { it.isNotBlank() }
+                ?: bm.text("name").ifBlank { null }
+            val animAvatar = userObj?.text("animated_avatar")?.takeIf { it.isNotBlank() }
+                ?: bm.text("animated_avatar").ifBlank { null }
             val avatar = userObj?.text("avatar_template")?.takeIf { it.isNotBlank() }
                 ?: bm.text("avatar_template").ifBlank { bm.text("post_user_avatar_template") }
 
@@ -249,7 +253,8 @@ class TopicRepository(
                     tags = tags,
                 ),
                 authorUsername = author,
-                avatarUrl = avatarUrlOf(avatar),
+                authorName = authorName,
+                avatarUrl = avatarUrlOf(avatar, animAvatar, size = 64),
                 category = categoryId?.let { known[it] },
                 trustLevel = null,
                 notificationLevel = notificationLevel,
@@ -950,7 +955,8 @@ class TopicRepository(
                 TopicListItem(
                     topic = if (topic.unseen && topic.id in seen) topic.copy(unseen = false) else topic,
                     authorUsername = author?.username,
-                    avatarUrl = avatarUrlOf(author?.avatarTemplate),
+                    authorName = author?.name,
+                    avatarUrl = avatarUrlOf(author?.avatarTemplate, author?.animatedAvatar, size = 64),
                     category = known[topic.categoryId],
                     notificationLevel = notificationLevel,
                 )
@@ -1131,6 +1137,8 @@ class TopicRepository(
             notificationType = resolvedType,
             avatarUrl = avatarUrlOf(
                 notice.text("acting_user_avatar_template").ifBlank { data.text("avatar_template") },
+                notice.text("acting_user_animated_avatar").ifBlank { data.text("animated_avatar") }.ifBlank { null },
+                size = 64,
             ),
             actor = resolvedActor,
             postNumber = resolvedPostNumber,
@@ -1581,7 +1589,8 @@ class TopicRepository(
             TopicListItem(
                 topic = if (topic.unseen && locallyRead) topic.copy(unseen = false) else topic,
                 authorUsername = author?.username ?: topic.lastPosterUsername,
-                avatarUrl = avatarUrlOf(author?.avatarTemplate),
+                authorName = author?.name,
+                avatarUrl = avatarUrlOf(author?.avatarTemplate, author?.animatedAvatar, size = 64),
                 category = topic.categoryId?.let { known[it] },
                 trustLevel = author?.trustLevel,
                 notificationLevel = notificationLevel,

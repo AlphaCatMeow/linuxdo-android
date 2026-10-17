@@ -976,7 +976,7 @@ fun PinnedGroupCard(
                 )
                 Spacer(Modifier.width(6.dp))
                 Text(
-                    text = head.authorUsername ?: "匿名",
+                    text = head.displayName.ifBlank { "匿名" },
                     style = IosTheme.type.footnote,
                     color = IosTheme.colors.secondaryLabel,
                     maxLines = 1,
@@ -1144,7 +1144,7 @@ fun TopicRow(
                 )
                 Spacer(Modifier.width(6.dp))
                 Text(
-                    text = item.authorUsername ?: "匿名",
+                    text = item.displayName.ifBlank { "匿名" },
                     style = IosTheme.type.footnote,
                     color = IosTheme.colors.secondaryLabel,
                     maxLines = 1,
