@@ -5,9 +5,8 @@
 > **直连免梯 · 长效不掉盾 · 本地消息推送 · 极致丝滑**  
 > 告别浏览器频繁弹盾与梯子节点断连，享受纯正的原生刷帖体验！
 
-<p align="center">
-  <img src="./assets/1015.jpg" alt="LinuxDo 原生安卓新版宣传漫画" width="100%" />
-</p>
+<img width="1024" height="637" alt="1015" src="https://github.com/user-attachments/assets/b0527b2a-be4e-4567-8a0c-16acbed56e27" />
+
 
 ---
 
