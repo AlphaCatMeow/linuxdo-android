@@ -1394,6 +1394,13 @@ fun SettingsScreen(
     var showNotificationScopeDialog by remember { mutableStateOf(false) }
     var showTestPushLabDialog by remember { mutableStateOf(false) }
 
+    val prefs = remember { context.getSharedPreferences("display_preferences", Context.MODE_PRIVATE) }
+    var devOptionsUnlocked by remember {
+        mutableStateOf(BuildConfig.DEBUG || prefs.getBoolean("dev_options_enabled", false))
+    }
+    var devClickCount by remember { mutableIntStateOf(0) }
+    var lastDevClickTime by remember { mutableStateOf(0L) }
+
     var isBatteryOptimizedIgnored by remember {
         mutableStateOf(NotificationHelper.isIgnoringBatteryOptimizations(context))
     }
@@ -2470,7 +2477,28 @@ fun SettingsScreen(
             Spacer(Modifier.height(20.dp))
             IosGroupCard {
                 // 3.1 版本信息与检查更新 (合并)
-                IosRow(onClick = onCheckUpdate) {
+                IosRow(onClick = {
+                    onCheckUpdate()
+                    if (!BuildConfig.DEBUG) {
+                        val now = System.currentTimeMillis()
+                        if (now - lastDevClickTime > 2000L) {
+                            devClickCount = 1
+                        } else {
+                            devClickCount++
+                        }
+                        lastDevClickTime = now
+                        if (devClickCount >= 7) {
+                            devOptionsUnlocked = !devOptionsUnlocked
+                            prefs.edit().putBoolean("dev_options_enabled", devOptionsUnlocked).apply()
+                            val msg = if (devOptionsUnlocked) "开发者选项已开启" else "开发者选项已隐藏"
+                            Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                            devClickCount = 0
+                        } else if (devClickCount >= 4) {
+                            val remaining = 7 - devClickCount
+                            Toast.makeText(context, "再点击 $remaining 次开启开发者选项", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                }) {
                     SettingIconBadge(bgColor = Color(0xFFE8F3FF)) {
                         SettingInfoIcon(tint = Color(0xFF007AFF))
                     }
@@ -2528,14 +2556,16 @@ fun SettingsScreen(
                     }
                 }
 
-                IosDivider()
+                if (devOptionsUnlocked) {
+                    IosDivider()
 
-                // 3.3 开发者选项与诊断
-                SettingsEntryRow(
-                    title = "开发者选项与诊断",
-                    badgeColor = Color(0xFFF0F0F2),
-                    onClick = onDiagnostics,
-                ) { SettingTerminalIcon(tint = Color(0xFF3A3A3C)) }
+                    // 3.3 开发者选项与诊断
+                    SettingsEntryRow(
+                        title = "开发者选项与诊断",
+                        badgeColor = Color(0xFFF0F0F2),
+                        onClick = onDiagnostics,
+                    ) { SettingTerminalIcon(tint = Color(0xFF3A3A3C)) }
+                }
             }
         }
 

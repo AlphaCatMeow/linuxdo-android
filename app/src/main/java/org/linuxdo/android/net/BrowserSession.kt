@@ -1115,7 +1115,9 @@ class BrowserSession(
         webViewInstance?.let { return it }
 
         // 开启 Chrome 开发者工具远程调试支持（可通过电脑 chrome://inspect 深入审查页面与控制台）
-        WebView.setWebContentsDebuggingEnabled(true)
+        if (BuildConfig.DEBUG) {
+            WebView.setWebContentsDebuggingEnabled(true)
+        }
 
         val webView = WebView(MutableContextWrapper(appContext))
         configureWebView(webView)
