@@ -13,7 +13,7 @@ android {
         applicationId = "org.linuxdo.android"
         minSdk = 26
         targetSdk = 36
-        versionCode = 12
+        versionCode = 13
         versionName = "1.3.0"
         ndk { abiFilters += "arm64-v8a" }
     }
