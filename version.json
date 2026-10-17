@@ -1,5 +1,5 @@
 {
-  "versionCode": 13,
+  "versionCode": 12,
   "versionName": "1.3.0",
   "forceUpdate": false,
   "minVersionCode": 1,
@@ -13,7 +13,7 @@
     "6、新增应用内 APK 流式下载与自动安装更新、草稿箱同步及多项性能优化"
   ],
   "apkUrl": "https://github.com/xuemk/linuxdo-android/releases/download/v1.3.0/linuxdo-1.3.0-release.apk",
-  "apkSha256": "1196684c996fdc16dc2c2c44785cd7c4084af421e6867f26f6e4b47e63d9be8f"
+  "apkSha256": "f7a3ab02cc85745c8e0ca609ec1a3d0c099d8b2571fc30c6a59c18dca6622c13"
 }
 
 
