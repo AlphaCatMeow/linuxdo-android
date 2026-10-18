@@ -1377,6 +1377,8 @@ fun SettingsScreen(
     onDohServerSelected: (DohServer) -> Unit = {},
     dohAutoFailover: Boolean = true,
     onDohAutoFailover: (Boolean) -> Unit = {},
+    dohAutoOptimize: Boolean = true,
+    onDohAutoOptimize: (Boolean) -> Unit = {},
     dohLatencies: Map<String, Long?> = emptyMap(),
     dohSummaries: Map<String, String> = emptyMap(),
     isTestingAllDoh: Boolean = false,
@@ -2110,6 +2112,25 @@ fun SettingsScreen(
                             modifier = Modifier.weight(1f),
                         )
                         IosSwitch(checked = dohAutoFailover, onCheckedChange = onDohAutoFailover)
+                    }
+
+                    IosDivider()
+
+                    // 智能定时测速切优
+                    IosRow(onClick = {}) {
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                "智能定时测速切优",
+                                style = IosTheme.type.body,
+                            )
+                            Text(
+                                "每 10 分钟自动监测各节点延迟，智能切换至最快健康节点",
+                                style = IosTheme.type.footnote,
+                                color = IosTheme.colors.secondaryLabel,
+                                modifier = Modifier.padding(top = 2.dp),
+                            )
+                        }
+                        IosSwitch(checked = dohAutoOptimize, onCheckedChange = onDohAutoOptimize)
                     }
 
                     IosDivider()

@@ -356,12 +356,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var autoJob: Job? = null
     private var verifying = false
     private var resumeAfterVerification: (() -> Unit)? = null
-    /**
-     * 邮件登录被 CF 拦下、待重放的 token。
-     * 与 resumeAfterVerification 分开是因为两者通过验证后的处理不同:
-     * 重放登录要自己收尾(boot 或回登录页),而不是交给 boot() 去恢复一个页面加载。
-     */
-    private var pendingEmailLoginToken: String? = null
     private val loadingFeeds = java.util.concurrent.ConcurrentHashMap.newKeySet<HomeFeedType>()
     private var searchJob: Job? = null
     private var unreadJob: Job? = null
@@ -507,6 +501,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         store.setDohAutoFailoverEnabled(enabled)
         _dohAutoFailover.value = enabled
         container.dohCoordinator.refresh()
+    }
+
+    private val _dohAutoOptimize = MutableStateFlow(store.isDohAutoOptimizeEnabled())
+    val dohAutoOptimize = _dohAutoOptimize.asStateFlow()
+
+    fun setDohAutoOptimize(enabled: Boolean) {
+        store.setDohAutoOptimizeEnabled(enabled)
+        _dohAutoOptimize.value = enabled
+        container.dohCoordinator.setAutoOptimizeEnabled(enabled)
     }
 
     fun testDohServer(server: org.linuxdo.android.net.DohServer) {
@@ -1292,59 +1295,110 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         openWebLoginModal(login, password, secondFactorToken, secondFactorMethod, rememberPassword)
     }
 
-    /** 发送邮箱一次性登录链接。 */
+    /**
+     * 发送邮箱一次性登录链接。
+     *
+     * 与账号密码登录完全同构：**不先走原生 OkHttp**。站点的邮件接口在触发人机验证时
+     * 返回裸 403，原生栈无法回答，而且 CF 拦截时还要先耗满 20 秒超时；直接进入
+     * 内联认证 WebView，由页面内 JS 依次完成 CSRF → hCaptcha → CF → 发信。
+     */
     fun sendLoginEmail(email: String) {
         if (_loginUiState.value.sendingCode || _loginUiState.value.showWebLoginDialog) return
-        loginJob?.cancel()
-        loginJob = viewModelScope.launch {
-            _loginUiState.update { it.copy(sendingCode = true, error = null, emailSent = false) }
-            try {
-                repository.sendEmailLogin(email)
-                if (!isActive) return@launch
-                _loginUiState.update { it.copy(sendingCode = false, emailSent = true) }
-            } catch (error: CancellationException) {
-                throw error
-            } catch (error: NeedsInteractiveVerification) {
-                if (!isActive) return@launch
-                _loginUiState.update {
-                    it.copy(
-                        sendingCode = false,
-                        error = "发送邮件触发了人机安全验证，需在安全验证页面完成验证。",
-                        isRiskOrCaptchaBlocked = true,
-                    )
-                }
-            } catch (error: RiskControlException) {
-                if (!isActive) return@launch
-                diagnostics.log("发送邮件触发 403 风控: ${error.message}")
-                _loginUiState.update {
-                    it.copy(
-                        sendingCode = false,
-                        showRiskControlDialog = true,
-                        error = null,
-                    )
-                }
-            } catch (error: NetworkTimeoutException) {
-                if (!isActive) return@launch
-                _loginUiState.update { it.copy(sendingCode = false, error = "发送请求超时 (20s)，请检查网络连接。") }
-            } catch (error: HttpStatusException) {
-                if (!isActive) return@launch
-                val isCaptcha = (error.status == 403 && (error.message?.contains("invalid_access") == true || error.message?.contains("captcha", ignoreCase = true) == true)) || error.message?.contains("人机") == true
-                _loginUiState.update {
-                    it.copy(
-                        sendingCode = false,
-                        error = if (isCaptcha) "发送邮件触发了站点安全验证，需在安全验证页面完成验证。" else "发送失败 (${error.message})",
-                        isRiskOrCaptchaBlocked = isCaptcha,
-                    )
-                }
-            } catch (error: Exception) {
-                if (!isActive) return@launch
-                _loginUiState.update { it.copy(sendingCode = false, error = error.message ?: "发送失败，请稍后重试。") }
-            }
+        if (email.isBlank()) {
+            _loginUiState.update { it.copy(error = "请输入邮箱") }
+            return
         }
+        loginJob?.cancel()
+        loginJob = null
+        diagnostics.log("转入内联安全认证会话发送登录邮件")
+        _loginUiState.update { it.copy(sendingCode = false, emailSent = false, error = null) }
+        openEmailSendModal(email)
     }
 
     /**
-     * 用用户从邮件链接中复制的 token 完成登录（支持 2FA 两步验证）。
+     * 在内联认证 WebView 里发送登录邮件：与账号密码登录共用同一套
+     * CSRF → hCaptcha → CF 挑战 → 提交 的时序，只是最后一步调用 /u/email-login.json。
+     */
+    private fun openEmailSendModal(email: String) {
+        _loginUiState.update {
+            it.copy(showWebLoginDialog = true, sendingCode = false, error = null)
+        }
+        val onResult: (Boolean, String?, Boolean) -> Unit = { success, errorMsg, _ ->
+            viewModelScope.launch {
+                _loginUiState.update {
+                    it.copy(
+                        showWebLoginDialog = false,
+                        sendingCode = false,
+                        emailSent = success,
+                        error = if (success) null else (errorMsg ?: "登录邮件发送失败，请重试。"),
+                    )
+                }
+                if (success) diagnostics.log("登录邮件已发送（内联安全认证链路）")
+            }
+        }
+        browser.loadCaptchaLogin(
+            login = email,
+            password = "",
+            isDark = isDarkMode(),
+            emailSendTo = email,
+            onResult = onResult,
+        )
+    }
+
+    /**
+     * 兑换失败时改由认证 WebView 整页打开邮件登录链接（对齐 Fluxdo）：
+     * 真实浏览器指纹 + 站点自己的验证页，往往能直接种下 _t。
+     */
+    private fun openEmailLinkModal(token: String) {
+        val url = "${Config.BASE_URL}/session/email-login/$token"
+        _loginUiState.update { it.copy(showWebLoginDialog = true, loading = false, error = null) }
+        val onResult: (Boolean, String?, Boolean) -> Unit = { success, errorMsg, _ ->
+            viewModelScope.launch {
+                if (success) {
+                    diagnostics.log("邮件登录链接已在应用内完成兑换")
+                    _loginUiState.update { LoginUiState() }
+                    _state.update { it.copy(screen = Screen.List) }
+                    boot()
+                } else {
+                    _loginUiState.update {
+                        it.copy(
+                            showWebLoginDialog = false,
+                            loading = false,
+                            error = errorMsg ?: "登录链接打开后仍未完成登录，请重试或重新获取验证码。",
+                        )
+                    }
+                }
+            }
+        }
+        browser.loadEmailLinkLogin(url = url, isDark = isDarkMode(), onResult = onResult)
+    }
+
+    /**
+     * 从用户粘贴的内容里取出邮件登录 token。
+     *
+     * 用户多半是直接复制邮件里的整条链接，形如
+     * `https://linux.do/session/email-login/<token>`（可能带查询串或末尾斜杠）。
+     * 与其要求用户自己截取最后一段，不如这里统一解析：含标记就取标记之后的部分，
+     * 否则按原样当作 token——保留旧的手工粘贴习惯。
+     */
+    private fun extractEmailLoginToken(raw: String): String {
+        val text = raw.trim()
+        if (text.isEmpty()) return ""
+        val marker = "/session/email-login/"
+        if (!text.contains(marker)) return text
+        return text.substringAfterLast(marker)
+            .substringBefore('?')
+            .substringBefore('#')
+            .trim()
+            .trim('/')
+    }
+
+    /**
+     * 用邮件里的 token 完成登录。
+     *
+     * 与账号密码登录同构：不在原生 OkHttp 里硬扛站点的 CF/hCaptcha 拦截
+     * （那样只会耗满 20 秒超时再报错），而是让认证 WebView 整页打开完整链接，
+     * 由站点自己的页面完成验证并种下 _t。用户粘贴完整链接也能用。
      */
     fun loginWithEmailCode(
         email: String,
@@ -1353,111 +1407,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         secondFactorMethod: Int = 1,
     ) {
         if (_loginUiState.value.loading || _loginUiState.value.showWebLoginDialog) return
-        val sanitizedToken = token.trim()
+        val sanitizedToken = extractEmailLoginToken(token)
+        if (sanitizedToken.isBlank()) {
+            _loginUiState.update { it.copy(loading = false, error = "请输入邮件链接中的 token") }
+            return
+        }
+        if (!sanitizedToken.matches(Regex("^[0-9a-fA-F]+$"))) {
+            _loginUiState.update { it.copy(loading = false, error = "登录链接里的 token 格式不正确，请重新复制完整链接") }
+            return
+        }
         loginJob?.cancel()
-        loginJob = viewModelScope.launch {
-            _loginUiState.update { it.copy(loading = true, error = null) }
-            try {
-                if (sanitizedToken.isBlank()) {
-                    _loginUiState.update { it.copy(loading = false, error = "请输入邮件链接中的 token") }
-                    return@launch
-                }
-                repository.emailLoginWithToken(sanitizedToken, secondFactorToken, secondFactorMethod)
-                if (!isActive) return@launch
-                diagnostics.log("邮件 token 登录成功,复核会话")
-                _loginUiState.update { LoginUiState() }
-                boot()
-            } catch (error: CancellationException) {
-                throw error
-            } catch (error: SecondFactorRequiredException) {
-                if (!isActive) return@launch
-                _loginUiState.update {
-                    it.copy(
-                        loading = false,
-                        secondFactorRequired = true,
-                        backupEnabled = error.backupEnabled,
-                        error = null,
-                    )
-                }
-            } catch (error: NeedsInteractiveVerification) {
-                if (!isActive) return@launch
-                _loginUiState.update {
-                    it.copy(
-                        loading = false,
-                        error = "验证请求触发了安全验证，需在安全验证页面完成验证。",
-                        isRiskOrCaptchaBlocked = true,
-                    )
-                }
-            } catch (error: RiskControlException) {
-                if (!isActive) return@launch
-                diagnostics.log("邮件登录触发 403 风控: ${error.message}")
-                _loginUiState.update {
-                    it.copy(
-                        loading = false,
-                        showRiskControlDialog = true,
-                        error = null,
-                    )
-                }
-            } catch (error: NetworkTimeoutException) {
-                if (!isActive) return@launch
-                _loginUiState.update { it.copy(loading = false, error = "验证请求超时 (20s)，请检查当前代理节点。") }
-            } catch (error: LoginRejectedException) {
-                if (!isActive) return@launch
-                _loginUiState.update { it.copy(loading = false, error = error.message ?: "登录链接无效或已过期。") }
-            } catch (error: HttpStatusException) {
-                if (!isActive) return@launch
-                val isCaptcha = (error.status == 403 && (error.message?.contains("invalid_access") == true || error.message?.contains("captcha", ignoreCase = true) == true)) || error.message?.contains("人机") == true
-                _loginUiState.update {
-                    it.copy(
-                        loading = false,
-                        error = if (isCaptcha) "验证请求触发了安全验证，需在安全验证页面完成验证。" else "服务器响应异常 (${error.message})",
-                        isRiskOrCaptchaBlocked = isCaptcha,
-                    )
-                }
-            } catch (error: Exception) {
-                if (!isActive) return@launch
-                _loginUiState.update { it.copy(loading = false, error = error.message ?: "登录失败，请检查 token 是否正确。") }
-            }
-        }
-    }
-
-    /** CF 验证通过后重放被拦下的邮件登录。 */
-    private fun retryEmailLogin(sanitizedToken: String) {
-        viewModelScope.launch {
-            _loginUiState.update { it.copy(loading = true, error = null) }
-            try {
-                repository.emailLoginWithToken(sanitizedToken)
-                _loginUiState.update { LoginUiState() }
-                boot()
-            } catch (error: CancellationException) {
-                throw error
-            } catch (error: SecondFactorRequiredException) {
-                _loginUiState.update {
-                    it.copy(
-                        loading = false,
-                        secondFactorRequired = true,
-                        backupEnabled = error.backupEnabled,
-                        error = null,
-                    )
-                }
-                _state.update { it.copy(screen = Screen.Login) }
-            } catch (error: RiskControlException) {
-                diagnostics.log("重试邮件登录遇到 403 风控: ${error.message}")
-                _loginUiState.update {
-                    it.copy(
-                        loading = false,
-                        showRiskControlDialog = true,
-                        error = null,
-                    )
-                }
-                _state.update { it.copy(screen = Screen.Login) }
-            } catch (error: Exception) {
-                _loginUiState.update {
-                    it.copy(loading = false, error = error.message ?: "登录失败，请重新获取验证码。")
-                }
-                _state.update { it.copy(screen = Screen.Login) }
-            }
-        }
+        loginJob = null
+        diagnostics.log("转入认证 WebView 整页打开邮件登录链接")
+        _loginUiState.update { it.copy(loading = false, error = null) }
+        openEmailLinkModal(sanitizedToken)
     }
 
     fun dismissRiskControlDialog() {
@@ -3924,6 +3887,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             NotificationWorker.enqueue(app)
         }
         syncKeepAliveService()
+        container.dohCoordinator.onLatenciesUpdated = { latencies: Map<String, Long?>, summaries: Map<String, String>, selectedUrl: String ->
+            _dohLatencies.value = latencies
+            _dohSummaries.value = summaries
+            _selectedDohServerUrl.value = selectedUrl
+        }
         boot()
         restartAutoProbeLoop()
         checkForUpdates(manual = false)
@@ -4152,13 +4120,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val hasSession = cookies.containsKey(Config.SESSION_COOKIE)
         when (_state.value.screen) {
             Screen.Verify -> when {
-                pendingEmailLoginToken != null -> {
-                    val token = pendingEmailLoginToken ?: return
-                    verifying = true
-                    pendingEmailLoginToken = null
-                    diagnostics.log("安全验证完成,重放邮件登录")
-                    retryEmailLogin(token)
-                }
                 resumeAfterVerification != null -> {
                     verifying = true
                     val resume = resumeAfterVerification
@@ -4212,7 +4173,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         pendingVisiblePostsByTopic.clear()
         currentVisiblePostsByTopic.clear()
         resumeAfterVerification = null
-        pendingEmailLoginToken = null
         container.preferences.edit { remove("cached_username") }
         _details.value = emptyMap()
         _categories.value = CategoriesUiState()

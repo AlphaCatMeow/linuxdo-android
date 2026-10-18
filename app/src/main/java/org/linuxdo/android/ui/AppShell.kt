@@ -348,6 +348,7 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
     val dohServers by viewModel.dohServers.collectAsStateWithLifecycle()
     val selectedDohServerUrl by viewModel.selectedDohServerUrl.collectAsStateWithLifecycle()
     val dohAutoFailover by viewModel.dohAutoFailover.collectAsStateWithLifecycle()
+    val dohAutoOptimize by viewModel.dohAutoOptimize.collectAsStateWithLifecycle()
     val dohLatencies by viewModel.dohLatencies.collectAsStateWithLifecycle()
     val dohSummaries by viewModel.dohSummaries.collectAsStateWithLifecycle()
     val isTestingAllDoh by viewModel.isTestingAllDoh.collectAsStateWithLifecycle()
@@ -692,6 +693,8 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                 onDohServerSelected = viewModel::setDohServerSelected,
                                 dohAutoFailover = dohAutoFailover,
                                 onDohAutoFailover = viewModel::setDohAutoFailover,
+                                dohAutoOptimize = dohAutoOptimize,
+                                onDohAutoOptimize = viewModel::setDohAutoOptimize,
                                 dohLatencies = dohLatencies,
                                 dohSummaries = dohSummaries,
                                 isTestingAllDoh = isTestingAllDoh,

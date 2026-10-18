@@ -74,6 +74,13 @@ class BrowserSession(
     private var onAuthCallback: ((success: Boolean, errorMsg: String?, need2FA: Boolean) -> Unit)? = null
     private var cachedLogin: String = ""
     private var cachedPassword: String = ""
+    /** 非空表示当前内联页处于"发送登录邮件"模式，值为目标邮箱。 */
+    private var cachedEmailSend: String? = null
+    /** 非空表示认证 WebView 正在整页打开邮件登录链接（Fluxdo 同款兑换方式）。 */
+    private var pendingEmailLink: String? = null
+    private var emailLinkCompleting: Boolean = false
+    /** 首个 onPageFinished 往往早于 Cookie 落盘，剩余复查次数。 */
+    private var emailLinkRechecksRemaining: Int = 0
     private var cachedSecondFactor: String? = null
     private var isDarkCached: Boolean = false
     private var isInCfMode: Boolean = false
@@ -101,6 +108,7 @@ class BrowserSession(
         awaitingSecondFactorLogin = false
         pendingAuthHtml = null
         authHtmlInjected = false
+        cachedEmailSend = null
         dismissCfDialog()
         onAuthCallback = null
     }
@@ -200,7 +208,7 @@ class BrowserSession(
                     }
                     "hcaptcha" -> {
                         hcaptchaTempReady = false
-                        if (retryingLoginWithHcaptchaToken) {
+                        if (retryingLoginWithHcaptchaToken || cachedEmailSend != null) {
                             // 令牌可能在用户完成 CF 的过程中到期；回退到可见 hCaptcha，
                             // 不能把已经通过的 CF 也当作失败。
                             retryingLoginWithHcaptchaToken = false
@@ -214,6 +222,7 @@ class BrowserSession(
                                     secondFactorMethod = cachedSecondFactorMethod,
                                     isDark = isDarkCached,
                                     resetCfRetry = false,
+                                    emailSendTo = cachedEmailSend,
                                     onResult = cb,
                                 )
                             }
@@ -221,6 +230,11 @@ class BrowserSession(
                             awaitingSecondFactorLogin = false
                             cb(false, "人机验证未通过，请重试", false)
                         }
+                    }
+                    "email_sent" -> {
+                        diagnostics.log("登录邮件已通过内联安全验证发送")
+                        awaitingSecondFactorLogin = false
+                        cb(true, null, false)
                     }
                     "exception" -> cb(false, "网络请求异常: $body", false)
                     else -> cb(false, "未知异常 ($phase)", false)
@@ -578,6 +592,7 @@ class BrowserSession(
                     secondFactorMethod = cachedSecondFactorMethod,
                     isDark = isDarkCached,
                     resetCfRetry = false,
+                    emailSendTo = cachedEmailSend,
                     onResult = onAuthCallback ?: { _, _, _ -> },
                 )
             }
@@ -649,6 +664,8 @@ class BrowserSession(
         secondFactorMethod: Int = 1,
         isDark: Boolean = false,
         resetCfRetry: Boolean = true,
+        /** 非空时切换为"发送登录邮件"模式：同一套 hCaptcha/CF 机制，提交的是 /u/email-login.json。 */
+        emailSendTo: String? = null,
         onResult: (success: Boolean, errorMsg: String?, need2FA: Boolean) -> Unit,
     ) {
         onAuthCallback = onResult
@@ -656,6 +673,7 @@ class BrowserSession(
         cachedPassword = password
         cachedSecondFactor = secondFactorToken
         cachedSecondFactorMethod = secondFactorMethod
+        cachedEmailSend = emailSendTo
         isDarkCached = isDark
         isInCfMode = false
         hcaptchaTempReady = false
@@ -668,6 +686,8 @@ class BrowserSession(
 
         val uJson = JSONObject.quote(login)
         val pJson = JSONObject.quote(password)
+        val emailJson = JSONObject.quote(emailSendTo.orEmpty())
+        val emailMode = !emailSendTo.isNullOrBlank()
         val sfJson = if (!secondFactorToken.isNullOrBlank()) JSONObject.quote(secondFactorToken) else "null"
         val sfMethodJson = JSONObject.quote(secondFactorMethod.toString())
         val bgBadge = if (isDark) "rgba(10, 132, 255, 0.22)" else "rgba(0, 122, 255, 0.12)"
@@ -721,7 +741,7 @@ class BrowserSession(
             <body>
               <div id="main-content" class="wrap">
                 <div class="badge">🛡️</div>
-                <p class="tip">勾选下方方框，确认你不是机器人即可继续登录</p>
+                <p class="tip">${if (emailMode) "勾选下方方框，确认你不是机器人即可发送登录邮件" else "勾选下方方框，确认你不是机器人即可继续登录"}</p>
                 <div id="cap" class="h-captcha"
                   data-sitekey="a776b4ac-8c4c-441e-986a-c6ee9ed8cf08"
                   data-callback="onPass"
@@ -889,7 +909,131 @@ class BrowserSession(
                     callBridge('onAuthResult', JSON.stringify({ phase: 'exception', status: 0, body: String(e) }));
                   }
                 }
-                window.__linuxdoRunLogin = runLogin;
+                /**
+                 * 发信模式：与 runLogin 共用同一套 CSRF / hCaptcha 兑换 / CF 挑战时序，
+                 * 只把最后一步换成 POST /u/email-login.json。
+                 * 站点的邮件接口在触发人机验证时返回 403 invalid_access ——
+                 * 换到 h_captcha_temp_id 后再提交才会被放行。
+                 */
+                async function runEmailSend(hcaptchaToken) {
+                  var email = $emailJson;
+
+                  function isCloudflareChallenge(response, text) {
+                    var mitigated = (response.headers.get('cf-mitigated') || '').toLowerCase();
+                    var body = (text || '').toLowerCase();
+                    return (response.status === 403 || response.status === 429) && (
+                      mitigated === 'challenge' ||
+                      body.indexOf('just a moment') !== -1 ||
+                      body.indexOf('challenge-platform') !== -1 ||
+                      body.indexOf('cf-chl-') !== -1 ||
+                      body.indexOf('cf-mitigated') !== -1
+                    );
+                  }
+
+                  try {
+                    var c = await fetch('/session/csrf', {
+                      method: 'GET',
+                      headers: { 'X-Requested-With': 'XMLHttpRequest', 'Accept': 'application/json' },
+                      credentials: 'include',
+                      cache: 'no-store'
+                    });
+                    if (c.status !== 200) {
+                      var cBody = await c.text();
+                      var isCf = isCloudflareChallenge(c, cBody);
+                      callBridge('onAuthResult', JSON.stringify({
+                        phase: isCf ? 'cf_needed' : 'csrf',
+                        status: c.status,
+                        body: cBody,
+                        hcaptchaToken: isCf ? hcaptchaToken : null
+                      }));
+                      return;
+                    }
+                    var csrf = (await c.json()).csrf;
+
+                    // 勾选后先换 h_captcha_temp_id（cookie 由内核自动带上）。
+                    if (hcaptchaToken) {
+                      var endpoints = ['/captcha/hcaptcha/create.json', '/hcaptcha/create.json'];
+                      var hOk = false;
+                      var hLast = null;
+                      for (var i = 0; i < endpoints.length; i++) {
+                        var ep = endpoints[i];
+                        try {
+                          var h = await fetch(ep, {
+                            method: 'POST',
+                            credentials: 'include',
+                            headers: {
+                              'Content-Type': 'application/x-www-form-urlencoded',
+                              'X-CSRF-Token': csrf,
+                              'X-Requested-With': 'XMLHttpRequest'
+                            },
+                            body: 'token=' + encodeURIComponent(hcaptchaToken)
+                          });
+                          var hText = await h.text();
+                          if (isCloudflareChallenge(h, hText)) {
+                            callBridge('onAuthResult', JSON.stringify({
+                              phase: 'cf_needed',
+                              status: h.status,
+                              body: hText,
+                              hcaptchaToken: hcaptchaToken,
+                              captchaAccepted: false
+                            }));
+                            return;
+                          }
+                          hLast = { endpoint: ep, status: h.status, body: hText };
+                          if (h.status === 200) { hOk = true; break; }
+                          if (h.status !== 404) break;
+                        } catch (e) {
+                          hLast = { endpoint: ep, status: 0, body: String(e) };
+                        }
+                      }
+                      if (!hOk) {
+                        callBridge('onAuthResult', JSON.stringify({
+                          phase: 'hcaptcha',
+                          status: hLast ? hLast.status : 0,
+                          body: JSON.stringify(hLast)
+                        }));
+                        return;
+                      }
+                    }
+
+                    // 最后一个参数不传时站点默认发"登录链接"邮件。
+                    var r = await fetch('/u/email-login.json', {
+                      method: 'POST',
+                      credentials: 'include',
+                      headers: {
+                        'Content-Type': 'application/json',
+                        'X-CSRF-Token': csrf,
+                        'X-Requested-With': 'XMLHttpRequest',
+                        'Accept': 'application/json'
+                      },
+                      body: JSON.stringify({ login: email })
+                    });
+                    var rText = await r.text();
+                    if (isCloudflareChallenge(r, rText)) {
+                      callBridge('onAuthResult', JSON.stringify({
+                        phase: 'cf_needed',
+                        status: r.status,
+                        body: rText,
+                        hcaptchaToken: hcaptchaToken,
+                        captchaAccepted: false
+                      }));
+                      return;
+                    }
+                    if (r.status === 403) {
+                      // 站内人机验证未通过：让页面重新渲染一次勾选框。
+                      callBridge('onAuthResult', JSON.stringify({ phase: 'hcaptcha', status: r.status, body: rText }));
+                      return;
+                    }
+                    if (r.status !== 200) {
+                      callBridge('onAuthResult', JSON.stringify({ phase: 'exception', status: r.status, body: rText }));
+                      return;
+                    }
+                    callBridge('onAuthResult', JSON.stringify({ phase: 'email_sent', status: r.status, body: rText }));
+                  } catch (e) {
+                    callBridge('onAuthResult', JSON.stringify({ phase: 'exception', status: 0, body: String(e) }));
+                  }
+                }
+                window.__linuxdoRunLogin = ${if (emailMode) "runEmailSend" else "runLogin"};
                 window.__linuxdoShowSubmitting = showSubmitting;
               </script>
               <script src="https://js.hcaptcha.com/1/api.js" async defer></script>
@@ -900,7 +1044,71 @@ class BrowserSession(
         // 调用时 WebView 已长期挂在 AppShell 中且处于主线程。直接导航能避开弹窗
         // 切换期间 View.post 回调被旧父容器丢弃的问题。
         pendingAuthHtml = html
+        pendingEmailLink = null
         authWebView?.let { loadAuthHtml(it, html) }
+    }
+
+    /**
+     * 邮件链接兑换：对齐 Fluxdo 的 WebViewLoginPage —— 不在原生栈里模拟请求，
+     * 而是让认证 WebView 整页打开完整链接，由站点自己完成 CF/人机验证并种下 _t。
+     *
+     * 这是兑换链路的兜底：原生 POST /session/email-login/:token 被站点拦下时，
+     * 整页导航往往还能过（真实浏览器指纹 + 站点自己的验证页）。
+     */
+    fun loadEmailLinkLogin(
+        url: String,
+        isDark: Boolean = false,
+        onResult: (success: Boolean, errorMsg: String?, need2FA: Boolean) -> Unit,
+    ) {
+        onAuthCallback = onResult
+        cachedEmailSend = null
+        isDarkCached = isDark
+        isInCfMode = false
+        pendingAuthHtml = null
+        authHtmlInjected = false
+        pendingEmailLink = url
+        emailLinkCompleting = true
+        emailLinkRechecksRemaining = EMAIL_LINK_RECHECK_TIMES
+        diagnostics.log("改用 WebView 整页打开邮件登录链接: $url")
+        authWebView?.let { view ->
+            view.loadUrl(url)
+        }
+    }
+
+    /**
+     * 整页链接登录的结果判定：只看是否真的落到了会话 Cookie _t。
+     *
+     * 兑换是"导航 → 302 → Set-Cookie → 跳首页"一长串跳转，首个 onPageFinished
+     * 触发时 Cookie 往往还没被内核写进 CookieManager。这里先与 WebView 同步一次，
+     * 没拿到就短间隔复查若干轮，而不是一次判死。
+     */
+    private fun checkEmailLinkLogin(view: WebView, url: String?) {
+        if (!emailLinkCompleting || pendingEmailLink == null) return
+        CookieManager.getInstance().flush()
+        val hasSession = runCatching { store.syncFromWebView().containsKey(Config.SESSION_COOKIE) }
+            .getOrDefault(false)
+        if (hasSession) {
+            emailLinkCompleting = false
+            pendingEmailLink = null
+            diagnostics.log("邮件链接已在 WebView 内完成登录，会话 Cookie 已同步")
+            onAuthCallback?.invoke(true, null, false)
+            return
+        }
+        if (emailLinkRechecksRemaining > 0) {
+            emailLinkRechecksRemaining--
+            view.postDelayed(
+                {
+                    if (emailLinkCompleting && authWebView === view) {
+                        checkEmailLinkLogin(view, url)
+                    }
+                },
+                EMAIL_LINK_RECHECK_INTERVAL_MS,
+            )
+            return
+        }
+        emailLinkCompleting = false
+        diagnostics.log("邮件链接页面已停止跳转但仍无会话 Cookie: ${url.orEmpty()}")
+        onAuthCallback?.invoke(false, "登录链接未能完成登录，请重新获取验证码后重试", false)
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -1052,6 +1260,7 @@ class BrowserSession(
                 CookieManager.getInstance().flush()
                 Log.d(TAG, "登录 onPageFinished: $url")
                 view?.let { maybeInjectAuthHtml(it, url) }
+                view?.let { checkEmailLinkLogin(it, url) }
             }
 
             override fun onReceivedHttpError(
@@ -1078,7 +1287,14 @@ class BrowserSession(
         view.webChromeClient = createLoggingChromeClient("登录")
         view.addJavascriptInterface(Bridge(), BRIDGE_NAME)
         authWebView = view
-        pendingAuthHtml?.let { loadAuthHtml(view, it) }
+        val link = pendingEmailLink
+        if (link != null) {
+            // 链接兑换：直接整页导航，等 onPageFinished 判定 _t 是否落地。
+            emailLinkCompleting = true
+            view.loadUrl(link)
+        } else {
+            pendingAuthHtml?.let { loadAuthHtml(view, it) }
+        }
         return view
     }
 
@@ -1347,6 +1563,10 @@ class BrowserSession(
 
         const val CF_SETTLE_DELAY_MS = 1_500L
         const val CF_PROBE_INTERVAL_MS = 750L
+
+        /** 邮件链接兑换时，首个 onPageFinished 之后还要复查几轮 Cookie。 */
+        const val EMAIL_LINK_RECHECK_TIMES = 15
+        const val EMAIL_LINK_RECHECK_INTERVAL_MS = 800L
 
         /** 等 Chromium 把 Set-Cookie 落到 CookieManager 的时间。 */
         const val CF_COOKIE_SETTLE_DELAY_MS = 300L

@@ -36,6 +36,13 @@ class UserApiKeyAuthService(
     private val store: SessionStore,
     private var httpClient: OkHttpClient,
     private val diagnostics: Diagnostics,
+    /**
+     * CSRF 请求被 Cloudflare 拦下时的静默重验证入口。
+     * 网页授权是"外部浏览器授权 → 回到 App 内原生网络栈兑换"两段式，
+     * 浏览器里的 cf_clearance 不会共享给 App，兑换第一次几乎必然撞盾；
+     * 这里交给 WebView 在后台过一次人机验证，成功后再重放一次请求。
+     */
+    private val silentRevalidate: suspend (String) -> Boolean = { false },
 ) {
     /** 动态更新底层的 OkHttpClient（DoH 节点切换或开关变更后调用） */
     fun updateClient(newClient: OkHttpClient) {
@@ -229,12 +236,38 @@ class UserApiKeyAuthService(
     }
 
     /**
-     * 获取 CSRF Token 并同步保存关联会话 Cookie
+     * 获取 CSRF Token 并同步保存关联会话 Cookie。
+     *
+     * 首次失败（多为 Cloudflare 403 挑战）不直接判死：先让 WebView 静默过一次盾，
+     * 拿到新的 cf_clearance 后再重放一次。两次都拿不到才返回 null。
      */
     private suspend fun fetchCsrf(): String? {
+        requestCsrf()?.let { return it }
+
+        val revalidated = runCatching { silentRevalidate("网页授权 CSRF 获取失败") }.getOrDefault(false)
+        if (!revalidated) {
+            diagnostics.log("CSRF 静默重验证未通过，放弃本次网页授权兑换")
+            return null
+        }
+        diagnostics.log("CSRF 静默重验证已完成，重放请求")
+        return requestCsrf()
+    }
+
+    /**
+     * 单次 CSRF 请求。
+     *
+     * 端点是 Discourse 标准的 /session/csrf（不带 .json）：带后缀的地址在无会话 Cookie 时
+     * 更容易被 301/404 或挑战页顶掉，取不到 JSON 体。Headers 与网页端完全一致，
+     * 让服务端按 AJAX 请求处理。
+     */
+    private suspend fun requestCsrf(): String? {
+        // OkHttp 侧读的是加密存储里的 Cookie 快照，必须先与 WebView 现场对齐，
+        // 否则刚在静默重验证里拿到的 cf_clearance 根本带不上。
+        withContext(Dispatchers.Main) { store.syncFromWebView() }
+
         val request = Request.Builder()
-            .url("${Config.BASE_URL}/session/csrf.json")
-            .header("Accept", "application/json")
+            .url("${Config.BASE_URL}/session/csrf")
+            .header("Accept", "application/json, text/javascript, */*; q=0.01")
             .header("X-Requested-With", "XMLHttpRequest")
             .build()
 
@@ -247,8 +280,15 @@ class UserApiKeyAuthService(
                     }
                 }
                 val body = resp.body?.string().orEmpty()
-                val obj = json.parseToJsonElement(body).jsonObject
-                obj["csrf"]?.jsonPrimitive?.contentOrNull
+                if (!resp.isSuccessful) {
+                    diagnostics.log(
+                        "CSRF 请求失败: HTTP ${resp.code} " +
+                            "cf-mitigated=${resp.header("cf-mitigated") ?: "-"} " +
+                            "body=${body.take(120)}",
+                    )
+                    return@use null
+                }
+                json.parseToJsonElement(body).jsonObject["csrf"]?.jsonPrimitive?.contentOrNull
             }
         }.getOrNull()
     }

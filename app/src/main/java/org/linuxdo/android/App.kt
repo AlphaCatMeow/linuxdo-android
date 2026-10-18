@@ -121,7 +121,14 @@ class AppContainer(context: Context) {
     val httpClient: okhttp3.OkHttpClient
         get() = dohCoordinator.currentClient
 
-    val userApiKeyAuthService: UserApiKeyAuthService = UserApiKeyAuthService(sessionStore, dohCoordinator.currentClient, diagnostics)
+    val userApiKeyAuthService: UserApiKeyAuthService = UserApiKeyAuthService(
+        sessionStore,
+        dohCoordinator.currentClient,
+        diagnostics,
+        // 网页授权兑换发生在 App 内的原生网络栈，外部浏览器里的 cf_clearance 带不过来。
+        // 撞盾时复用共享 WebView 静默过一次，比直接抛"获取 CSRF 失败"可靠得多。
+        silentRevalidate = { reason -> browser.clearChallenge(reason) },
+    )
 
     val imageLoader: ImageLoader = ImageLoader.Builder(context)
         .callFactory(dynamicCallFactory)

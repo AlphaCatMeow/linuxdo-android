@@ -311,10 +311,17 @@ fun TopicDetailScreen(
     val showOrderBar = opPinned && (bodyRows.isNotEmpty() || replyTotal > 0)
     val topErrorCount = if (showTopError && state.error != null) 1 else 0
 
+    // 1 楼（主帖）是话题的起点，物理上其上方绝无更早的可见楼层。
+    // 若列表中已包含 1 楼，前序残留的 previousIds 仅为服务端历史流水中的被删帖或系统幽灵 ID。
+    // 此时坚决收口关闭前序缺口，彻底避免因占位反复插入与重排引发的楼层横跳。
+    // 从后序楼层跳进来且未加载到 1 楼时，hasHeadPost 为 false，缺口仍正常展示供向上回溯加载。
+    val hasHeadPost = rows.any { it.post.postNumber == 1 }
+    val showPreviousGap = state.previousIds.isNotEmpty() && !hasHeadPost
+
     fun lazyIndexOf(rowIndex: Int): Int {
         val afterHead = rowIndex >= headRows.size
         val orderBarBefore = if (showOrderBar && afterHead) 1 else 0
-        val gapBefore = if (state.previousIds.isNotEmpty() && afterHead) 1 else 0
+        val gapBefore = if (showPreviousGap && afterHead) 1 else 0
         return 1 + topErrorCount + orderBarBefore + gapBefore + rowIndex
     }
 
@@ -373,7 +380,9 @@ fun TopicDetailScreen(
     var upwardAnchor by remember { mutableStateOf<Pair<Long, Int>?>(null) }
     var upwardPrevRowCount by remember { mutableIntStateOf(0) }
     val triggerLoadPrevious = {
-        if (!state.loading && state.previousIds.isNotEmpty()) {
+        // 已包含 1 楼时不存在"更早的可见楼层"，前序仅剩被删除/占位的幽灵 id。
+        // 再触发只会让列表围绕锚点重排，产生顶部反复跳动。
+        if (!hasHeadPost && !state.loading && state.previousIds.isNotEmpty()) {
             val firstPostId = rows.firstOrNull { it.post.postNumber == 1 }?.post?.id
             val anchorItem = list.layoutInfo.visibleItemsInfo.firstOrNull { info ->
                 val key = info.key as? Long ?: return@firstOrNull false
@@ -396,8 +405,9 @@ fun TopicDetailScreen(
             upwardAnchor = null
         }
     }
-    val nearGapFromBelow by remember(rows, state.previousIds.size) {
+    val nearGapFromBelow by remember(rows, state.previousIds.size, showPreviousGap) {
         derivedStateOf {
+            if (!showPreviousGap) return@derivedStateOf false
             val info = list.layoutInfo.visibleItemsInfo
             val hasGap = info.any { it.key == "load-previous" }
             val firstPostId = rows.firstOrNull { it.post.postNumber == 1 }?.post?.id
@@ -406,7 +416,7 @@ fun TopicDetailScreen(
         }
     }
     LaunchedEffect(active, nearGapFromBelow, state.loading, state.previousIds.size, state.error) {
-        if (active && nearGapFromBelow && !state.loading && state.error == null && state.previousIds.isNotEmpty()) {
+        if (active && nearGapFromBelow && showPreviousGap && !state.loading && state.error == null && state.previousIds.isNotEmpty()) {
             triggerLoadPrevious()
         }
     }
@@ -761,7 +771,7 @@ fun TopicDetailScreen(
                                     onToggle = onToggleOrder,
                                 )
                             }
-                            if (state.previousIds.isNotEmpty()) item("load-previous") {
+                            if (showPreviousGap) item("load-previous") {
                                 PreviousSliceGap(
                                     hiddenCount = state.previousIds.size,
                                     loading = state.loading,

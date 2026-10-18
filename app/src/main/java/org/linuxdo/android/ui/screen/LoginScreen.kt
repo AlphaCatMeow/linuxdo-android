@@ -336,7 +336,7 @@ fun LoginScreen(
                             codeText = it
                             if (state.secondFactorRequired) onResetSecondFactor()
                         },
-                        placeholder = "请输入验证码",
+                        placeholder = "粘贴验证码或完整登录链接",
                         leadingIcon = { ShieldIcon() },
                         modifier = Modifier.weight(1f),
                         keyboardOptions = KeyboardOptions(
@@ -391,7 +391,7 @@ fun LoginScreen(
 
                 // 提示文字
                 Text(
-                    "验证码将通过邮件发送，请查收后输入链接中的 token",
+                    "验证码将通过邮件发送。可直接粘贴邮件里的完整登录链接，或其中 /session/email-login/ 后面的 token",
                     fontSize = 12.sp,
                     color = Color(0xFF9AA5BB),
                     textAlign = TextAlign.Center,
@@ -512,7 +512,7 @@ fun LoginScreen(
         AlertDialog(
             onDismissRequest = onDismissError,
             title = { Text("邮件已发送") },
-            text = { Text("登录邮件已发送至您的邮箱。\n\n请打开邮件，复制链接中 /session/email-login/ 后面的 token 字符串，粘贴到验证码输入框后点击登录。") },
+            text = { Text("登录邮件已发送至您的邮箱。\n\n可打开邮件直接复制整条登录链接，粘贴到验证码输入框后点击登录（也可以只粘贴 /session/email-login/ 后面的 token）。") },
             confirmButton = {
                 TextButton(onClick = onDismissError) { Text("知道了") }
             },
@@ -523,9 +523,12 @@ fun LoginScreen(
     if (state.showRiskControlDialog) {
         AlertDialog(
             onDismissRequest = onDismissRiskControl,
-            title = { Text("L站安全风控提示") },
+            title = { Text("安全验证未通过") },
             text = {
-                Text("检测到当前登录触发 L 站安全风控 (403)，无法直接通过原生表单登录。\n\n请使用网页授权认证完成登录。")
+                Text(
+                    "已尝试在应用内完成人机验证，但站点仍在拦截当前请求。\n\n" +
+                        "可稍后重试，或改用网页授权认证完成登录。",
+                )
             },
             confirmButton = {
                 TextButton(onClick = {

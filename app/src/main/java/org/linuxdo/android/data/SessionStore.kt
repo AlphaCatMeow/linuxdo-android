@@ -521,7 +521,7 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
      */
     override fun getDohServerUrl(): String? = plainPrefs.getString(KEY_DOH_SERVER_URL, null)
 
-    fun setDohServerUrl(url: String?) {
+    override fun setDohServerUrl(url: String?) {
         if (url == null) {
             plainPrefs.edit().remove(KEY_DOH_SERVER_URL).apply()
         } else {
@@ -534,6 +534,13 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
 
     fun setDohAutoFailoverEnabled(enabled: Boolean) {
         plainPrefs.edit().putBoolean(KEY_DOH_AUTO_FAILOVER, enabled).apply()
+    }
+
+    /** 是否开启智能定时低延迟优选与自动切换（默认开启） */
+    override fun isDohAutoOptimizeEnabled(): Boolean = plainPrefs.getBoolean(KEY_DOH_AUTO_OPTIMIZE, true)
+
+    override fun setDohAutoOptimizeEnabled(enabled: Boolean) {
+        plainPrefs.edit().putBoolean(KEY_DOH_AUTO_OPTIMIZE, enabled).apply()
     }
 
     /**
@@ -609,6 +616,7 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
         const val KEY_DOH_ENABLED = "doh_enabled"
         const val KEY_DOH_SERVER_URL = "doh_server_url"
         const val KEY_DOH_AUTO_FAILOVER = "doh_auto_failover"
+        const val KEY_DOH_AUTO_OPTIMIZE = "doh_auto_optimize"
         const val KEY_DOH_SERVERS_JSON = "doh_servers_json"
         const val KEY_DOH_CUSTOM_SERVERS_JSON = "doh_custom_servers_json"
 
