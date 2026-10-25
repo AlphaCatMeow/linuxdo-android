@@ -19,7 +19,18 @@ sealed interface Route : Serializable {
     data class SettingsDetail(val page: SettingsPage) : Route
     data object Notifications : Route
     data class UserTopics(val username: String, val title: String, val isBookmark: Boolean = false) : Route
+    data class UserReplies(val username: String, val title: String = "我的回复", val filter: String = "5") : Route
     data object Drafts : Route
+    data object BrowsingHistory : Route
+    data object Chat : Route
+    data class ChatRoom(val channelId: Long, val title: String) : Route
+    data class FollowList(val username: String) : Route
+    data object Blacklist : Route
+    data class UserProfile(
+        val username: String,
+        val initialAvatarUrl: String? = null,
+        val initialStaticAvatarUrl: String? = null,
+    ) : Route
 }
 
 /** 设置的二级子页。标题同时用作首页品目名与子页导航栏标题。 */

@@ -2,25 +2,35 @@ package org.linuxdo.android.net
 
 import android.net.Uri
 import android.util.Base64
+import java.io.IOException
 import java.security.KeyPairGenerator
 import java.security.PrivateKey
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 import javax.crypto.Cipher
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.contentOrNull
-import okhttp3.Cookie
+import okhttp3.Call
+import okhttp3.Callback
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
 import org.linuxdo.android.Config
 import org.linuxdo.android.data.Diagnostics
 import org.linuxdo.android.data.SessionStore
+import org.linuxdo.android.data.TopicRepository
 
 /**
  * Discourse User API Key 网页授权认证服务。
@@ -39,8 +49,8 @@ class UserApiKeyAuthService(
     /**
      * CSRF 请求被 Cloudflare 拦下时的静默重验证入口。
      * 网页授权是"外部浏览器授权 → 回到 App 内原生网络栈兑换"两段式，
-     * 浏览器里的 cf_clearance 不会共享给 App，兑换第一次几乎必然撞盾；
-     * 这里交给 WebView 在后台过一次人机验证，成功后再重放一次请求。
+     * 浏览器里的 cf_clearance 不会共享给 App；静默验证后最多重试一次，
+     * 仍被挑战则交给界面显示人工验证，验证后重新获取匹配会话的 CSRF。
      */
     private val silentRevalidate: suspend (String) -> Boolean = { false },
 ) {
@@ -51,6 +61,7 @@ class UserApiKeyAuthService(
 
     private var pendingPrivateKey: PrivateKey? = null
     private var pendingNonce: String? = null
+    private var pendingGeneration: Long? = null
 
     private val json = Json { ignoreUnknownKeys = true }
 
@@ -66,6 +77,7 @@ class UserApiKeyAuthService(
         pendingPrivateKey = keyPair.private
         val nonce = UUID.randomUUID().toString()
         pendingNonce = nonce
+        pendingGeneration = store.sessionGeneration
         val clientId = UUID.randomUUID().toString()
 
         val publicKeyBytes = keyPair.public.encoded
@@ -96,17 +108,20 @@ class UserApiKeyAuthService(
     fun cancel() {
         pendingPrivateKey = null
         pendingNonce = null
+        pendingGeneration = null
     }
 
     /**
      * 处理深链回调 discourse://auth_redirect?payload=...&oneTimePassword=...
      */
     suspend fun handleAuthRedirect(uri: Uri) = withContext(Dispatchers.IO) {
-        val (privateKey, expectedNonce) = synchronized(this@UserApiKeyAuthService) {
+        val (privateKey, expectedNonce, generation) = synchronized(this@UserApiKeyAuthService) {
             val key = pendingPrivateKey ?: throw IllegalStateException("未发起过网页授权或授权已过期，请重新尝试")
             val nonce = pendingNonce ?: throw IllegalStateException("授权 nonce 丢失，请重新尝试")
-            key to nonce
+            val generation = pendingGeneration ?: throw IllegalStateException("网页授权已过期，请重新尝试")
+            Triple(key, nonce, generation)
         }
+        checkSession(generation)
 
         val payloadParam = uri.getQueryParameter("payload")
             ?: throw IllegalArgumentException("授权回调缺少 payload 参数")
@@ -141,15 +156,18 @@ class UserApiKeyAuthService(
         diagnostics.log("User API Key 解密成功，正在兑换会话 Cookie")
 
         // 3. 兑换 OTP 为会话 Cookie (_t)
-        redeemOtp(cleanOtp)
+        redeemOtp(cleanOtp, generation)
 
         // 4. 用完即焚：吊销该 User API Key
-        revokeKey(apiKey)
+        revokeKey(apiKey, generation)
 
         // 5. 成功后清除私钥和 nonce
         synchronized(this@UserApiKeyAuthService) {
-            pendingPrivateKey = null
-            pendingNonce = null
+            if (pendingNonce == expectedNonce) {
+                pendingPrivateKey = null
+                pendingNonce = null
+                pendingGeneration = null
+            }
         }
     }
 
@@ -166,71 +184,46 @@ class UserApiKeyAuthService(
      * 兑换 OTP：
      * 先取 CSRF 及匹配的 _forum_session，然后不跟随重定向 POST /session/otp/:token，拦截第一跳 302 的 Set-Cookie。
      */
-    private suspend fun redeemOtp(otp: String) {
-        val csrf = fetchCsrf()
-            ?: throw IllegalStateException("获取 CSRF Token 失败，无法完成兑换")
+    private suspend fun redeemOtp(otp: String, generation: Long) {
+        val csrf = fetchCsrf(generation)
+        val previousToken = withContext(Dispatchers.Main) {
+            checkSession(generation)
+            store.syncFromWebView()[Config.SESSION_COOKIE]
+        }
 
         val otpClient = httpClient.newBuilder()
             .followRedirects(false)
             .followSslRedirects(false)
+            // OTP 只能消费一次，连接异常不能让 OkHttp 自动重放 POST。
+            .retryOnConnectionFailure(false)
             .connectTimeout(15, TimeUnit.SECONDS)
             .readTimeout(15, TimeUnit.SECONDS)
             .build()
 
         val request = Request.Builder()
             .url("${Config.BASE_URL}/session/otp/$otp")
+            .tag(ActiveSessionRequest::class.java, ActiveSessionRequest(generation))
             .post("".toRequestBody("application/json; charset=utf-8".toMediaType()))
             .header("X-CSRF-Token", csrf)
             .header("X-Requested-With", "XMLHttpRequest")
             .header("Accept", "application/json, text/javascript, */*; q=0.01")
             .build()
 
-        var responseCode = 0
-        val response = otpClient.newCall(request).execute()
-        response.use { resp ->
-            responseCode = resp.code
-            diagnostics.log("兑换 OTP 响应码: ${resp.code}")
-            if (resp.code !in 200..302) {
-                val errBody = resp.body?.string()?.take(300).orEmpty()
-                diagnostics.log("兑换 OTP 失败响应体: $errBody")
-            }
-            val parsedCookies = Cookie.parseAll(resp.request.url, resp.headers).toMutableList()
-            // 显式提取 Set-Cookie 中的 _t，防止因严格域名匹配丢失
-            val rawSetCookies = resp.headers.values("Set-Cookie")
-            for (raw in rawSetCookies) {
-                val match = Regex("(?:^|;\\s*)_t=([^;]+)").find(raw)
-                if (match != null) {
-                    val tValue = match.groupValues[1].trim()
-                    if (tValue.isNotEmpty() && parsedCookies.none { it.name == Config.SESSION_COOKIE }) {
-                        parsedCookies.add(
-                            Cookie.Builder()
-                                .name(Config.SESSION_COOKIE)
-                                .value(tValue)
-                                .domain(Config.HOST)
-                                .path("/")
-                                .secure()
-                                .httpOnly()
-                                .build()
-                        )
-                    }
-                }
-            }
-
-            if (parsedCookies.isNotEmpty()) {
-                withContext(Dispatchers.Main) {
-                    store.applyResponseCookies(parsedCookies)
-                }
-            }
+        val response = executeAuthRequest(otpClient, request, "/session/otp", generation)
+        diagnostics.log("兑换 OTP 响应码: ${response.status}")
+        if (response.challenged) throw NeedsInteractiveVerification("网页授权需要完成安全验证")
+        if (response.status !in 200..302) {
+            throw HttpStatusException(response.status, "登录令牌兑换失败，请重新授权")
         }
 
         // 校验是否拿到会话 Cookie
         val hasSession = withContext(Dispatchers.Main) {
-            store.hasSessionCookie()
+            checkSession(generation)
+            val currentToken = store.syncFromWebView()[Config.SESSION_COOKIE]
+            !currentToken.isNullOrBlank() && currentToken != previousToken
         }
         if (!hasSession) {
-            val errorHint = if (responseCode == 403) "安全防护校验拦截（HTTP 403），请稍后重试"
-                else "登录令牌兑换成功但未获取到会话凭证 (_t)，请重试"
-            throw IllegalStateException(errorHint)
+            throw IllegalStateException("登录令牌兑换后未获取到新的会话凭证 (_t)，请重新授权")
         }
         diagnostics.log("会话凭证 (_t) 已成功持久化")
     }
@@ -238,19 +231,24 @@ class UserApiKeyAuthService(
     /**
      * 获取 CSRF Token 并同步保存关联会话 Cookie。
      *
-     * 首次失败（多为 Cloudflare 403 挑战）不直接判死：先让 WebView 静默过一次盾，
-     * 拿到新的 cf_clearance 后再重放一次。两次都拿不到才返回 null。
+     * 只对明确的 Cloudflare 挑战做一次静默验证；429、网络错误和无效响应分别上报。
+     * 静默验证未通过时保留授权上下文，由界面完成前台验证后恢复。
      */
-    private suspend fun fetchCsrf(): String? {
-        requestCsrf()?.let { return it }
-
-        val revalidated = runCatching { silentRevalidate("网页授权 CSRF 获取失败") }.getOrDefault(false)
+    private suspend fun fetchCsrf(generation: Long): String {
+        try {
+            return requestCsrf(generation)
+        } catch (_: NeedsInteractiveVerification) {
+            diagnostics.log("网页授权 CSRF 遇到挑战，尝试一次静默验证")
+        }
+        throwIfRateLimitCoolingDown()
+        val revalidated = silentRevalidate("网页授权 CSRF 需要安全验证")
+        checkSession(generation)
+        throwIfRateLimitCoolingDown()
         if (!revalidated) {
-            diagnostics.log("CSRF 静默重验证未通过，放弃本次网页授权兑换")
-            return null
+            throw NeedsInteractiveVerification("网页授权需要完成安全验证")
         }
         diagnostics.log("CSRF 静默重验证已完成，重放请求")
-        return requestCsrf()
+        return requestCsrf(generation)
     }
 
     /**
@@ -260,54 +258,136 @@ class UserApiKeyAuthService(
      * 更容易被 301/404 或挑战页顶掉，取不到 JSON 体。Headers 与网页端完全一致，
      * 让服务端按 AJAX 请求处理。
      */
-    private suspend fun requestCsrf(): String? {
+    private suspend fun requestCsrf(generation: Long): String {
         // OkHttp 侧读的是加密存储里的 Cookie 快照，必须先与 WebView 现场对齐，
         // 否则刚在静默重验证里拿到的 cf_clearance 根本带不上。
-        withContext(Dispatchers.Main) { store.syncFromWebView() }
+        withContext(Dispatchers.Main) {
+            checkSession(generation)
+            store.syncFromWebView()
+        }
 
         val request = Request.Builder()
             .url("${Config.BASE_URL}/session/csrf")
+            .tag(ActiveSessionRequest::class.java, ActiveSessionRequest(generation))
             .header("Accept", "application/json, text/javascript, */*; q=0.01")
             .header("X-Requested-With", "XMLHttpRequest")
+            .header("Cache-Control", "no-cache")
             .build()
 
-        return runCatching {
-            httpClient.newCall(request).execute().use { resp ->
-                val cookies = Cookie.parseAll(resp.request.url, resp.headers)
-                if (cookies.isNotEmpty()) {
-                    withContext(Dispatchers.Main) {
-                        store.applyResponseCookies(cookies)
+        val response = executeAuthRequest(httpClient, request, "/session/csrf", generation)
+        if (response.challenged) throw NeedsInteractiveVerification("网页授权 CSRF 需要安全验证")
+        if (response.status !in 200..299) {
+            throw HttpStatusException(response.status, "获取网页登录凭据失败，请稍后重试")
+        }
+        val csrf = runCatching {
+            json.parseToJsonElement(response.body).jsonObject["csrf"]?.jsonPrimitive
+                ?.takeIf { it.isString }?.contentOrNull?.takeIf { it.isNotBlank() }
+        }.getOrNull()
+        return csrf ?: throw IllegalStateException("站点未返回有效的 CSRF 凭据，请检查网络后重试")
+    }
+
+    private fun checkSession(generation: Long) {
+        check(store.sessionGeneration == generation && !store.sessionChanging) { "会话已切换，请重新授权" }
+    }
+
+    private fun throwIfRateLimitCoolingDown() {
+        val remaining = TopicRepository.rateLimitRemainingMs()
+        if (remaining > 0L) throw RateLimitException(remaining)
+    }
+
+    /** 与普通请求共用读写调度；验证由调用方在释放并发名额后执行。 */
+    private suspend fun executeAuthRequest(
+        client: OkHttpClient,
+        request: Request,
+        label: String,
+        generation: Long,
+    ): TransportResult {
+        val execute: suspend () -> TransportResult = {
+            checkSession(generation)
+            suspendCancellableCoroutine { continuation ->
+                val call = client.newCall(request)
+                continuation.invokeOnCancellation { call.cancel() }
+                call.enqueue(object : Callback {
+                    override fun onFailure(call: Call, error: IOException) {
+                        if (continuation.isActive) continuation.resumeWithException(error)
+                    }
+
+                    override fun onResponse(call: Call, response: Response) {
+                        try {
+                            val result = response.use {
+                                checkSession(generation)
+                                val body = response.body?.string().orEmpty()
+                                val retryAfter = if (response.code == 429 || response.code == 503) {
+                                    HttpHeaderUtils.extractRetryAfterSeconds(
+                                        retryAfterHeader = response.header("Retry-After"),
+                                        resetHeader = response.header("x-ratelimit-reset") ?: response.header("ratelimit-reset"),
+                                        body = body,
+                                    )
+                                } else {
+                                    HttpHeaderUtils.parseRetryAfter(response.header("Retry-After"))
+                                }
+                                val mitigated = response.header("cf-mitigated")
+                                diagnostics.log("网页授权 $label: HTTP ${response.code}, cf-mitigated=${mitigated ?: "-"}")
+                                if (response.code == 429) {
+                                    val remaining = TopicRepository.enterRateLimitCooldown(
+                                        label, retryAfter, store,
+                                        cfChallenge = mitigated?.contains("challenge", ignoreCase = true) == true ||
+                                            TopicRepository.isCfChallengeBody(body),
+                                    )
+                                    throw RateLimitException(remaining)
+                                }
+                                TransportResult(
+                                    response.code, body,
+                                    ChallengeDetector.isChallenge(response.code, mitigated, body), retryAfter,
+                                )
+                            }
+                            if (continuation.isActive) continuation.resume(result)
+                        } catch (error: Exception) {
+                            if (continuation.isActive) continuation.resumeWithException(error)
+                        }
+                    }
+                })
+            }
+        }
+        return try {
+            if (request.method == "POST") {
+                TopicRepository.postGate.withLock {
+                    TopicRepository.throttlePost(burst = true)
+                    try {
+                        execute()
+                    } finally {
+                        TopicRepository.markPostCompleted()
                     }
                 }
-                val body = resp.body?.string().orEmpty()
-                if (!resp.isSuccessful) {
-                    diagnostics.log(
-                        "CSRF 请求失败: HTTP ${resp.code} " +
-                            "cf-mitigated=${resp.header("cf-mitigated") ?: "-"} " +
-                            "body=${body.take(120)}",
-                    )
-                    return@use null
+            } else {
+                TopicRepository.getSemaphore.withPermit {
+                    TopicRepository.acquireGetSlot { false }
+                    execute()
                 }
-                json.parseToJsonElement(body).jsonObject["csrf"]?.jsonPrimitive?.contentOrNull
             }
-        }.getOrNull()
+        } catch (error: IOException) {
+            diagnostics.log("网页授权 $label 连接失败: ${error.javaClass.simpleName}")
+            throw IllegalStateException("连接站点失败，请检查网络后重试", error)
+        }
     }
 
     /**
      * 吊销临时生成的 User API Key，避免无用凭证留存服务端。
      */
-    private fun revokeKey(apiKey: String) {
+    private suspend fun revokeKey(apiKey: String, generation: Long) {
         try {
             val request = Request.Builder()
                 .url("${Config.BASE_URL}/user-api-key/revoke")
+                .tag(ActiveSessionRequest::class.java, ActiveSessionRequest(generation))
                 .post("".toRequestBody("application/json; charset=utf-8".toMediaType()))
                 .header("User-Api-Key", apiKey)
                 .header("X-Requested-With", "XMLHttpRequest")
                 .build()
 
-            httpClient.newCall(request).execute().use { resp ->
-                diagnostics.log("吊销 User API Key 响应码: ${resp.code}")
-            }
+            val response = executeAuthRequest(httpClient, request, "/user-api-key/revoke", generation)
+            diagnostics.log("吊销 User API Key 响应码: ${response.status}")
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (e: Exception) {
             diagnostics.log("吊销 User API Key 异常 (可忽略): ${e.message}")
         }

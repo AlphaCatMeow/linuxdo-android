@@ -17,6 +17,35 @@ object Config {
     /** 「我的」各分区的缓存有效期,到期才在前台重新拉取。 */
     const val PROFILE_CACHE_TTL_MS = 3 * 60 * 1_000L
 
+    /** 升级进度（Connect）缓存有效期（6小时），避免频繁爬取 connect.linux.do */
+    const val TRUST_REPORT_CACHE_TTL_MS = 6 * 60 * 60 * 1_000L
+
+    /** 等级积分（LDC Credit）缓存有效期（6小时），静默更新 */
+    const val LDC_USER_INFO_CACHE_TTL_MS = 6 * 60 * 60 * 1_000L
+
+    /** 社区分（CDK score）缓存有效期（6小时）。分数由 CDK 服务端按徽章定时结算，变化很慢。 */
+    const val CDK_SCORE_CACHE_TTL_MS = 6 * 60 * 60 * 1_000L
+
+    /** 升级进度与积分的手动刷新统计时间窗口（30分钟） */
+    const val CONNECT_MANUAL_REFRESH_WINDOW_MS = 30 * 60 * 1_000L
+
+    /** 30分钟内最大允许手动刷新次数（超出后限流提醒） */
+    const val CONNECT_MANUAL_REFRESH_MAX_COUNT = 5
+
+    /** 静默更新遭遇风控/错误时的熔断退避时长（30分钟内不再静默重试） */
+    const val CONNECT_SILENT_REFRESH_BACKOFF_MS = 30 * 60 * 1_000L
+
+    /**
+     * 后台静默预热升级进度与积分的等待时长。冷启动时首次预热不早于进程启动后 2 分钟：
+     * 首屏列表、头像、未读、CSRF 都挤在开头，此时再打 connect / credit 极易被 CF 质询。
+     * 账号切换等后续触发至少再等这么久。
+     */
+    const val CONNECT_IDLE_WARMUP_DELAY_MS = 30_000L
+    const val CONNECT_FIRST_WARMUP_AFTER_START_MS = 2 * 60 * 1_000L
+
+    /** 本地还没有升级进度 / 积分缓存时，进程启动后多久内不允许手动拉取（交给后台首轮预热） */
+    const val CONNECT_FIRST_FETCH_LOCK_MS = 10 * 60 * 1_000L
+
     const val UNREAD_POLL_INTERVAL_MS = 10_000L
 
     /** TCP/TLS 建连超时。连不上服务器时要尽快报错,而不是让用户干等。 */

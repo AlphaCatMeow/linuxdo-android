@@ -3,10 +3,19 @@ package org.linuxdo.android.data
 import android.content.Context
 import android.content.SharedPreferences
 import android.webkit.CookieManager
+import android.os.Looper
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import okhttp3.Cookie
 import org.json.JSONObject
+import kotlin.coroutines.resume
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeout
+import androidx.webkit.CookieManagerCompat
+import androidx.webkit.WebViewFeature
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import kotlinx.serialization.json.Json
 import org.linuxdo.android.Config
 
@@ -19,6 +28,87 @@ import org.linuxdo.android.Config
  */
 class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider {
     private val prefs: SharedPreferences = createPrefs(context)
+    @Volatile var cookieVersion: Long = 0L
+        private set
+    @Volatile var sessionGeneration: Long = 1L
+        private set
+    @Volatile var sessionChanging: Boolean = false
+        private set
+    @Volatile var verificationRequired: Boolean = false
+        private set
+    private val cookieMutationGate = Mutex()
+    private val challengedClearanceLock = Any()
+    private val challengedClearances = LinkedHashSet<String>()
+    private val challengedClearanceFps = LinkedHashSet<String>()
+
+    fun requireVerification() { verificationRequired = true }
+    fun completeVerification() { verificationRequired = false }
+
+    /**
+     * 登记本会话内已被 Cloudflare 挑战（403/429 challenge）判废的 cf_clearance 值或指纹。
+     * 有界保留最近 [MAX_CHALLENGED_CLEARANCES] 枚，供多变体选优与换值重放时排除已知死值。
+     */
+    fun noteClearanceChallenged(valueOrFp: String?) {
+        val trimmed = valueOrFp?.trim().orEmpty()
+        if (trimmed.isEmpty() || trimmed == "-") return
+        val isFingerprint = trimmed.length == 6 && trimmed.all { it in '0'..'9' || it in 'a'..'f' }
+        val fp = if (isFingerprint) trimmed else org.linuxdo.android.net.NetDiagnostics.fingerprint(trimmed)
+        synchronized(challengedClearanceLock) {
+            if (!isFingerprint) {
+                if (!challengedClearances.contains(trimmed)) {
+                    if (challengedClearances.size >= MAX_CHALLENGED_CLEARANCES) {
+                        val it = challengedClearances.iterator()
+                        if (it.hasNext()) {
+                            it.next()
+                            it.remove()
+                        }
+                    }
+                    challengedClearances.add(trimmed)
+                }
+            }
+            if (fp != "-" && !challengedClearanceFps.contains(fp)) {
+                if (challengedClearanceFps.size >= MAX_CHALLENGED_CLEARANCES) {
+                    val it = challengedClearanceFps.iterator()
+                    if (it.hasNext()) {
+                        it.next()
+                        it.remove()
+                    }
+                }
+                challengedClearanceFps.add(fp)
+            }
+        }
+    }
+
+    /** 判断某枚 cf_clearance（原始值或 6 位指纹）是否在本会话内已被挑战判死。 */
+    fun isClearanceChallenged(valueOrFp: String?): Boolean {
+        val trimmed = valueOrFp?.trim().orEmpty()
+        if (trimmed.isEmpty() || trimmed == "-") return false
+        val isFingerprint = trimmed.length == 6 && trimmed.all { it in '0'..'9' || it in 'a'..'f' }
+        val fp = if (isFingerprint) trimmed else org.linuxdo.android.net.NetDiagnostics.fingerprint(trimmed)
+        return synchronized(challengedClearanceLock) {
+            (!isFingerprint && trimmed in challengedClearances) || (fp != "-" && fp in challengedClearanceFps)
+        }
+    }
+
+    fun clearChallengedClearances() {
+        synchronized(challengedClearanceLock) {
+            challengedClearances.clear()
+            challengedClearanceFps.clear()
+        }
+    }
+
+    /** 获取当前经选优后的权威 cf_clearance 指纹（无有效值时返回 "-"）。 */
+    fun currentCfClearanceFp(): String {
+        val clearance = syncFromWebView()[Config.CF_CLEARANCE_COOKIE]?.takeIf { it.isNotBlank() }
+        return org.linuxdo.android.net.NetDiagnostics.fingerprint(clearance)
+    }
+
+    fun advanceSessionGeneration(): Long {
+        clearChallengedClearances()
+        return synchronized(this) {
+            ++sessionGeneration
+        }
+    }
 
     fun storedCookies(): Map<String, String> {
         val raw = prefs.getString(KEY_COOKIES, null) ?: return emptyMap()
@@ -44,14 +134,117 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
      * "只剩 CF 的 Cookie、_t 已经丢了"(系统清理 WebView 存储、进程被杀、过挑战都可能)。
      * 整份覆盖会把存储里完好的 _t 抹掉,而那是最后一份备份,抹掉就真掉登录且不可恢复。
      * 真正的撤销走 applyResponseCookies 的过期分支,或 clear()/clearSessionCookie()。
+     *
+     * **重要修复**：cf_clearance 等 CF Cookie 不再持久化保存。
+     * 它们与网络环境/TLS 指纹强绑定，VPN 开关、DoH 节点切换、进程重启后环境变化，
+     * 旧 clearance 失效会导致 403 循环。让它们保持 WebView 的临时状态，
+     * 失效时由 Cloudflare 重新验证，而不是反复使用一枚已废弃的凭据。
      */
     fun syncFromWebView(): Map<String, String> {
-        val web = parseCookieHeader(CookieManager.getInstance().getCookie(Config.BASE_URL))
-        val stored = storedCookies()
+        // 从持久化存储中排除 CF Cookie（不可跨环境复用）
+        val stored = storedCookies().filterKeys {
+            !it.equals(Config.CF_CLEARANCE_COOKIE, ignoreCase = true) && !it.startsWith("__cf") && !it.startsWith("_cf")
+        }
+        if (sessionChanging) return stored
+        val manager = CookieManager.getInstance()
+        val rawHeader = manager.getCookie(Config.BASE_URL).orEmpty()
+        val web = parseCookieHeader(rawHeader).toMutableMap()
+        // 旧版可能留下同名 Domain/host-only 副本。优先读浏览器的结构化属性，
+        // 无法确认时保留已有凭据，不按扁平 Cookie 头的偶然顺序覆盖它。
+        val structured = runCatching { if (WebViewFeature.isFeatureSupported(WebViewFeature.GET_COOKIE_INFO)) {
+            CookieManagerCompat.getCookieInfo(manager, Config.BASE_URL)
+                .mapNotNull { Cookie.parse(Config.BASE_URL.toHttpUrl(), it) }
+        } else emptyList() }.getOrDefault(emptyList())
+        for (name in listOf(Config.SESSION_COOKIE, FORUM_SESSION_COOKIE)) {
+            val candidates = structured.filter { it.name == name && it.hostOnly && it.path == "/" }
+                .map { it.value }.distinct()
+            val rawValues = rawHeader.split(';')
+                .map { it.trim() }.filter { it.substringBefore('=') == name }
+                .map { it.substringAfter('=') }.distinct()
+            when {
+                candidates.size == 1 -> web[name] = candidates.single()
+                rawValues.size > 1 && stored[name] in rawValues -> web[name] = stored.getValue(name)
+                rawValues.size > 1 -> web.remove(name)
+            }
+        }
+        // 对齐 Fluxdo BoundarySync + CfClearanceAuthority：
+        // 当存在多个同名 cf_clearance 变体（如 .linux.do / linux.do / CHIPS Partitioned）时，
+        // 排除已过期和本会话已被撞死的变体，按 expiresAt 最晚 + hostOnly + path 长度选出唯一权威值，
+        // 杜绝 parseCookieHeader 按扁平字符串末尾顺序盲目用旧值/死值覆盖新值。
+        val now = System.currentTimeMillis()
+        val clearanceName = Config.CF_CLEARANCE_COOKIE
+        val structuredClearances = structured.filter {
+            it.name.equals(clearanceName, ignoreCase = true) && it.value.isNotBlank()
+        }
+        val rawClearances = rawHeader.split(';')
+            .map { it.trim() }
+            .filter { it.substringBefore('=').trim().equals(clearanceName, ignoreCase = true) }
+            .map { it.substringAfter('=').trim() }
+            .filter { it.isNotBlank() }
+            .distinct()
+        if (structuredClearances.isNotEmpty()) {
+            val bestClearance = structuredClearances
+                .filter { it.expiresAt > now && !isClearanceChallenged(it.value) }
+                .sortedWith(
+                    compareByDescending<Cookie> { it.expiresAt }
+                        .thenByDescending { it.hostOnly }
+                        .thenByDescending { it.path.length }
+                )
+                .firstOrNull()
+            if (bestClearance != null) {
+                web[clearanceName] = bestClearance.value
+            } else {
+                web.remove(clearanceName)
+            }
+        } else if (rawClearances.isNotEmpty()) {
+            val bestRaw = rawClearances.lastOrNull { !isClearanceChallenged(it) }
+            if (bestRaw != null) {
+                web[clearanceName] = bestRaw
+            } else {
+                web.remove(clearanceName)
+            }
+        }
         if (web.isEmpty()) return stored
-        val merged = stored + web
+        // 关键修复：过滤掉 CF Cookie，不保存到持久化存储
+        val businessCookies = web.filterKeys {
+            !it.equals(Config.CF_CLEARANCE_COOKIE, ignoreCase = true) && !it.startsWith("__cf") && !it.startsWith("_cf")
+        }
+        val merged = stored + businessCookies
         if (merged != stored) save(merged)
-        return merged
+        // 返回完整的 Cookie（包含 CF Cookie），供本次会话使用，但不持久化
+        return stored + web
+    }
+
+    /**
+     * 探测当前 WebView/Cookie 存储中是否持有有效的 Cloudflare 盾凭据（cf_clearance 或以 cf_ / __cf 开头）。
+     */
+    fun hasCfClearance(): Boolean {
+        val manager = runCatching { CookieManager.getInstance() }.getOrNull() ?: return false
+        val raw = manager.getCookie(Config.BASE_URL).orEmpty()
+        val parsed = parseCookieHeader(raw)
+        return parsed.keys.any { key ->
+            key.equals(Config.CF_CLEARANCE_COOKIE, ignoreCase = true) ||
+            key.startsWith("cf_", ignoreCase = true) ||
+            key.startsWith("__cf", ignoreCase = true)
+        }
+    }
+
+    /** 只在服务端确认当前账号后迁移旧 Domain 副本，不能在未确认时猜测有效 token。 */
+    suspend fun normalizeVerifiedAuthCookies(generation: Long) = cookieMutationGate.withLock {
+        if (sessionChanging || generation != sessionGeneration || plainPrefs.getBoolean("auth_cookie_host_only_v2", false)) return@withLock
+        val manager = CookieManager.getInstance()
+        val cookies = syncFromWebView()
+        for (name in listOf(Config.SESSION_COOKIE, FORUM_SESSION_COOKIE)) {
+            val value = cookies[name]?.takeIf { it.isNotBlank() } ?: continue
+            for (domain in listOf(Config.HOST, ".${Config.HOST}")) {
+                setWebCookie(manager, "$name=; Max-Age=0; Domain=$domain; Path=/; Secure; HttpOnly")
+            }
+            if (generation != sessionGeneration || sessionChanging) return@withLock
+            check(setWebCookie(manager, "$name=$value; Path=/; Secure; HttpOnly; SameSite=Lax"))
+            check(parseCookieHeader(manager.getCookie(Config.BASE_URL))[name] == value)
+        }
+        manager.flush()
+        plainPrefs.edit().putBoolean("auth_cookie_host_only_v2", true).apply()
     }
 
     /**
@@ -74,7 +267,14 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
         }
         if (missing.isEmpty()) return
         missing.forEach { (name, value) ->
-            manager.setCookie(Config.BASE_URL, "$name=$value; Domain=${Config.HOST}; Path=/; Secure")
+            // Discourse 会话 Cookie (_t / _forum_session) 必须严格保持 host-only，绝不附加 Domain 属性，
+            // 否则会造成 Domain Cookie 与 Host-only Cookie 分叉并存，导致服务端静默删除会话掉登录。
+            val header = if (name == Config.SESSION_COOKIE || name == FORUM_SESSION_COOKIE) {
+                "$name=$value; Path=/; Secure; HttpOnly"
+            } else {
+                "$name=$value; Path=/; Secure"
+            }
+            manager.setCookie(Config.BASE_URL, header)
         }
         manager.flush()
     }
@@ -86,12 +286,169 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
      * 拿这个已经失效的 token 白跑一次 /session/current,还可能被重新塞回 WebView。
      */
     fun clearSessionCookie() {
+        advanceSessionGeneration()
         save(storedCookies() - Config.SESSION_COOKIE)
-        CookieManager.getInstance().apply {
-            setCookie(Config.BASE_URL, "${Config.SESSION_COOKIE}=; Max-Age=0; Domain=${Config.HOST}; Path=/")
-            flush()
+        val manager = CookieManager.getInstance()
+        val deletionHeaders = listOf(
+            "${Config.SESSION_COOKIE}=; Max-Age=0; Path=/; Secure; HttpOnly",
+            "${Config.SESSION_COOKIE}=; Max-Age=0; Domain=${Config.HOST}; Path=/; Secure; HttpOnly",
+            "${Config.SESSION_COOKIE}=; Max-Age=0; Domain=.${Config.HOST}; Path=/; Secure; HttpOnly",
+            "${Config.SESSION_COOKIE}=; Max-Age=0; Path=/",
+            "${Config.SESSION_COOKIE}=; Max-Age=0; Domain=${Config.HOST}; Path=/",
+        )
+        deletionHeaders.forEach { manager.setCookie(Config.BASE_URL, it) }
+        manager.flush()
+    }
+
+    /**
+     * 403 诊断用的 Cookie 清单（主线程调用）：列出主站与 credit 子站上 CF 与会话 Cookie 的
+     * 作用域属性和值指纹，用来确认是否存在根域/子域/分区副本并存。值只记指纹。
+     */
+    fun cookieInventory(): String {
+        val manager = runCatching { CookieManager.getInstance() }.getOrNull() ?: return "CookieManager 不可用"
+        val interesting = { name: String ->
+            name == Config.SESSION_COOKIE || name == FORUM_SESSION_COOKIE ||
+                name.startsWith("cf_", ignoreCase = true) || name.startsWith("__cf", ignoreCase = true) ||
+                name.startsWith("_cf", ignoreCase = true)
+        }
+        val structuredSupported = runCatching { WebViewFeature.isFeatureSupported(WebViewFeature.GET_COOKIE_INFO) }.getOrDefault(false)
+        val stored = storedCookies()
+        return listOf(Config.BASE_URL, "https://credit.linux.do").joinToString(" || ") { url ->
+            val entries = if (structuredSupported) {
+                runCatching { CookieManagerCompat.getCookieInfo(manager, url) }.getOrDefault(emptyList())
+                    .mapNotNull { raw ->
+                        val name = raw.substringBefore('=').trim()
+                        if (!interesting(name)) return@mapNotNull null
+                        val value = raw.substringAfter('=').substringBefore(';')
+                        val attrs = raw.split(';').drop(1).map { it.trim() }
+                            .filter { attr ->
+                                val key = attr.substringBefore('=').lowercase()
+                                key in setOf("domain", "path", "samesite", "secure", "httponly", "partitioned", "expires", "max-age")
+                            }
+                            .joinToString(";")
+                        "$name#${org.linuxdo.android.net.NetDiagnostics.fingerprint(value)}{${attrs.ifBlank { "host-only" }}}"
+                    }
+            } else {
+                manager.getCookie(url).orEmpty().split(';').map { it.trim() }
+                    .filter { interesting(it.substringBefore('=')) }
+                    .map { "${it.substringBefore('=')}#${org.linuxdo.android.net.NetDiagnostics.fingerprint(it.substringAfter('='))}" }
+            }
+            "${url.removePrefix("https://")}: ${entries.joinToString(", ").ifBlank { "无" }}"
+        } + " || 结构化=${structuredSupported} 存储_t=${org.linuxdo.android.net.NetDiagnostics.fingerprint(stored[Config.SESSION_COOKIE])}" +
+            " 存储_forum_session=${org.linuxdo.android.net.NetDiagnostics.fingerprint(stored[FORUM_SESSION_COOKIE])}"
+    }
+
+    /**
+     * 针对 BAD CSRF 的轻度校准：
+     * 仅清理引起会话与 CSRF Token 失步的 _forum_session Cookie，
+     * 绝不触动 cf_clearance 和 _t，避免破坏 TLS 盾与登录凭据。
+     */
+    fun calibrateForumSessionForBadCsrf(): Boolean = synchronized(this) {
+        val manager = runCatching { CookieManager.getInstance() }.getOrNull() ?: return false
+        val rawHeader = manager.getCookie(Config.BASE_URL).orEmpty()
+        val cookies = parseCookieHeader(rawHeader)
+        if (!cookies.containsKey(FORUM_SESSION_COOKIE)) return true
+
+        save(storedCookies() - FORUM_SESSION_COOKIE)
+        val domains = listOf(null, Config.HOST, ".${Config.HOST}")
+        val attributes = listOf(
+            "",
+            "; Secure",
+            "; Secure; HttpOnly",
+            "; Secure; HttpOnly; SameSite=Lax",
+        )
+        domains.forEach { domain ->
+            val domainPart = domain?.let { "; Domain=$it" }.orEmpty()
+            attributes.forEach { attribute ->
+                manager.setCookie(
+                    Config.BASE_URL,
+                    "$FORUM_SESSION_COOKIE=; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Path=/$domainPart$attribute",
+                )
+            }
+        }
+        manager.flush()
+        return true
+    }
+
+    /**
+     * 保 _t 洗 Cookie（深度自愈清洗）：
+     * 彻底清除由子域跳转、CF Turnstile 或会话失步引入的污染 Cookie（cf_clearance、_forum_session、__cf*），
+     * 同时纯净保留用户的登录核心凭证 _t，避免重新输入密码登录。
+     *
+     * 包含加锁保护、递增请求代次、彻底清空分区 Cookie、种回 host-only _t 并做读回验证。
+     */
+    fun purgeTransientCookiesPreservingLogin(): Boolean = synchronized(this) {
+        advanceSessionGeneration()
+        val manager = runCatching { CookieManager.getInstance() }.getOrNull() ?: return false
+        val rawHeader = manager.getCookie(Config.BASE_URL).orEmpty()
+        val currentCookies = parseCookieHeader(rawHeader)
+        val token = currentCookies[Config.SESSION_COOKIE]
+            ?: storedCookies()[Config.SESSION_COOKIE]
+            ?: return false
+
+        // 1. 从持久化存储中只保留核心业务凭证（_t）
+        val cleanStored = storedCookies().filterKeys { key ->
+            key == Config.SESSION_COOKIE || (!key.startsWith("_cf", ignoreCase = true) && !key.startsWith("__cf", ignoreCase = true) && key != FORUM_SESSION_COOKIE && !key.equals(Config.CF_CLEARANCE_COOKIE, ignoreCase = true))
+        }
+        save(cleanStored)
+
+        // 2. 彻底清空所有子站和根域 (.linux.do) 残留的全部污染 Cookie
+        manager.removeAllCookies(null)
+        manager.flush()
+
+        // 3. 仅把核心凭证 _t 纯净重新种回主站 Host
+        manager.setCookie(Config.BASE_URL, "${Config.SESSION_COOKIE}=$token; Path=/; Secure; HttpOnly; SameSite=Lax")
+        manager.flush()
+
+        // 4. 读回验证 (Read-back verification)
+        val readBack = parseCookieHeader(manager.getCookie(Config.BASE_URL))
+        if (readBack[Config.SESSION_COOKIE] == token) {
+            return true
+        }
+        // 紧急兜底再次重种
+        manager.setCookie(Config.BASE_URL, "${Config.SESSION_COOKIE}=$token; Path=/; Secure; HttpOnly")
+        manager.flush()
+        return parseCookieHeader(manager.getCookie(Config.BASE_URL))[Config.SESSION_COOKIE] == token
+    }
+
+    suspend fun replaceBusinessCookies(token: String?, forumSession: String?) {
+        check(Looper.myLooper() == Looper.getMainLooper()) { "CookieManager updates must run on the main thread" }
+        val cookies = syncFromWebView().toMutableMap()
+        advanceSessionGeneration()
+        sessionChanging = true
+        try {
+            cookieMutationGate.withLock {
+                withTimeout(5_000L) {
+                    val manager = CookieManager.getInstance()
+                    val replacements = mapOf(
+                        Config.SESSION_COOKIE to token?.takeIf(String::isNotBlank),
+                        FORUM_SESSION_COOKIE to forumSession?.takeIf(String::isNotBlank),
+                    )
+                    for ((name, value) in replacements) {
+                        for (domain in listOf("", "; Domain=${Config.HOST}", "; Domain=.${Config.HOST}")) {
+                            setWebCookie(manager, "$name=; Max-Age=0; Path=/$domain; Secure; HttpOnly")
+                        }
+                        cookies.remove(name)
+                        if (value != null) {
+                            check(setWebCookie(manager, "$name=$value; Path=/; Secure; HttpOnly; SameSite=Lax")) {
+                                "无法恢复账号凭据"
+                            }
+                            cookies[name] = value
+                        }
+                        check(parseCookieHeader(manager.getCookie(Config.BASE_URL))[name] == value) {
+                            "账号凭据写入未确认，请重试"
+                        }
+                    }
+                    manager.flush()
+                    save(cookies)
+                }
+            }
+        } finally {
+            sessionChanging = false
         }
     }
+
+    suspend fun clearBusinessCookies() = replaceBusinessCookies(token = null, forumSession = null)
 
     /** 判断当前是否已登录社区凭据。 */
     fun hasSession(): Boolean = storedCookies().containsKey(Config.SESSION_COOKIE)
@@ -132,30 +489,56 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
     }
 
     /** 应用 OkHttp 响应里的 Set-Cookie,同时写入加密存储与 WebView,保证两边一致。 */
-    fun applyResponseCookies(cookies: List<Cookie>) {
-        if (cookies.isEmpty()) return
+    suspend fun applyResponseCookies(
+        cookies: List<Cookie>,
+        requestUrl: String = Config.BASE_URL,
+        expectedCookieVersion: Long? = null,
+        requestGeneration: Long? = null,
+        sentCookies: Map<String, String> = emptyMap(),
+    ) = cookieMutationGate.withLock {
+        if (cookies.isEmpty() || sessionChanging) return@withLock
+        if (requestGeneration != null && requestGeneration != sessionGeneration) return@withLock
+        if (expectedCookieVersion != null && expectedCookieVersion != cookieVersion) return@withLock
         val manager = CookieManager.getInstance()
         val merged = syncFromWebView().toMutableMap()
         val now = System.currentTimeMillis()
         cookies.forEach { cookie ->
+            if ((requestGeneration != null && requestGeneration != sessionGeneration) || sessionChanging) return@withLock
+            val targetUrl = requestUrl
+            val auth = cookie.name == Config.SESSION_COOKIE || cookie.name == FORUM_SESSION_COOKIE
+            val mainAuth = auth && requestUrl.toHttpUrl().host == Config.HOST && cookie.domain == Config.HOST
+            // A 的旧 token 被撤销，不表示同账号刚轮换得到的 B 也被撤销。
+            if (mainAuth && sentCookies[cookie.name] != merged[cookie.name]) return@forEach
+            if (mainAuth) {
+                listOf("; Domain=${Config.HOST}", "; Domain=.${Config.HOST}").forEach { domain ->
+                    setWebCookie(manager, "${cookie.name}=; Max-Age=0; Path=/$domain; Secure; HttpOnly")
+                }
+            }
+            if ((requestGeneration != null && requestGeneration != sessionGeneration) || sessionChanging) return@withLock
             if (cookie.expiresAt < now) {
-                merged.remove(cookie.name)
-                manager.setCookie(
-                    Config.BASE_URL,
-                    "${cookie.name}=; Max-Age=0; Domain=${Config.HOST}; Path=/",
-                )
+                if (requestUrl.toHttpUrl().host == Config.HOST) merged.remove(cookie.name)
+                val domain = if (mainAuth || cookie.hostOnly) "" else "; Domain=${cookie.domain}"
+                setWebCookie(manager, "${cookie.name}=; Max-Age=0; Path=${cookie.path}$domain; Secure", targetUrl)
             } else {
-                merged[cookie.name] = cookie.value
-                manager.setCookie(Config.BASE_URL, cookie.toString())
+                // 防止已被挑战判废的 cf_clearance 借响应 Set-Cookie 回写覆盖刚签发的新值
+                if (cookie.name.equals(Config.CF_CLEARANCE_COOKIE, ignoreCase = true) && isClearanceChallenged(cookie.value)) {
+                    return@forEach
+                }
+                if (requestUrl.toHttpUrl().host == Config.HOST && cookie.matches(Config.BASE_URL.toHttpUrl())) {
+                    merged[cookie.name] = cookie.value
+                }
+                val normalized = if (mainAuth) cookie.toString().replace(Regex("; domain=[^;]+", RegexOption.IGNORE_CASE), "") else cookie.toString()
+                setWebCookie(manager, normalized, targetUrl)
             }
         }
         manager.flush()
-        save(merged)
+        if (!sessionChanging && (requestGeneration == null || requestGeneration == sessionGeneration)) save(merged)
     }
 
     fun hasSessionCookie(): Boolean = syncFromWebView().containsKey(Config.SESSION_COOKIE)
 
     fun clear() {
+        advanceSessionGeneration()
         clearTopicNotificationLevels()
         clearCurrentUserId()
         plainPrefs.edit().remove(KEY_LAST_SEEN_NOTIFICATION_ID).apply()
@@ -166,6 +549,7 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
     }
 
     private fun save(cookies: Map<String, String>) {
+        cookieVersion++
         prefs.edit()
             .putString(KEY_COOKIES, JSONObject(cookies as Map<*, *>).toString())
             .putLong(KEY_SAVED_AT, System.currentTimeMillis())
@@ -197,6 +581,28 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
 
     fun setFloatingBallEnabled(enabled: Boolean) {
         plainPrefs.edit().putBoolean(KEY_FLOATING_BALL_ENABLED, enabled).apply()
+    }
+
+    fun getSkinPresetId(): String = plainPrefs.getString(KEY_SKIN_PRESET, "spongebob") ?: "spongebob"
+
+    fun setSkinPresetId(id: String) {
+        plainPrefs.edit().putString(KEY_SKIN_PRESET, id).apply()
+    }
+
+    fun isUserCustomizedSkin(): Boolean = plainPrefs.getBoolean("user_customized_skin", false)
+
+    fun setUserCustomizedSkin(customized: Boolean) {
+        plainPrefs.edit().putBoolean("user_customized_skin", customized).apply()
+    }
+
+    fun getString(key: String): String? = plainPrefs.getString(key, null)
+
+    fun putString(key: String, value: String) {
+        plainPrefs.edit().putString(key, value).apply()
+    }
+
+    fun removeString(key: String) {
+        plainPrefs.edit().remove(key).apply()
     }
 
     fun getFloatingBallActions(): List<FloatingAction> =
@@ -543,6 +949,74 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
         plainPrefs.edit().putBoolean(KEY_DOH_AUTO_OPTIMIZE, enabled).apply()
     }
 
+    /** 是否在开启系统代理/VPN 时强制保持 DoH + ECH 直连（防止直连分流规则导致阻断，默认关闭由系统让渡） */
+    override fun isDohForceOverProxyEnabled(): Boolean = plainPrefs.getBoolean(KEY_DOH_FORCE_OVER_PROXY, false)
+
+    override fun setDohForceOverProxyEnabled(enabled: Boolean) {
+        plainPrefs.edit().putBoolean(KEY_DOH_FORCE_OVER_PROXY, enabled).apply()
+    }
+
+    /** 首页信息流显示模式（图文/小图/纯文），向后兼容旧 Boolean 值 */
+    fun getFeedDisplayMode(): String {
+        // 向后兼容：若新 key 无值，检查旧 Boolean key
+        val stored = plainPrefs.getString(KEY_FEED_DISPLAY_MODE, null)
+        if (stored != null) return stored
+        val oldGraphic = plainPrefs.getBoolean(KEY_FEED_GRAPHIC_MODE, true)
+        return if (oldGraphic) "graphic" else "small_image"
+    }
+
+    fun setFeedDisplayMode(mode: String) {
+        plainPrefs.edit().putString(KEY_FEED_DISPLAY_MODE, mode).apply()
+    }
+
+    // 兼容旧接口（供历史调用点过渡）
+    fun isFeedGraphicMode(): Boolean = getFeedDisplayMode() == "graphic"
+
+    fun setFeedGraphicMode(enabled: Boolean) {
+        setFeedDisplayMode(if (enabled) "graphic" else "small_image")
+    }
+
+    /** 搜索历史记录（最多保留20条，最新在最前） */
+    fun getSearchHistory(): List<String> {
+        val raw = plainPrefs.getString(KEY_SEARCH_HISTORY_JSON, null) ?: return emptyList()
+        return try {
+            val arr = org.json.JSONArray(raw)
+            val list = mutableListOf<String>()
+            for (i in 0 until arr.length()) {
+                val item = arr.optString(i, "").trim()
+                if (item.isNotEmpty() && !list.contains(item)) {
+                    list.add(item)
+                }
+            }
+            list.take(20)
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    fun addSearchHistory(keyword: String): List<String> {
+        val trimmed = keyword.trim()
+        if (trimmed.isEmpty()) return getSearchHistory()
+        val current = getSearchHistory().toMutableList()
+        current.remove(trimmed)
+        current.add(0, trimmed)
+        val updated = current.take(20)
+        val arr = org.json.JSONArray()
+        updated.forEach { arr.put(it) }
+        plainPrefs.edit().putString(KEY_SEARCH_HISTORY_JSON, arr.toString()).apply()
+        return updated
+    }
+
+    fun getRateLimitedUntil(): Long = plainPrefs.getLong(KEY_RATE_LIMITED_UNTIL, 0L)
+
+    fun setRateLimitedUntil(timeMs: Long) {
+        plainPrefs.edit().putLong(KEY_RATE_LIMITED_UNTIL, timeMs).apply()
+    }
+
+    fun clearSearchHistory() {
+        plainPrefs.edit().remove(KEY_SEARCH_HISTORY_JSON).apply()
+    }
+
     /**
      * 全部 DoH 节点的 JSON 序列化串（支持增删改查与预设持久化）。
      * 格式：`[{"url":"https://...","name":"...","isCustom":true},...]`
@@ -575,6 +1049,7 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
         private const val PREFS_NAME = "session_secure"
         private const val PREFS_PLAIN_NAME = "app_preferences"
         private const val KEY_CURRENT_USER_ID = "current_user_id"
+        private const val FORUM_SESSION_COOKIE = "_forum_session"
         private const val KEY_COOKIES = "cookies"
         private const val KEY_SAVED_AT = "saved_at"
         private const val KEY_USER_AGENT = "user_agent"
@@ -611,6 +1086,7 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
         private const val KEY_TEST_WAIT_SCREEN_ON = "test_wait_screen_on"
         private const val KEY_APP_IN_FOREGROUND = "app_in_foreground"
         private const val MAX_NOTIFICATION_LEVELS = 1000
+        private const val MAX_CHALLENGED_CLEARANCES = 16
 
         // ── DoH 相关偏好 ──────────────────────────────────────────────────────────
         const val KEY_DOH_ENABLED = "doh_enabled"
@@ -619,6 +1095,12 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
         const val KEY_DOH_AUTO_OPTIMIZE = "doh_auto_optimize"
         const val KEY_DOH_SERVERS_JSON = "doh_servers_json"
         const val KEY_DOH_CUSTOM_SERVERS_JSON = "doh_custom_servers_json"
+        const val KEY_DOH_FORCE_OVER_PROXY = "doh_force_over_proxy"
+        const val KEY_FEED_GRAPHIC_MODE = "feed_graphic_mode"
+        const val KEY_FEED_DISPLAY_MODE = "feed_display_mode"
+        const val KEY_SKIN_PRESET = "skin_preset"
+        const val KEY_SEARCH_HISTORY_JSON = "search_history_json"
+        const val KEY_RATE_LIMITED_UNTIL = "rate_limited_until_wall_ms"
 
         fun parseCookieHeader(raw: String?): Map<String, String> =
             raw.orEmpty().split(";").mapNotNull { part ->
@@ -650,6 +1132,15 @@ class SessionStore(context: Context) : org.linuxdo.android.net.DohConfigProvider
                 build()
             }
         }
+
+        private suspend fun setWebCookie(manager: CookieManager, value: String, url: String = Config.BASE_URL): Boolean =
+            withTimeout(3_000L) {
+                suspendCancellableCoroutine { continuation ->
+                    manager.setCookie(url, value) { accepted ->
+                        if (continuation.isActive) continuation.resume(accepted)
+                    }
+                }
+            }
     }
 }
 

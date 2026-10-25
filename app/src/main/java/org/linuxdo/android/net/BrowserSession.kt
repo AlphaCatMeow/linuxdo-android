@@ -28,13 +28,22 @@ import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Toast
+import android.widget.LinearLayout
+import android.widget.TextView
+import android.widget.Button
+import android.util.TypedValue
+import android.graphics.drawable.GradientDrawable
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import org.linuxdo.android.BuildConfig
 import kotlin.coroutines.resume
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -46,6 +55,7 @@ import org.json.JSONTokener
 import org.linuxdo.android.Config
 import org.linuxdo.android.data.Diagnostics
 import org.linuxdo.android.data.SessionStore
+import org.linuxdo.android.data.TopicRepository
 
 /**
  * 全应用唯一的 WebView 会话:
@@ -66,10 +76,44 @@ class BrowserSession(
     private var cfCompletionProbing: Boolean = false
     private var cfQuietRounds: Int = 0
     private val pending = ConcurrentHashMap<String, CompletableDeferred<TransportResult>>()
+    private val probeRequests = ConcurrentHashMap<String, CompletableDeferred<String>>()
     private val solveMutex = Mutex()
 
     @Volatile
     private var finishedCount = 0
+    @Volatile
+    private var hasMainFrameError = false
+    private var verificationStart = -1
+    private var verificationStartedAt = 0L
+
+    /** 验证期间是否真正有一页站内页面加载完成（排除上一页残留回调与 chrome-error 页）。 */
+    @Volatile private var verificationPageLoaded = false
+
+    /** 验证页的导航是否已真正开始（onPageStarted）。连接挂起时 Chromium 不会回调它。 */
+    @Volatile private var verificationNavStarted = false
+
+    /** 本轮 /challenge 验证是否已穿过 Cloudflare 到达 Discourse 源站（返回源站 404）。 */
+    @Volatile private var challengeOriginReached = false
+
+    /** 验证页是否已确认存在需要人工交互的挑战组件（如 Turnstile），仅在为 true 时揭开遮罩露出 WebView。 */
+    @Volatile private var verificationNeedsInteraction = false
+
+    /** 本轮验证是否曾见到 Cloudflare 挑战标记，用于判断后续跳回裸 /challenge 是否为验证完成跳转。 */
+    @Volatile private var verificationSawChallenge = false
+
+    /** 首次探测到活跃挑战元素的时间戳，给自动过盾留出短暂窗口，避免非交互挑战一闪而过。 */
+    @Volatile private var activeChallengeDetectedAt = 0L
+
+    fun isChallengeOriginReached(): Boolean = challengeOriginReached
+
+    /** 最近一次静默重验证的结论，供上层区分「需要用户过盾」与「WebView 连不上站点」。 */
+    enum class SilentOutcome { CLEARED, CHALLENGE, UNREACHABLE, TIMEOUT }
+
+    @Volatile var lastSilentOutcome: SilentOutcome? = null
+        private set
+    /** 最近一次成功完成 CF 验证/重验证的时间戳（elapsedRealtime），用于并发过盾锁内去重合并。 */
+    @Volatile private var lastClearedAtElapsed: Long = 0L
+    private var verificationClearance: String? = null
 
     private var onAuthCallback: ((success: Boolean, errorMsg: String?, need2FA: Boolean) -> Unit)? = null
     private var cachedLogin: String = ""
@@ -83,6 +127,22 @@ class BrowserSession(
     private var emailLinkRechecksRemaining: Int = 0
     private var cachedSecondFactor: String? = null
     private var isDarkCached: Boolean = false
+    private var authSubmitJob: Job? = null
+    @Volatile
+    private var authSubmitCompletion: CompletableDeferred<AuthSubmitResult>? = null
+    @Volatile
+    private var authAbortAcknowledgement: CompletableDeferred<Unit>? = null
+    @Volatile
+    private var authAbortSubmissionId: String? = null
+    private var authAbortJob: Job? = null
+    @Volatile
+    private var cancelledSubmissionId: String? = null
+    @Volatile
+    private var authSubmissionGeneration: Long = 0L
+    @Volatile
+    private var currentSubmissionId: String? = null
+    @Volatile
+    private var currentSubmissionCallback: ((Boolean, String?, Boolean) -> Unit)? = null
     private var isInCfMode: Boolean = false
     private var cfRetryUsed: Boolean = false
     private var cfProbeScheduled: Boolean = false
@@ -95,7 +155,38 @@ class BrowserSession(
     private var cfDialog: Dialog? = null
     private var cfWebView: WebView? = null
 
+    private enum class AuthSubmitResult {
+        RESPONSE,
+        ABORTED,
+        SCRIPT_MISSING,
+    }
+
     fun cancelCaptchaLogin() {
+        authSubmissionGeneration += 1L
+        val submissionId = currentSubmissionId
+        val completion = authSubmitCompletion
+        val view = authWebView
+        val hasActiveSubmission = submissionId != null && completion != null && !completion.isCompleted
+        if (submissionId != null && completion != null && !completion.isCompleted) {
+            cancelledSubmissionId = submissionId
+            currentSubmissionCallback = null
+            if (view != null) {
+                abortActiveAuthSubmission(submissionId, view, completion)
+            } else {
+                if (authAbortSubmissionId != submissionId || authAbortJob?.isActive != true) {
+                    currentSubmissionId = null
+                    currentSubmissionCallback = null
+                    completion.complete(AuthSubmitResult.ABORTED)
+                }
+            }
+        } else {
+            currentSubmissionId = null
+            currentSubmissionCallback = null
+            authSubmitJob?.cancel()
+            authSubmitJob = null
+            completion?.complete(AuthSubmitResult.ABORTED)
+            authSubmitCompletion = null
+        }
         isInCfMode = false
         cfRetryUsed = false
         cfProbeScheduled = false
@@ -111,6 +202,15 @@ class BrowserSession(
         cachedEmailSend = null
         dismissCfDialog()
         onAuthCallback = null
+        pendingEmailLink = null
+        emailLinkCompleting = false
+        if (!hasActiveSubmission) {
+            authWebView?.let { authView ->
+                authView.evaluateJavascript("if (typeof window.__linuxdoAbortLogin === 'function') window.__linuxdoAbortLogin();", null)
+                authView.stopLoading()
+                authView.loadUrl("about:blank")
+            }
+        }
     }
 
     fun hasPendingSecondFactorLogin(): Boolean = awaitingSecondFactorLogin
@@ -144,21 +244,101 @@ class BrowserSession(
     private inner class Bridge {
         @JavascriptInterface
         fun onResult(id: String, status: Int, mitigated: String, body: String) {
+            onResult(id, status, mitigated, body, "")
+        }
+
+        @JavascriptInterface
+        fun onResult(id: String, status: Int, mitigated: String, body: String, retryAfter: String) {
+            val retryAfterSeconds = if (status == 429 || status == 503) {
+                HttpHeaderUtils.extractRetryAfterSeconds(retryAfter, body = body)
+            } else {
+                HttpHeaderUtils.parseRetryAfter(retryAfter)
+            }
             pending.remove(id)?.complete(
-                TransportResult(status, body, ChallengeDetector.isChallenge(status, mitigated, body)),
+                TransportResult(
+                    status = status,
+                    body = body,
+                    challenged = ChallengeDetector.isChallenge(status, mitigated, body),
+                    retryAfterSeconds = retryAfterSeconds,
+                    cfMitigated = mitigated,
+                ),
             )
+        }
+
+        @JavascriptInterface
+        fun onProbeComplete(reqId: String, payloadJson: String) {
+            probeRequests.remove(reqId)?.complete(payloadJson)
+        }
+
+        @JavascriptInterface
+        fun onChallengeNavigating(reason: String) {
+            verificationNeedsInteraction = false
+            webViewInstance?.post {
+                if (verificationStart >= 0) {
+                    webViewInstance?.alpha = 0f
+                }
+            }
+            cfWebView?.post {
+                if (isInCfMode) {
+                    cfWebView?.alpha = 0f
+                }
+            }
+        }
+
+        @JavascriptInterface
+        fun onChallengeOriginReached(reason: String) {
+            challengeOriginReached = true
+            verificationNeedsInteraction = false
+            webViewInstance?.post {
+                if (verificationStart >= 0) {
+                    webViewInstance?.alpha = 0f
+                }
+            }
+            cfWebView?.post {
+                val view = cfWebView
+                if (isInCfMode && view != null) {
+                    view.alpha = 0f
+                    awaitFreshClearanceThen(view, "源站 404 页面($reason)")
+                }
+            }
         }
 
         @JavascriptInterface
         fun onAuthResult(jsonStr: String) {
             Log.d(TAG, "onAuthResult: $jsonStr")
             diagnostics.log("收到安全验证登录结果: $jsonStr")
-            val cb = onAuthCallback ?: return
+            var resultSubmissionId = ""
             try {
                 val obj = JSONObject(jsonStr)
+                val submissionId = obj.optString("submissionId")
+                resultSubmissionId = submissionId
+                val completion = authSubmitCompletion
+                if (submissionId.isBlank() || submissionId != currentSubmissionId || completion == null || completion.isCompleted) {
+                    diagnostics.log("忽略已过期或已取消的登录结果: subId=$submissionId, current=$currentSubmissionId")
+                    return
+                }
                 val phase = obj.optString("phase")
                 val status = obj.optInt("status")
                 val body = obj.optString("body")
+                val retryAfterStr = obj.optString("retryAfter")
+                val retryAfterSeconds = HttpHeaderUtils.parseRetryAfter(retryAfterStr)
+                val callback = currentSubmissionCallback?.takeIf { cancelledSubmissionId != submissionId }
+
+                if (status == 429) {
+                    TopicRepository.enterRateLimitCooldown("WebView 登录流程($phase)", retryAfterSeconds, sessionStore = store)
+                }
+                currentSubmissionId = null
+                currentSubmissionCallback = null
+                completion.complete(AuthSubmitResult.RESPONSE)
+                if (authSubmitCompletion === completion) authSubmitCompletion = null
+
+                if (cancelledSubmissionId == submissionId) return
+                val cb = callback ?: return
+                if (status == 429) {
+                    awaitingSecondFactorLogin = false
+                    cb(false, "操作过于频繁，请稍后再试", false)
+                    return
+                }
 
                 when (phase) {
                     "session" -> {
@@ -240,8 +420,25 @@ class BrowserSession(
                     else -> cb(false, "未知异常 ($phase)", false)
                 }
             } catch (e: Exception) {
-                cb(false, "响应解析失败: ${e.message}", false)
+                diagnostics.log("解析登录结果失败: ${e.message}")
+                if (resultSubmissionId.isNotBlank() && resultSubmissionId == currentSubmissionId) {
+                    val callback = currentSubmissionCallback?.takeIf { cancelledSubmissionId != resultSubmissionId }
+                    currentSubmissionId = null
+                    currentSubmissionCallback = null
+                    authSubmitCompletion?.complete(AuthSubmitResult.RESPONSE)
+                    authSubmitCompletion = null
+                    callback?.invoke(false, "响应解析失败: ${e.message}", false)
+                }
             }
+        }
+
+        @JavascriptInterface
+        fun onAuthAborted(submissionId: String) {
+            if (submissionId.isBlank() || submissionId != currentSubmissionId || submissionId != authAbortSubmissionId) {
+                diagnostics.log("忽略过期登录中止回执: subId=$submissionId, current=$currentSubmissionId")
+                return
+            }
+            authAbortAcknowledgement?.complete(Unit)
         }
 
         @JavascriptInterface
@@ -319,6 +516,16 @@ class BrowserSession(
             view.webViewClient = object : WebViewClient() {
                 override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
                     Log.d(TAG, "CF onPageStarted: $url")
+                    if (view != null && isChallengePathUrl(url.orEmpty())) {
+                        installOriginFallbackMask(view)
+                    }
+                }
+
+                override fun onPageCommitVisible(view: WebView?, url: String?) {
+                    super.onPageCommitVisible(view, url)
+                    if (view != null && isChallengePathUrl(url.orEmpty())) {
+                        installOriginFallbackMask(view)
+                    }
                 }
 
                 override fun onPageFinished(view: WebView?, url: String?) {
@@ -326,10 +533,14 @@ class BrowserSession(
                     Log.d(TAG, "CF onPageFinished: $url")
                     val currentUrl = url.orEmpty()
                     if (view == null) return
+                    if (isChallengePathUrl(currentUrl)) {
+                        installOriginFallbackMask(view)
+                    }
                     if (isBareChallengeUrl(currentUrl)) {
                         // 对齐 Fluxdo：检查页面是否已到达源站 404（CF 放行回源）
                         view.evaluateJavascript(ORIGIN_NOT_FOUND_PROBE_JS) { result ->
                             if (decodeJsValue(result) == "true") {
+                                view.alpha = 0f
                                 awaitFreshClearanceThen(view, "源站 404 页面(DOM 特征)")
                                 return@evaluateJavascript
                             }
@@ -353,7 +564,9 @@ class BrowserSession(
                         // 对齐 Fluxdo：/challenge 是站点专用的 CF 验证入口。
                         // 未通过时 CF 接管并返回 challenge；通过后请求落到源站，源站没有该页面返回 404。
                         // 但 404 只能说明"这次请求没被 CF 接管",不等于本轮验证签发了新 clearance ——
-                        // 旧 clearance 残留时 CF 同样会直接放行回源。所以这里不直接收口。
+                        // 旧 clearance 残留时 CF 同样会直接放行回源。所以这里先遮住 404 再确认新凭据。
+                        view.alpha = 0f
+                        installOriginFallbackMask(view)
                         awaitFreshClearanceThen(view, "主框架 /challenge 返回源站 404")
                         return
                     }
@@ -367,12 +580,99 @@ class BrowserSession(
                 }
             }
             view.webChromeClient = createLoggingChromeClient("CF")
+            view.addJavascriptInterface(Bridge(), BRIDGE_NAME)
         }
+
+        val density = context.resources.displayMetrics.density
+        fun dp(v: Int) = (v * density).toInt()
+        val isDark = isDarkCached
+        val surfaceColor = if (isDark) Color.rgb(28, 28, 30) else Color.WHITE
+        val labelColor = if (isDark) Color.rgb(245, 245, 247) else Color.rgb(28, 28, 30)
+        val secondaryColor = if (isDark) Color.rgb(142, 142, 147) else Color.rgb(142, 142, 147)
+        val dividerColor = if (isDark) Color.rgb(56, 56, 58) else Color.rgb(229, 229, 234)
+        val warnBg = if (isDark) Color.rgb(58, 46, 18) else Color.rgb(254, 243, 199)
+        val warnText = if (isDark) Color.rgb(253, 230, 138) else Color.rgb(146, 64, 14)
+        val warnBtn = if (isDark) Color.rgb(245, 158, 11) else Color.rgb(180, 83, 9)
+
+        val root = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                setColor(surfaceColor)
+                cornerRadii = floatArrayOf(
+                    dp(20).toFloat(), dp(20).toFloat(),
+                    dp(20).toFloat(), dp(20).toFloat(),
+                    0f, 0f, 0f, 0f,
+                )
+            }
+        }
+        val header = LinearLayout(context).apply {
+            gravity = Gravity.CENTER_VERTICAL
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(dp(16), 0, dp(16), 0)
+        }
+        val icon = TextView(context).apply {
+            text = "🛡️"
+            gravity = Gravity.CENTER_VERTICAL
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 20f)
+        }
+        val title = TextView(context).apply {
+            text = "安全验证"
+            gravity = Gravity.CENTER_VERTICAL
+            setTextColor(labelColor)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f)
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+            setPadding(dp(8), 0, 0, 0)
+        }
+        val close = TextView(context).apply {
+            text = "✕"
+            gravity = Gravity.CENTER
+            setTextColor(secondaryColor)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f)
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(if (isDark) Color.rgb(44, 44, 46) else Color.rgb(242, 242, 247))
+            }
+        }
+        header.addView(icon, LinearLayout.LayoutParams(dp(28), ViewGroup.LayoutParams.MATCH_PARENT))
+        header.addView(title, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f))
+        header.addView(close, LinearLayout.LayoutParams(dp(28), dp(28)))
+        root.addView(header, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(50)))
+        root.addView(View(context).apply { setBackgroundColor(dividerColor) }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 1))
+
+        val timeoutBanner = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setBackgroundColor(warnBg)
+            setPadding(dp(12), dp(6), dp(12), dp(6))
+            visibility = View.GONE
+        }
+        val warnMsg = TextView(context).apply {
+            text = "验证服务连接受阻（可能受直连或 DoH 影响），若一直白屏建议检查代理设置"
+            setTextColor(warnText)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setLineSpacing(0f, 1.2f)
+        }
+        val retryBtn = Button(context, null, android.R.attr.borderlessButtonStyle).apply {
+            text = "刷新"
+            setTextColor(warnBtn)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setOnClickListener {
+                challengeView.alpha = 1f
+                challengeView.reload()
+            }
+        }
+        timeoutBanner.addView(warnMsg, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        timeoutBanner.addView(retryBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(32)))
+        root.addView(timeoutBanner, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+
+        root.addView(challengeView, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
 
         val dialog = Dialog(context).apply {
             requestWindowFeature(Window.FEATURE_NO_TITLE)
-            setContentView(challengeView)
+            setContentView(root)
             setCanceledOnTouchOutside(false)
+            close.setOnClickListener { dismiss() }
             setOnDismissListener {
                 if (cfDialog === this && isInCfMode) {
                     val dismissedView = cfWebView
@@ -388,7 +688,7 @@ class BrowserSession(
         cfWebView = challengeView
         dialog.show()
         dialog.window?.apply {
-            setBackgroundDrawable(ColorDrawable(Color.WHITE))
+            setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
             setLayout(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 (context.resources.displayMetrics.heightPixels * 0.92f).toInt(),
@@ -397,6 +697,11 @@ class BrowserSession(
             addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
             attributes = attributes.apply { dimAmount = 0.5f }
         }
+        challengeView.postDelayed({
+            if (isInCfMode && cfDialog?.isShowing == true && !isFreshCfClearance(currentCfClearance())) {
+                timeoutBanner.visibility = View.VISIBLE
+            }
+        }, 4_000L)
         challengeView.loadUrl("${Config.BASE_URL}/challenge")
         scheduleCfCompletionProbe(challengeView)
     }
@@ -530,6 +835,9 @@ class BrowserSession(
     }
 
     private fun currentCfClearance(): String? {
+        if (!store.sessionChanging && Looper.myLooper() == Looper.getMainLooper()) {
+            store.syncFromWebView()[CF_CLEARANCE_COOKIE]?.takeIf { it.isNotBlank() }?.let { return it }
+        }
         val cm = CookieManager.getInstance()
         val header1 = cm.getCookie(Config.BASE_URL)
         val header2 = cm.getCookie("${Config.BASE_URL}/")
@@ -552,6 +860,28 @@ class BrowserSession(
         return parsed.host == Config.HOST &&
             parsed.path == CF_CHALLENGE_PATH &&
             parsed.query.isNullOrEmpty()
+    }
+
+    private fun isChallengePathUrl(url: String): Boolean {
+        val parsed = runCatching { Uri.parse(url) }.getOrNull() ?: return false
+        return parsed.host == Config.HOST && parsed.path == CF_CHALLENGE_PATH
+    }
+
+    /**
+     * 对齐 Fluxdo：在 /challenge 页面注入防 404 闪现遮罩与卸载/DOM 404 监听器。
+     * 一旦 CF 挑战完成触发页面卸载（beforeunload/pagehide），或 DOM 出现源站 404 特征，
+     * 立即在当前 JS 帧塞入全屏纯色遮罩并通知原生层隐藏 WebView。
+     */
+    private fun installOriginFallbackMask(view: WebView) {
+        val nightMode = (appContext.resources.configuration.uiMode and
+            android.content.res.Configuration.UI_MODE_NIGHT_MASK) ==
+            android.content.res.Configuration.UI_MODE_NIGHT_YES
+        val maskColor = if (isDarkCached || nightMode) "#1c1c1e" else "#f2f2f7"
+        view.evaluateJavascript(buildOriginFallbackMaskScript(maskColor), null)
+    }
+
+    private fun hideOriginFallbackMask(view: WebView) {
+        view.evaluateJavascript("if (typeof window.__linuxdoHideCfMask === 'function') window.__linuxdoHideCfMask();", null)
     }
 
     /** 带 `cf-mitigated: challenge` 的响应是 CF 自己接管的挑战，不能算放行。 */
@@ -605,34 +935,134 @@ class BrowserSession(
         secondFactorToken: String?,
         secondFactorMethod: Int,
     ) {
+        val submissionCallback = onAuthCallback ?: return
+        val submissionId = UUID.randomUUID().toString()
+        val submissionGeneration = authSubmissionGeneration
         val hcaptchaJson = hcaptchaToken?.let(JSONObject::quote) ?: "null"
         val secondFactorJson = secondFactorToken?.let(JSONObject::quote) ?: "null"
         val secondFactorMethodJson = JSONObject.quote(secondFactorMethod.toString())
-        view.evaluateJavascript(
-            """
-                (function () {
-                  if (typeof window.__linuxdoRunLogin !== 'function') return false;
-                  if (typeof window.__linuxdoShowSubmitting === 'function') {
-                    window.__linuxdoShowSubmitting();
-                  }
-                  window.__linuxdoRunLogin($hcaptchaJson, $secondFactorJson, $secondFactorMethodJson);
-                  return true;
-                })();
-            """.trimIndent(),
-        ) { raw ->
-            if (decodeJsValue(raw) == "true") return@evaluateJavascript
-            retryingLoginWithHcaptchaToken = false
-            diagnostics.log("网页登录脚本已丢失，重新展示图形验证")
-            loadCaptchaLogin(
-                login = cachedLogin,
-                password = cachedPassword,
-                secondFactorToken = cachedSecondFactor,
-                secondFactorMethod = cachedSecondFactorMethod,
-                isDark = isDarkCached,
-                resetCfRetry = false,
-                onResult = onAuthCallback ?: { _, _, _ -> },
-            )
+        val submissionIdJson = JSONObject.quote(submissionId)
+        val previousJob = authSubmitJob
+        authSubmitJob = CoroutineScope(Dispatchers.Main).launch {
+            previousJob?.join()
+            if (submissionGeneration != authSubmissionGeneration) return@launch
+            TopicRepository.postGate.withLock {
+                if (submissionGeneration != authSubmissionGeneration) return@withLock
+                TopicRepository.throttlePost(burst = true)
+                if (submissionGeneration != authSubmissionGeneration) return@withLock
+
+                currentSubmissionId = submissionId
+                currentSubmissionCallback = submissionCallback
+                val completion = CompletableDeferred<AuthSubmitResult>()
+                authSubmitCompletion = completion
+                try {
+                    view.evaluateJavascript(
+                        """
+                            (function () {
+                              if (typeof window.__linuxdoRunLogin !== 'function') return false;
+                              if (typeof window.__linuxdoShowSubmitting === 'function') {
+                                window.__linuxdoShowSubmitting();
+                              }
+                              window.__linuxdoRunLogin($submissionIdJson, $hcaptchaJson, $secondFactorJson, $secondFactorMethodJson);
+                              return true;
+                            })();
+                        """.trimIndent(),
+                    ) { raw ->
+                        if (decodeJsValue(raw) == "true") return@evaluateJavascript
+                        retryingLoginWithHcaptchaToken = false
+                        diagnostics.log("网页登录脚本已丢失，重新展示图形验证")
+                        if (currentSubmissionId == submissionId) {
+                            currentSubmissionId = null
+                            currentSubmissionCallback = null
+                            completion.complete(AuthSubmitResult.SCRIPT_MISSING)
+                            loadCaptchaLogin(
+                                login = cachedLogin,
+                                password = cachedPassword,
+                                secondFactorToken = cachedSecondFactor,
+                                secondFactorMethod = cachedSecondFactorMethod,
+                                isDark = isDarkCached,
+                                resetCfRetry = false,
+                                onResult = submissionCallback,
+                            )
+                        }
+                    }
+                    val result = withTimeoutOrNull(25_000L) {
+                        completion.await()
+                    }
+
+                    if (result == null && currentSubmissionId == submissionId) {
+                        diagnostics.log("WebView 登录等待超时(25s)，主动中断底层网络请求")
+                        abortActiveAuthSubmission(submissionId, view, completion)
+                        val abortResult = completion.await()
+                        if (abortResult == AuthSubmitResult.ABORTED && cancelledSubmissionId != submissionId) {
+                            submissionCallback(false, "登录超时，请重试", false)
+                        }
+                    }
+                } finally {
+                    if (currentSubmissionId == submissionId) {
+                        currentSubmissionId = null
+                        currentSubmissionCallback = null
+                    }
+                    if (authSubmitCompletion === completion) authSubmitCompletion = null
+                    if (cancelledSubmissionId == submissionId) cancelledSubmissionId = null
+                    TopicRepository.markPostCompleted()
+                }
+            }
         }
+    }
+
+    private fun abortActiveAuthSubmission(
+        submissionId: String,
+        view: WebView,
+        completion: CompletableDeferred<AuthSubmitResult>,
+    ) {
+        if (authAbortSubmissionId == submissionId && authAbortJob?.isActive == true) return
+
+        val acknowledgement = CompletableDeferred<Unit>()
+        authAbortSubmissionId = submissionId
+        authAbortAcknowledgement = acknowledgement
+        if (authWebView === view) authWebView = null
+        pendingAuthHtml = null
+        authHtmlInjected = false
+        val submissionIdJson = JSONObject.quote(submissionId)
+        runCatching {
+            view.evaluateJavascript(
+                """
+                    (function () {
+                      if (typeof window.__linuxdoAbortLogin !== 'function') return false;
+                      return window.__linuxdoAbortLogin($submissionIdJson) !== false;
+                    })();
+                """.trimIndent(),
+            ) { raw ->
+                if (decodeJsValue(raw) != "true") acknowledgement.complete(Unit)
+                runCatching { view.stopLoading() }
+            }
+        }.onFailure { acknowledgement.complete(Unit) }
+
+        authAbortJob = CoroutineScope(Dispatchers.Main).launch {
+            withTimeoutOrNull(AUTH_ABORT_ACK_TIMEOUT_MS) { acknowledgement.await() }
+            destroyAuthWebView(view)
+            if (currentSubmissionId == submissionId) {
+                currentSubmissionId = null
+                currentSubmissionCallback = null
+            }
+            if (authSubmitCompletion === completion) authSubmitCompletion = null
+            if (cancelledSubmissionId == submissionId) cancelledSubmissionId = null
+            if (authAbortSubmissionId == submissionId) {
+                authAbortSubmissionId = null
+                authAbortAcknowledgement = null
+                authAbortJob = null
+            }
+            completion.complete(AuthSubmitResult.ABORTED)
+        }
+    }
+
+    private fun destroyAuthWebView(view: WebView) {
+        if (authWebView === view) authWebView = null
+        runCatching { (view.context as? MutableContextWrapper)?.baseContext = appContext }
+        runCatching { view.stopLoading() }
+        runCatching { view.removeJavascriptInterface(BRIDGE_NAME) }
+        runCatching { view.destroy() }
     }
 
     private fun dismissCfDialog() {
@@ -770,11 +1200,40 @@ class BrowserSession(
                   if (overlay) overlay.style.display = 'flex';
                 }
 
-                async function runLogin(hcaptchaToken, secondFactorOverride, secondFactorMethodOverride) {
+                var currentAbortController = null;
+                var currentLoginSubmissionId = null;
+                function abortCurrentLogin(subId) {
+                  if (!subId || currentLoginSubmissionId !== subId || !currentAbortController) return false;
+                  try {
+                    currentAbortController.abort();
+                    return true;
+                  } catch (e) {
+                    return false;
+                  }
+                }
+                window.__linuxdoAbortLogin = abortCurrentLogin;
+                function reportLoginAbort(subId) {
+                  callBridge('onAuthAborted', subId);
+                }
+
+                async function runLogin(subId, hcaptchaToken, secondFactorOverride, secondFactorMethodOverride) {
+                  if (typeof AbortController === 'undefined') {
+                    callBridge('onAuthResult', JSON.stringify({
+                      submissionId: subId,
+                      phase: 'exception',
+                      status: 0,
+                      retryAfter: '',
+                      body: 'AbortController is unavailable'
+                    }));
+                    return;
+                  }
+                  currentLoginSubmissionId = subId;
+                  currentAbortController = new AbortController();
+                  var signal = currentAbortController.signal;
                   var identifier = $uJson;
                   var password = $pJson;
-                  var secondFactor = arguments.length > 1 ? secondFactorOverride : $sfJson;
-                  var secondFactorMethod = arguments.length > 2 ? secondFactorMethodOverride : $sfMethodJson;
+                  var secondFactor = arguments.length > 2 ? secondFactorOverride : $sfJson;
+                  var secondFactorMethod = arguments.length > 3 ? secondFactorMethodOverride : $sfMethodJson;
 
                   function isCloudflareChallenge(response, text) {
                     var mitigated = (response.headers.get('cf-mitigated') || '').toLowerCase();
@@ -819,15 +1278,18 @@ class BrowserSession(
                       method: 'GET',
                       headers: { 'X-Requested-With': 'XMLHttpRequest', 'Accept': 'application/json' },
                       credentials: 'include',
-                      cache: 'no-store'
+                      cache: 'no-store',
+                      signal: signal
                     });
                     if (c.status !== 200) {
                       var cBody = await c.text();
                       reportResponse('csrf 失败', c);
                       var isCf = isCloudflareChallenge(c, cBody);
                       callBridge('onAuthResult', JSON.stringify({
+                        submissionId: subId,
                         phase: isCf ? 'cf_needed' : 'csrf',
                         status: c.status,
+                        retryAfter: c.headers.get('retry-after') || '',
                         body: cBody,
                         hcaptchaToken: isCf ? hcaptchaToken : null
                       }));
@@ -851,28 +1313,41 @@ class BrowserSession(
                               'X-CSRF-Token': csrf,
                               'X-Requested-With': 'XMLHttpRequest'
                             },
-                            body: 'token=' + encodeURIComponent(hcaptchaToken)
+                            body: 'token=' + encodeURIComponent(hcaptchaToken),
+                            signal: signal
                           });
                           var hText = await h.text();
                           if (isCloudflareChallenge(h, hText)) {
                             callBridge('onAuthResult', JSON.stringify({
+                              submissionId: subId,
                               phase: 'cf_needed',
                               status: h.status,
+                              retryAfter: h.headers.get('retry-after') || '',
                               body: hText,
                               hcaptchaToken: hcaptchaToken,
                               captchaAccepted: false
                             }));
                             return;
                           }
-                          hLast = { endpoint: ep, status: h.status, body: hText };
+                          hLast = { endpoint: ep, status: h.status, retryAfter: h.headers.get('retry-after') || '', body: hText };
                           if (h.status === 200) { hOk = true; break; }
                           if (h.status !== 404) break;
                         } catch (e) {
-                          hLast = { endpoint: ep, status: 0, body: String(e) };
+                          if (e && e.name === 'AbortError') {
+                            reportLoginAbort(subId);
+                            return;
+                          }
+                          hLast = { endpoint: ep, status: 0, retryAfter: '', body: String(e) };
                         }
                       }
                       if (!hOk) {
-                        callBridge('onAuthResult', JSON.stringify({ phase: 'hcaptcha', status: hLast ? hLast.status : 0, body: JSON.stringify(hLast) }));
+                        callBridge('onAuthResult', JSON.stringify({
+                          submissionId: subId,
+                          phase: 'hcaptcha',
+                          status: hLast ? hLast.status : 0,
+                          retryAfter: hLast ? hLast.retryAfter : '',
+                          body: JSON.stringify(hLast)
+                        }));
                         return;
                       }
                     }
@@ -891,22 +1366,46 @@ class BrowserSession(
                         'X-Requested-With': 'XMLHttpRequest',
                         'Accept': 'application/json'
                       },
-                      body: form
+                      body: form,
+                      signal: signal
                     });
                     var sText = await s.text();
                     if (s.status !== 200) reportResponse('session 非 200', s);
                     if (isCloudflareChallenge(s, sText)) {
                       callBridge('onAuthResult', JSON.stringify({
+                        submissionId: subId,
                         phase: 'cf_needed',
                         status: s.status,
+                        retryAfter: s.headers.get('retry-after') || '',
                         body: sText,
                         captchaAccepted: !!hcaptchaToken
                       }));
                       return;
                     }
-                    callBridge('onAuthResult', JSON.stringify({ phase: 'session', status: s.status, body: sText }));
+                    callBridge('onAuthResult', JSON.stringify({
+                      submissionId: subId,
+                      phase: 'session',
+                      status: s.status,
+                      retryAfter: s.headers.get('retry-after') || '',
+                      body: sText
+                    }));
                   } catch (e) {
-                    callBridge('onAuthResult', JSON.stringify({ phase: 'exception', status: 0, body: String(e) }));
+                    if (e && e.name === 'AbortError') {
+                      reportLoginAbort(subId);
+                      return;
+                    }
+                    callBridge('onAuthResult', JSON.stringify({
+                      submissionId: subId,
+                      phase: 'exception',
+                      status: 0,
+                      retryAfter: '',
+                      body: String(e)
+                    }));
+                  } finally {
+                    if (currentLoginSubmissionId === subId) {
+                      currentLoginSubmissionId = null;
+                      currentAbortController = null;
+                    }
                   }
                 }
                 /**
@@ -915,7 +1414,20 @@ class BrowserSession(
                  * 站点的邮件接口在触发人机验证时返回 403 invalid_access ——
                  * 换到 h_captcha_temp_id 后再提交才会被放行。
                  */
-                async function runEmailSend(hcaptchaToken) {
+                async function runEmailSend(subId, hcaptchaToken) {
+                  if (typeof AbortController === 'undefined') {
+                    callBridge('onAuthResult', JSON.stringify({
+                      submissionId: subId,
+                      phase: 'exception',
+                      status: 0,
+                      retryAfter: '',
+                      body: 'AbortController is unavailable'
+                    }));
+                    return;
+                  }
+                  currentLoginSubmissionId = subId;
+                  currentAbortController = new AbortController();
+                  var signal = currentAbortController.signal;
                   var email = $emailJson;
 
                   function isCloudflareChallenge(response, text) {
@@ -935,14 +1447,17 @@ class BrowserSession(
                       method: 'GET',
                       headers: { 'X-Requested-With': 'XMLHttpRequest', 'Accept': 'application/json' },
                       credentials: 'include',
-                      cache: 'no-store'
+                      cache: 'no-store',
+                      signal: signal
                     });
                     if (c.status !== 200) {
                       var cBody = await c.text();
                       var isCf = isCloudflareChallenge(c, cBody);
                       callBridge('onAuthResult', JSON.stringify({
+                        submissionId: subId,
                         phase: isCf ? 'cf_needed' : 'csrf',
                         status: c.status,
+                        retryAfter: c.headers.get('retry-after') || '',
                         body: cBody,
                         hcaptchaToken: isCf ? hcaptchaToken : null
                       }));
@@ -966,30 +1481,39 @@ class BrowserSession(
                               'X-CSRF-Token': csrf,
                               'X-Requested-With': 'XMLHttpRequest'
                             },
-                            body: 'token=' + encodeURIComponent(hcaptchaToken)
+                            body: 'token=' + encodeURIComponent(hcaptchaToken),
+                            signal: signal
                           });
                           var hText = await h.text();
                           if (isCloudflareChallenge(h, hText)) {
                             callBridge('onAuthResult', JSON.stringify({
+                              submissionId: subId,
                               phase: 'cf_needed',
                               status: h.status,
+                              retryAfter: h.headers.get('retry-after') || '',
                               body: hText,
                               hcaptchaToken: hcaptchaToken,
                               captchaAccepted: false
                             }));
                             return;
                           }
-                          hLast = { endpoint: ep, status: h.status, body: hText };
+                          hLast = { endpoint: ep, status: h.status, retryAfter: h.headers.get('retry-after') || '', body: hText };
                           if (h.status === 200) { hOk = true; break; }
                           if (h.status !== 404) break;
                         } catch (e) {
-                          hLast = { endpoint: ep, status: 0, body: String(e) };
+                          if (e && e.name === 'AbortError') {
+                            reportLoginAbort(subId);
+                            return;
+                          }
+                          hLast = { endpoint: ep, status: 0, retryAfter: '', body: String(e) };
                         }
                       }
                       if (!hOk) {
                         callBridge('onAuthResult', JSON.stringify({
+                          submissionId: subId,
                           phase: 'hcaptcha',
                           status: hLast ? hLast.status : 0,
+                          retryAfter: hLast ? hLast.retryAfter : '',
                           body: JSON.stringify(hLast)
                         }));
                         return;
@@ -1006,13 +1530,16 @@ class BrowserSession(
                         'X-Requested-With': 'XMLHttpRequest',
                         'Accept': 'application/json'
                       },
-                      body: JSON.stringify({ login: email })
+                      body: JSON.stringify({ login: email }),
+                      signal: signal
                     });
                     var rText = await r.text();
                     if (isCloudflareChallenge(r, rText)) {
                       callBridge('onAuthResult', JSON.stringify({
+                        submissionId: subId,
                         phase: 'cf_needed',
                         status: r.status,
+                        retryAfter: r.headers.get('retry-after') || '',
                         body: rText,
                         hcaptchaToken: hcaptchaToken,
                         captchaAccepted: false
@@ -1020,17 +1547,49 @@ class BrowserSession(
                       return;
                     }
                     if (r.status === 403) {
-                      // 站内人机验证未通过：让页面重新渲染一次勾选框。
-                      callBridge('onAuthResult', JSON.stringify({ phase: 'hcaptcha', status: r.status, body: rText }));
+                      callBridge('onAuthResult', JSON.stringify({
+                        submissionId: subId,
+                        phase: 'hcaptcha',
+                        status: r.status,
+                        retryAfter: r.headers.get('retry-after') || '',
+                        body: rText
+                      }));
                       return;
                     }
                     if (r.status !== 200) {
-                      callBridge('onAuthResult', JSON.stringify({ phase: 'exception', status: r.status, body: rText }));
+                      callBridge('onAuthResult', JSON.stringify({
+                        submissionId: subId,
+                        phase: 'exception',
+                        status: r.status,
+                        retryAfter: r.headers.get('retry-after') || '',
+                        body: rText
+                      }));
                       return;
                     }
-                    callBridge('onAuthResult', JSON.stringify({ phase: 'email_sent', status: r.status, body: rText }));
+                    callBridge('onAuthResult', JSON.stringify({
+                      submissionId: subId,
+                      phase: 'email_sent',
+                      status: r.status,
+                      retryAfter: r.headers.get('retry-after') || '',
+                      body: rText
+                    }));
                   } catch (e) {
-                    callBridge('onAuthResult', JSON.stringify({ phase: 'exception', status: 0, body: String(e) }));
+                    if (e && e.name === 'AbortError') {
+                      reportLoginAbort(subId);
+                      return;
+                    }
+                    callBridge('onAuthResult', JSON.stringify({
+                      submissionId: subId,
+                      phase: 'exception',
+                      status: 0,
+                      retryAfter: '',
+                      body: String(e)
+                    }));
+                  } finally {
+                    if (currentLoginSubmissionId === subId) {
+                      currentLoginSubmissionId = null;
+                      currentAbortController = null;
+                    }
                   }
                 }
                 window.__linuxdoRunLogin = ${if (emailMode) "runEmailSend" else "runLogin"};
@@ -1268,10 +1827,15 @@ class BrowserSession(
                 request: WebResourceRequest?,
                 errorResponse: WebResourceResponse?,
             ) {
+                val status = errorResponse?.statusCode ?: 0
                 diagnostics.log(
-                    "登录 WebView HTTP 错误 [${errorResponse?.statusCode ?: 0}]: ${request?.url}" +
+                    "登录 WebView HTTP 错误 [$status]: ${request?.url}" +
                         cfMitigatedSuffix(errorResponse),
                 )
+                if (status == 429 && request?.isForMainFrame == true) {
+                    val retryAfter = HttpHeaderUtils.parseRetryAfter(errorResponse?.responseHeaders?.get("Retry-After"))
+                    TopicRepository.enterRateLimitCooldown(request.url.toString(), retryAfter, store)
+                }
             }
 
             override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
@@ -1303,15 +1867,19 @@ class BrowserSession(
      * 其他收场路径则彻底销毁，下一次登录从全新的 WebView 开始。
      */
     fun detachAuth(view: WebView) {
-        if (authWebView !== view) return
         (view.context as? MutableContextWrapper)?.baseContext = appContext
+        if (authWebView !== view) return
         if (awaitingSecondFactorLogin) return
-        authWebView = null
+        val submissionId = currentSubmissionId
+        val completion = authSubmitCompletion
+        if (submissionId != null && completion != null && !completion.isCompleted) {
+            cancelledSubmissionId = submissionId
+            abortActiveAuthSubmission(submissionId, view, completion)
+            return
+        }
         pendingAuthHtml = null
         authHtmlInjected = false
-        view.stopLoading()
-        view.removeJavascriptInterface(BRIDGE_NAME)
-        view.destroy()
+        destroyAuthWebView(view)
     }
 
     private fun createLoggingChromeClient(scope: String): WebChromeClient = object : WebChromeClient() {
@@ -1320,8 +1888,32 @@ class BrowserSession(
             val source = consoleMessage?.sourceId().orEmpty()
             val line = consoleMessage?.lineNumber() ?: 0
             val level = consoleMessage?.messageLevel()
+            
+            // 过滤掉常见的非关键浏览器警告，避免日志刷屏
+            if (shouldFilterConsoleMessage(msg, level)) {
+                return true
+            }
+            
             diagnostics.log("$scope WebView Console [$level] ($source:$line): $msg")
             return true
+        }
+        
+        private fun shouldFilterConsoleMessage(msg: String, level: ConsoleMessage.MessageLevel?): Boolean {
+            // 仅过滤 WARNING 级别的已知噪音，保留 ERROR 以便排障
+            if (level != ConsoleMessage.MessageLevel.WARNING) {
+                return false
+            }
+            
+            val lowerMsg = msg.lowercase()
+            return when {
+                // Permissions-Policy 未识别特性警告（浏览器兼容性问题，非应用错误）
+                lowerMsg.contains("permissions-policy") && lowerMsg.contains("unrecognized feature") -> true
+                // OTS 字体解析警告（第三方字体问题，不影响功能）
+                lowerMsg.contains("ots parsing error") -> true
+                // 字体压缩尺寸警告（性能优化提示，非功能错误）
+                lowerMsg.contains("decompressed") && lowerMsg.contains("compressed size") -> true
+                else -> false
+            }
         }
     }
 
@@ -1338,13 +1930,58 @@ class BrowserSession(
         val webView = WebView(MutableContextWrapper(appContext))
         configureWebView(webView)
         webView.webViewClient = object : WebViewClient() {
+            override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                val url = request?.url?.toString().orEmpty()
+                if (request?.isForMainFrame == true && verificationStart >= 0 && verificationSawChallenge && isBareChallengeUrl(url)) {
+                    // 对齐 Fluxdo：挑战页面完成后重定向回裸 /challenge，导航开始前立即盖上遮罩
+                    verificationNeedsInteraction = false
+                    view?.alpha = 0f
+                    if (view != null) installOriginFallbackMask(view)
+                }
+                return false
+            }
+
             override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
+                hasMainFrameError = false
+                val currentUrl = url.orEmpty()
+                if (verificationStart >= 0) {
+                    verificationNavStarted = true
+                    if (verificationSawChallenge && isBareChallengeUrl(currentUrl)) {
+                        verificationNeedsInteraction = false
+                        view?.alpha = 0f
+                    }
+                }
+                if (view != null && isChallengePathUrl(currentUrl)) {
+                    installOriginFallbackMask(view)
+                }
                 Log.d(TAG, "onPageStarted: $url")
+            }
+
+            override fun onPageCommitVisible(view: WebView?, url: String?) {
+                super.onPageCommitVisible(view, url)
+                val currentUrl = url.orEmpty()
+                if (view != null && isChallengePathUrl(currentUrl)) {
+                    installOriginFallbackMask(view)
+                    if (challengeOriginReached || (verificationStart >= 0 && !verificationNeedsInteraction)) {
+                        view.alpha = 0f
+                    }
+                }
             }
 
             override fun onPageFinished(view: WebView?, url: String?) {
                 finishedCount++
                 CookieManager.getInstance().flush()
+                val currentUrl = url.orEmpty()
+                if (view != null && isChallengePathUrl(currentUrl)) {
+                    installOriginFallbackMask(view)
+                }
+                // 必须先有本次导航的 onPageStarted：被 loadUrl 打断的上一页（静默重验证的首页）
+                // 也会回调 onPageFinished，不能把它当成验证页已加载。
+                if (verificationStart >= 0 && verificationNavStarted && !hasMainFrameError &&
+                    runCatching { Uri.parse(currentUrl).host }.getOrNull() == Config.HOST
+                ) {
+                    verificationPageLoaded = true
+                }
                 Log.d(TAG, "onPageFinished: $url")
             }
 
@@ -1362,6 +1999,7 @@ class BrowserSession(
                     Log.w(TAG, "SSL 错误已忽略(DEBUG): $primaryErr")
                     handler?.proceed()
                 } else {
+                    hasMainFrameError = true
                     handler?.cancel()
                 }
             }
@@ -1375,11 +2013,35 @@ class BrowserSession(
                 val url = request?.url?.toString().orEmpty()
                 val status = errorResponse?.statusCode ?: 0
                 val reason = errorResponse?.reasonPhrase.orEmpty()
-                diagnostics.log("WebView HTTP 错误 [$status $reason]: $url")
+                // Cloudflare PAT (Private Access Token) 硬件探测在移动端 WebView 必然返回 401，由 Turnstile 自动降级，忽略不报障
+                if (url.contains("/pat/") && status == 401) {
+                    return
+                }
+                diagnostics.log("WebView HTTP 错误 [$status $reason]: $url" + cfMitigatedSuffix(errorResponse))
+                if (request?.isForMainFrame == true) {
+                    if (status == 404 && isBareChallengeUrl(url) && !isCfMitigatedChallenge(errorResponse)) {
+                        // 对齐 Fluxdo：/challenge 是站点专用的 CF 验证入口，回源 404 本身就是已通过 CF 的完成信号，
+                        // 绝不能当成主框架错误，且立即隐藏 WebView 避免露出 Discourse 404 页面。
+                        challengeOriginReached = true
+                        verificationNeedsInteraction = false
+                        if (verificationStart >= 0) {
+                            view?.alpha = 0f
+                        }
+                        if (view != null) installOriginFallbackMask(view)
+                        diagnostics.log("WebView 主框架 /challenge 返回源站 404，判定已通过 Cloudflare")
+                        return
+                    }
+                    if (status !in listOf(403, 503)) {
+                        hasMainFrameError = true
+                    }
+                }
             }
 
             override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
                 super.onReceivedError(view, request, error)
+                if (request?.isForMainFrame == true) {
+                    hasMainFrameError = true
+                }
                 val url = request?.url?.toString().orEmpty()
                 val code = error?.errorCode ?: 0
                 val desc = error?.description?.toString().orEmpty()
@@ -1442,36 +2104,525 @@ class BrowserSession(
 
     suspend fun currentUrl(): String? = withContext(Dispatchers.Main) { webView().url }
 
+    data class ProbeResult(
+        val status: String,
+        val csrf: String = "",
+        val error: String = "",
+    )
+
+    /**
+     * 通过 JS Bridge 异步探测当前 WebView 会话状态与 CSRF 可用性。
+     * 解决 evaluateJavascript 无法 await Promise（导致立即返回 "{}" 误判为超时）的问题。
+     */
+    suspend fun runProbe(timeoutMs: Long = 4_000L): ProbeResult? {
+        val reqId = UUID.randomUUID().toString()
+        val deferred = CompletableDeferred<String>()
+        probeRequests[reqId] = deferred
+        val script = """
+            (async function(reqId) {
+              try {
+                if (location.href === 'about:blank') {
+                  window.$BRIDGE_NAME.onProbeComplete(reqId, JSON.stringify({ status: 'ABOUT_BLANK', origin: location.origin }));
+                  return;
+                }
+                if (location.protocol !== 'https:' || location.host !== ${JSONObject.quote(Config.HOST)}) {
+                  window.$BRIDGE_NAME.onProbeComplete(reqId, JSON.stringify({ status: 'WRONG_ORIGIN', origin: location.origin }));
+                  return;
+                }
+                const hasChallenge = (document.title || '').includes('Just a moment') ||
+                  Boolean(document.querySelector('#challenge-running, #challenge-stage, form#challenge-form, #cf-wrapper, .cf-turnstile'));
+                if (hasChallenge) {
+                  window.$BRIDGE_NAME.onProbeComplete(reqId, JSON.stringify({ status: 'CF_CHALLENGE' }));
+                  return;
+                }
+                const res = await fetch('/session/csrf.json', {
+                  method: 'GET',
+                  credentials: 'include',
+                  headers: { 'X-Requested-With': 'XMLHttpRequest', 'Accept': 'application/json' }
+                });
+                if (res.status === 200) {
+                  const data = await res.json();
+                  window.$BRIDGE_NAME.onProbeComplete(reqId, JSON.stringify({ status: 'CLEARED', csrf: data.csrf || '' }));
+                } else {
+                  window.$BRIDGE_NAME.onProbeComplete(reqId, JSON.stringify({ status: 'HTTP_' + res.status }));
+                }
+              } catch (e) {
+                window.$BRIDGE_NAME.onProbeComplete(reqId, JSON.stringify({ status: 'ERROR', msg: String(e) }));
+              }
+            })(${JSONObject.quote(reqId)});
+        """.trimIndent()
+
+        return try {
+            withContext(Dispatchers.Main) {
+                webView().evaluateJavascript(script, null)
+            }
+            val raw = withTimeoutOrNull(timeoutMs) { deferred.await() } ?: return null
+            val json = runCatching { JSONObject(raw) }.getOrNull() ?: return null
+            ProbeResult(
+                status = json.optString("status"),
+                csrf = json.optString("csrf"),
+                error = json.optString("msg"),
+            )
+        } catch (_: Exception) {
+            null
+        } finally {
+            probeRequests.remove(reqId)
+        }
+    }
+
     suspend fun currentTitle(): String = evalString("document.title")
 
-    /** 当前页已在站内且不再是 Cloudflare 挑战页。 */
+    /** 当前页已在站内且不再是 Cloudflare 挑战页，并严格排除 Chromium 错误页与非法源。 */
     suspend fun isPageCleared(): Boolean {
-        val host = currentUrl()?.let { Uri.parse(it).host }
-        if (host != Config.HOST) return false
+        if (hasMainFrameError) return false
+        val url = currentUrl() ?: return false
+        val uri = Uri.parse(url)
+        if (uri.scheme != "https" || uri.host != Config.HOST) return false
+
         val title = currentTitle()
-        return title.isNotBlank() && !ChallengeDetector.isChallengeTitle(title)
+        if (title.isNotBlank() && ChallengeDetector.isChallengeTitle(title)) return false
+
+        val jsEnvCheck = evalString(
+            """
+            (function() {
+                try {
+                    if (window.location.protocol !== 'https:' || window.location.host !== ${JSONObject.quote(Config.HOST)}) {
+                        return 'invalid_origin';
+                    }
+                    if (document.title.includes('Just a moment') || document.querySelector('#challenge-running, #challenge-stage, form#challenge-form, #cf-wrapper, .cf-turnstile')) {
+                        return 'challenge_running';
+                    }
+                    var metaToken = document.querySelector('meta[name="csrf-token"]')?.content;
+                    if (metaToken && metaToken.length > 5) return 'cleared';
+                    var hasDiscourse = Boolean(document.querySelector('#main-outlet, .d-header, header, #site-logo, .topic-list'));
+                    if (hasDiscourse) return 'cleared';
+                    return 'loading';
+                } catch (e) {
+                    return 'error:' + e;
+                }
+            })()
+            """.trimIndent()
+        )
+        if (jsEnvCheck == "cleared") return true
+        if (challengeOriginReached && jsEnvCheck == "loading") return true
+        return false
+    }
+
+    /** 获取当前 WebView 站内页面真实绑定的 CSRF Token */
+    suspend fun currentCsrfToken(): String? {
+        val metaToken = evalString("document.querySelector('meta[name=\"csrf-token\"]')?.content || ''")
+        if (metaToken.isNotBlank()) return metaToken
+        val probe = runProbe(timeoutMs = 4_000L)
+        return probe?.csrf?.takeIf { it.isNotBlank() }
+    }
+
+    /**
+     * 确保 WebView 传输层处于真实有效的站内同源环境。
+     * 若当前未就绪或处于错误页，尝试重新导航首页并等待加载/过盾。
+     */
+    suspend fun ensureReady(): Boolean {
+        if (isPageCleared()) return true
+        return clearChallenge("就绪检查")
+    }
+
+    suspend fun beginInteractiveVerification() = withContext(Dispatchers.Main) {
+        // 重试时现场已无 clearance，保留首次进入时记下的那枚，供放弃验证时回填
+        store.syncFromWebView()[Config.CF_CLEARANCE_COOKIE]?.takeIf { it.isNotBlank() }?.let { verificationClearance = it }
+        verificationStart = finishedCount
+        verificationStartedAt = SystemClock.elapsedRealtime()
+        verificationPageLoaded = false
+        verificationNavStarted = false
+        challengeOriginReached = false
+        verificationNeedsInteraction = false
+        verificationSawChallenge = false
+        activeChallengeDetectedAt = 0L
+        store.clearCookie(Config.CF_CLEARANCE_COOKIE)
+        // 先停掉静默重验证遗留的导航，避免它的回调混进验证页的加载判定
+        webViewInstance?.stopLoading()
+        webViewInstance?.alpha = 0f
+        verificationNavStarted = false
+        verificationPageLoaded = false
+        hasMainFrameError = false
+        openUrl("${Config.BASE_URL}$CF_CHALLENGE_PATH")
+    }
+
+    enum class VerifyPageState { LOADING, READY, STALLED }
+
+    /**
+     * 验证页当前状态，供界面决定显示原生加载/异常层还是露出 WebView。
+     * 对齐 Fluxdo：默认由原生加载遮罩覆盖 WebView，只有探测到需要人工交互的 CF 挑战元素
+     * （[verificationNeedsInteraction] == true 且尚未回源 404）时才露出 WebView；
+     * 非交互挑战自动通过或直接回源 404 时全程保持 LOADING，不露一帧 404 页面。
+     */
+    fun verifyPageState(): VerifyPageState = when {
+        verificationStart < 0 -> VerifyPageState.READY
+        challengeOriginReached -> VerifyPageState.LOADING
+        hasMainFrameError -> VerifyPageState.STALLED
+        verificationPageLoaded && verificationNeedsInteraction -> VerifyPageState.READY
+        !verificationPageLoaded && SystemClock.elapsedRealtime() - verificationStartedAt > VERIFY_STALL_MS -> VerifyPageState.STALLED
+        else -> VerifyPageState.LOADING
+    }
+
+    /**
+     * 验证页加载异常：主框架报错（chrome-error），或打开后 [VERIFY_STALL_MS] 内一页都没加载完。
+     * 用于在验证页提示「检查网络或代理」，Turnstile 正常渲染时不会命中。
+     */
+    fun isVerificationPageStalled(): Boolean {
+        if (verificationStart < 0 || challengeOriginReached) return false
+        if (hasMainFrameError) return true
+        // 不能用 finishedCount 判断：loadUrl 打断上一页时旧页面也会回调 onPageFinished，
+        // 会让「没加载完」漏判，只能等系统约 10 秒后报连接超时才提示。
+        return !verificationPageLoaded &&
+            SystemClock.elapsedRealtime() - verificationStartedAt > VERIFY_STALL_MS
+    }
+
+    private suspend fun finishInteractiveVerification(reason: String): Boolean {
+        verificationNeedsInteraction = false
+        withContext(Dispatchers.Main) {
+            webViewInstance?.alpha = 0f
+        }
+        delay(CF_COOKIE_SETTLE_DELAY_MS)
+        withContext(Dispatchers.Main) {
+            CookieManager.getInstance().flush()
+            store.syncFromWebView()
+            webViewInstance?.alpha = 1f
+        }
+        diagnostics.log("交互式安全验证完成: $reason")
+        lastClearedAtElapsed = SystemClock.elapsedRealtime()
+        store.completeVerification()
+        verificationStart = -1
+        verificationClearance = null
+        verificationSawChallenge = false
+        activeChallengeDetectedAt = 0L
+        return true
+    }
+
+    suspend fun interactiveVerificationComplete(): Boolean {
+        if (verificationStart < 0) return false
+        if (challengeOriginReached) {
+            return finishInteractiveVerification("主框架 /challenge 已到达源站 404")
+        }
+        if (finishedCount <= verificationStart) return false
+
+        val clearance = withContext(Dispatchers.Main) {
+            CookieManager.getInstance().flush()
+            store.syncFromWebView()[Config.CF_CLEARANCE_COOKIE]
+        }
+        val clearanceChanged = !clearance.isNullOrBlank() && clearance != verificationClearance
+        val activeChallenge = evalString(ACTIVE_CHALLENGE_PROBE_JS) == "true"
+        if (activeChallenge) {
+            verificationSawChallenge = true
+        }
+        if (clearanceChanged && !activeChallenge) {
+            return finishInteractiveVerification("检测到新 cf_clearance 且页面已无活跃挑战标记")
+        }
+
+        if (verificationPageLoaded && !challengeOriginReached) {
+            val originNotFound = evalString(ORIGIN_NOT_FOUND_PROBE_JS) == "true"
+            if (originNotFound) {
+                challengeOriginReached = true
+                return finishInteractiveVerification("DOM 检测到源站 404 页面")
+            }
+            if (activeChallenge) {
+                if (activeChallengeDetectedAt == 0L) {
+                    activeChallengeDetectedAt = SystemClock.elapsedRealtime()
+                } else if (
+                    !verificationNeedsInteraction &&
+                    SystemClock.elapsedRealtime() - activeChallengeDetectedAt >= VERIFY_REVEAL_DELAY_MS
+                ) {
+                    verificationNeedsInteraction = true
+                    withContext(Dispatchers.Main) {
+                        webViewInstance?.let { view ->
+                            hideOriginFallbackMask(view)
+                            view.alpha = 1f
+                        }
+                    }
+                }
+            } else {
+                activeChallengeDetectedAt = 0L
+                if (verificationNeedsInteraction && verificationSawChallenge) {
+                    // 对齐 Fluxdo _startRevealedStateWatcher：原本有挑战的页面挑战标记消失，立即盖回遮罩等待收口
+                    verificationNeedsInteraction = false
+                    withContext(Dispatchers.Main) { webViewInstance?.alpha = 0f }
+                } else if (
+                    !verificationNeedsInteraction &&
+                    !verificationSawChallenge &&
+                    SystemClock.elapsedRealtime() - verificationStartedAt >= VERIFY_FALLBACK_REVEAL_MS
+                ) {
+                    verificationNeedsInteraction = true
+                    withContext(Dispatchers.Main) {
+                        webViewInstance?.let { view ->
+                            hideOriginFallbackMask(view)
+                            view.alpha = 1f
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!isPageCleared()) return false
+        val forumLoaded = evalString("Boolean(document.querySelector('#main-outlet, .d-header, header, #site-logo, .topic-list'))") == "true"
+        if (forumLoaded) {
+            return finishInteractiveVerification("已加载站内论坛 DOM")
+        }
+        return false
+    }
+
+    /**
+     * 用户放弃验证时：若没拿到新 clearance，就把进入验证前的那枚回填。
+     * beginInteractiveVerification 为检测换发会先删掉旧 clearance，验证页又打不开（DoH 直连）时
+     * 直接返回会让后续 GET 也失去凭据。
+     */
+    suspend fun restoreClearanceIfVerificationAbandoned() = withContext(Dispatchers.Main) {
+        val previous = verificationClearance?.takeIf { it.isNotBlank() } ?: return@withContext
+        verificationClearance = null
+        val current = store.syncFromWebView()[Config.CF_CLEARANCE_COOKIE]
+        if (!current.isNullOrBlank()) return@withContext
+        CookieManager.getInstance().apply {
+            setCookie(
+                Config.BASE_URL,
+                "${Config.CF_CLEARANCE_COOKIE}=$previous; Domain=.${Config.HOST}; Path=/; Secure; HttpOnly; SameSite=None; Max-Age=86400",
+            )
+            flush()
+        }
+        diagnostics.log("验证已取消，回填进入验证前的 cf_clearance(指纹 ${NetDiagnostics.fingerprint(previous)})")
+    }
+
+    suspend fun stopSessionRequests() = withContext(Dispatchers.Main) {
+        cancelCaptchaLogin()
+        pending.values.forEach { it.cancel(CancellationException("会话已切换")) }
+        pending.clear()
+        probeRequests.values.forEach { it.cancel(CancellationException("会话已切换")) }
+        probeRequests.clear()
+        verificationStart = -1
+        challengeOriginReached = false
+        verificationNeedsInteraction = false
+        verificationSawChallenge = false
+        activeChallengeDetectedAt = 0L
+        webViewInstance?.let { view ->
+            view.alpha = 1f
+            view.stopLoading()
+            view.loadUrl("about:blank")
+        }
     }
 
     /**
      * 静默重验证:在 WebView 里重新加载首页,等待挑战自动通过,并把最新 Cookie 同步回加密存储。
      * 超时返回 false,由调用方决定是否转入可见的交互验证。
      */
-    suspend fun clearChallenge(reason: String): Boolean = solveMutex.withLock {
-        diagnostics.log("静默重验证开始: $reason")
-        val finishedBefore = finishedCount
+    /** 当前 WebView 里是否已有 cf_clearance。 */
+    suspend fun hasCfClearance(): Boolean = withContext(Dispatchers.Main) { currentCfClearance() != null }
+
+    /**
+     * 没有 cf_clearance 时，在隐藏 WebView 里静默打开 /challenge 换取一枚。已有则直接返回 true。
+     *
+     * cf_clearance 只在真正通过一次挑战后签发。网页授权在外部浏览器完成，凭据带不进 App，
+     * 兑换阶段的几个 GET 又不会被挑战，于是登录成功却始终没有 cf_clearance，第一个 POST 必然撞写规则。
+     * 首页通常不被挑战，加载首页拿不到凭据；/challenge 是站点专用验证入口，必定触发挑战，
+     * 非交互挑战会在这里自动通过并签发凭据。
+     */
+    suspend fun ensureCfClearance(reason: String, timeoutMs: Long = Config.CHALLENGE_TIMEOUT_MS): Boolean =
+        solveMutex.withLock {
+            if (hasCfClearance() || challengeOriginReached) return@withLock true
+            acquireCfClearanceLocked(reason, timeoutMs)
+        }
+
+    /** 调用方必须已持有 [solveMutex]。 */
+    private suspend fun acquireCfClearanceLocked(reason: String, timeoutMs: Long = Config.CHALLENGE_TIMEOUT_MS): Boolean {
+        diagnostics.log("静默补签 cf_clearance 开始: $reason")
+        val startedAt = SystemClock.elapsedRealtime()
+        hasMainFrameError = false
+        challengeOriginReached = false
+        openUrl("${Config.BASE_URL}$CF_CHALLENGE_PATH")
+        val deadline = startedAt + timeoutMs
+        var unreachableSince = -1L
+        var sawChallenge = false
+        var outcome = SilentOutcome.TIMEOUT
+        try {
+            while (SystemClock.elapsedRealtime() < deadline) {
+                delay(POLL_INTERVAL_MS)
+                val clearance = withContext(Dispatchers.Main) {
+                    CookieManager.getInstance().flush()
+                    currentCfClearance()
+                }
+                val activeChallenge = evalString(ACTIVE_CHALLENGE_PROBE_JS) == "true"
+                if (activeChallenge) {
+                    sawChallenge = true
+                }
+                if (!challengeOriginReached && !activeChallenge && evalString(ORIGIN_NOT_FOUND_PROBE_JS) == "true") {
+                    challengeOriginReached = true
+                }
+                if (challengeOriginReached || (clearance != null && !activeChallenge)) {
+                    // 等 Chromium 把同轮签发的其余 Cookie 落盘再同步
+                    delay(CF_COOKIE_SETTLE_DELAY_MS)
+                    withContext(Dispatchers.Main) {
+                        CookieManager.getInstance().flush()
+                        store.syncFromWebView()
+                    }
+                    outcome = SilentOutcome.CLEARED
+                    break
+                }
+                if (hasMainFrameError) {
+                    if (unreachableSince < 0) unreachableSince = SystemClock.elapsedRealtime()
+                    if (SystemClock.elapsedRealtime() - unreachableSince > UNREACHABLE_GRACE_MS) {
+                        outcome = SilentOutcome.UNREACHABLE
+                        break
+                    }
+                }
+            }
+        } catch (cancelled: CancellationException) {
+            diagnostics.log("[诊断] 静默补签 cf_clearance 被取消(+${SystemClock.elapsedRealtime() - startedAt}ms)")
+            throw cancelled
+        }
+        if (outcome == SilentOutcome.TIMEOUT && sawChallenge) {
+            outcome = SilentOutcome.CHALLENGE
+        }
+        lastSilentOutcome = outcome
+        val cleared = outcome == SilentOutcome.CLEARED
+        if (cleared) {
+            lastClearedAtElapsed = SystemClock.elapsedRealtime()
+        }
+        diagnostics.log(
+            "静默补签 cf_clearance ${if (cleared) "成功" else "未通过(${outcome.name})"}" +
+                " 耗时=${SystemClock.elapsedRealtime() - startedAt}ms",
+        )
+        return cleared
+    }
+
+    suspend fun clearChallenge(reason: String, failedClearanceFp: String = "-"): Boolean = solveMutex.withLock {
+        val currentClearance = withContext(Dispatchers.Main) {
+            CookieManager.getInstance().flush()
+            currentCfClearance()
+        }
+        val currentFp = NetDiagnostics.fingerprint(currentClearance)
+        val now = SystemClock.elapsedRealtime()
+        val sinceLastClear = if (lastClearedAtElapsed > 0L) now - lastClearedAtElapsed else Long.MAX_VALUE
+        // P0-1 锁内 Double-Check：
+        // a. 请求携带的 failedClearanceFp 与当前 WebView 权威 currentFp 已不同（且当前值未被判死）；
+        // b. 起飞时无凭据(failedClearanceFp == "-")，但距上次 CLEARED < 8s 且当前已持有未判死的 cf_clearance。
+        val currentHealthy = currentFp != "-" && !store.isClearanceChallenged(currentClearance)
+        val clearanceRotated = failedClearanceFp != "-" &&
+            currentHealthy &&
+            currentFp != failedClearanceFp
+        val recentlyCleared = failedClearanceFp == "-" &&
+            currentHealthy &&
+            sinceLastClear in 0L..COALESCE_CLEAR_WINDOW_MS
+        if (clearanceRotated || recentlyCleared) {
+            withContext(Dispatchers.Main) { store.syncFromWebView() }
+            lastSilentOutcome = SilentOutcome.CLEARED
+            diagnostics.log(
+                "静默重验证合并跳过(凭据已就绪): $reason | failedFp=$failedClearanceFp currentFp=$currentFp" +
+                    " sinceLast=${if (sinceLastClear == Long.MAX_VALUE) -1L else sinceLastClear}ms",
+            )
+            return@withLock true
+        }
+        if (failedClearanceFp != "-") {
+            store.noteClearanceChallenged(failedClearanceFp)
+        }
+        // 手里根本没有 cf_clearance 时，重载首页不会签发凭据（首页一般不被挑战），重试照样撞盾
+        if (currentClearance.isNullOrBlank()) return@withLock acquireCfClearanceLocked(reason)
+        diagnostics.log("静默重验证开始: $reason (failedFp=$failedClearanceFp, currentFp=$currentFp)")
+        val startedAt = SystemClock.elapsedRealtime()
+        logEnvironmentOnce()
+        logCookieInventory("重验证前")
+        hasMainFrameError = false
         openUrl("${Config.BASE_URL}/")
         val deadline = SystemClock.elapsedRealtime() + Config.CHALLENGE_TIMEOUT_MS
         var cleared = false
+        var challengeStartTime = -1L
+        var lastProbeState = ""
+        var round = 0
+        var unreachableSince = -1L
+        var outcome = SilentOutcome.TIMEOUT
+        try {
         while (SystemClock.elapsedRealtime() < deadline) {
-            delay(POLL_INTERVAL_MS)
-            if (finishedCount > finishedBefore && isPageCleared()) {
+            val probe = runProbe(timeoutMs = 4_000L)
+            round++
+            val probeState = "probe=${probe?.status ?: "TIMEOUT"}${probe?.error?.takeIf { it.isNotBlank() }?.let { "(${it.take(60)})" }.orEmpty()}" +
+                " url=${currentUrl()?.let { runCatching { Uri.parse(it).let { u -> "${u.scheme}://${u.host}${u.path}" } }.getOrNull() } ?: "-"}" +
+                " title=${currentTitle().take(30)} mainFrameError=$hasMainFrameError finished=$finishedCount"
+            if (probeState != lastProbeState) {
+                diagnostics.log("[诊断] 重验证第${round}轮 +${SystemClock.elapsedRealtime() - startedAt}ms $probeState")
+                lastProbeState = probeState
+            }
+            if (!hasMainFrameError && probe?.status != "WRONG_ORIGIN") {
+                unreachableSince = -1L
+            }
+            if (probe?.status == "CLEARED") {
+                CookieManager.getInstance().flush()
+                withContext(Dispatchers.Main) { store.syncFromWebView() }
+                diagnostics.log("静默重验证成功(探活通路畅通, hasCsrf=${probe.csrf.isNotBlank()})")
+                cleared = true
+                break
+            } else if (probe?.status == "CF_CHALLENGE") {
+                // 对齐 v1.3.1：挑战页留足 CHALLENGE_TIMEOUT_MS 让 CF 的 JS/非交互挑战自动跑完。
+                // 多数 "Just a moment" 几秒到十几秒内会自己通过，提前放弃等于把本可静默续上的盾变成手工验证。
+                if (challengeStartTime < 0) {
+                    challengeStartTime = SystemClock.elapsedRealtime()
+                    diagnostics.log("静默重验证: 遇到 Cloudflare 挑战页，等待其自动完成")
+                }
+                outcome = SilentOutcome.CHALLENGE
+            } else if (hasMainFrameError || probe?.status == "WRONG_ORIGIN") {
+                // 主框架连不上（DoH 直连下 WebView 不走 ECH 通道）时停在 chrome-error 页，
+                // 等多久都不会好转；宽限数秒排除重定向中间态后立即判定不可达，不再空等满 30 秒。
+                if (unreachableSince < 0) unreachableSince = SystemClock.elapsedRealtime()
+                if (SystemClock.elapsedRealtime() - unreachableSince > UNREACHABLE_GRACE_MS) {
+                    diagnostics.log("静默重验证: WebView 无法连通站点(主框架错误)，提前结束")
+                    outcome = SilentOutcome.UNREACHABLE
+                    break
+                }
+            } else if (isPageCleared()) {
+                CookieManager.getInstance().flush()
+                withContext(Dispatchers.Main) { store.syncFromWebView() }
+                diagnostics.log("静默重验证成功(DOM 特征就绪)")
                 cleared = true
                 break
             }
+            delay(POLL_INTERVAL_MS)
+        }
+        } catch (cancelled: CancellationException) {
+            diagnostics.log("[诊断] 静默重验证被取消(+${SystemClock.elapsedRealtime() - startedAt}ms, 第${round}轮, ${cancelled.message.orEmpty().take(40)})")
+            throw cancelled
         }
         withContext(Dispatchers.Main) { store.syncFromWebView() }
-        diagnostics.log(if (cleared) "静默重验证成功" else "静默重验证超时")
+        if (cleared) {
+            outcome = SilentOutcome.CLEARED
+            lastClearedAtElapsed = SystemClock.elapsedRealtime()
+        } else if (outcome == SilentOutcome.CHALLENGE) {
+            // 等满仍停在挑战页：确实需要人工交互（如 Turnstile 勾选）
+            diagnostics.log("静默等待超时仍为 Cloudflare 挑战，需前台交互验证")
+            store.requireVerification()
+        }
+        lastSilentOutcome = outcome
+        diagnostics.log(if (cleared) "静默重验证成功" else "静默重验证未通过(${outcome.name})")
+        diagnostics.log("[诊断] 静默重验证结束 cleared=$cleared 耗时=${SystemClock.elapsedRealtime() - startedAt}ms 轮数=$round 末态: $lastProbeState")
+        logCookieInventory("重验证后")
         cleared
+    }
+
+    /** 403 诊断：主站与 credit 子站的 CF/会话 Cookie 作用域与指纹。 */
+    suspend fun logCookieInventory(stage: String) {
+        val inventory = withContext(Dispatchers.Main) { runCatching { store.cookieInventory() }.getOrElse { "读取失败: ${it.javaClass.simpleName}" } }
+        diagnostics.log("[诊断] Cookie清单($stage): $inventory")
+    }
+
+    @Volatile private var environmentLogged = false
+
+    /** 每个进程记录一次：存储 UA、WebView 实际 UA、系统默认 UA 与 Client Hints 品牌版本是否一致。 */
+    suspend fun logEnvironmentOnce() {
+        if (environmentLogged) return
+        environmentLogged = true
+        val systemUa = runCatching { android.webkit.WebSettings.getDefaultUserAgent(appContext) }.getOrDefault("")
+        val pageUa = evalString("navigator.userAgent")
+        val brands = evalString(
+            "(navigator.userAgentData && navigator.userAgentData.brands) ? navigator.userAgentData.brands.map(function(b){return b.brand+'/'+b.version}).join(',') : 'none'",
+        )
+        val chromeVersion = { ua: String -> Regex("Chrome/([\\d.]+)").find(ua)?.groupValues?.get(1) ?: "-" }
+        diagnostics.log(
+            "[诊断] 环境: 固定UA Chrome=${chromeVersion(userAgent)} 页面UA Chrome=${chromeVersion(pageUa)}" +
+                " 系统WebView Chrome=${chromeVersion(systemUa)} 页面UA与固定UA一致=${pageUa == userAgent}" +
+                " ClientHints=$brands uaFp=${NetDiagnostics.fingerprint(userAgent)}",
+        )
     }
 
     /** 路径 B:在已通过挑战的页面内用 fetch() 请求,走真实 Chrome 网络栈。 */
@@ -1482,17 +2633,44 @@ class BrowserSession(
         body: String? = null,
         contentType: String = "application/json; charset=utf-8",
         present: Boolean = true,
+        allowRevalidate: Boolean = true,
     ): TransportResult {
-        if (!isPageCleared()) clearChallenge("fetch 前置检查")
+        val generation = store.sessionGeneration
+        if (!isPageCleared()) {
+            if (!allowRevalidate) {
+                diagnostics.log("[B: WebView fetch] 前置检查未通过(禁止循环重验)，放弃请求: $path")
+                return TransportResult(0, "WebView 前置检查未通过(页面未就绪)", false)
+            }
+            val cleared = clearChallenge("fetch 前置检查")
+            if (!cleared || !isPageCleared()) {
+                diagnostics.log("[B: WebView fetch] 前置检查未通过，放弃请求: $path (cleared=$cleared mainFrameError=$hasMainFrameError)")
+                return TransportResult(0, "WebView 前置检查未通过(页面未就绪或无法连接)", false)
+            }
+        }
         val id = UUID.randomUUID().toString()
         val deferred = CompletableDeferred<TransportResult>()
         pending[id] = deferred
-        withContext(Dispatchers.Main) {
-            webView().evaluateJavascript(buildFetchScript(id, path, csrf, method, body, contentType, present), null)
+        try {
+            withContext(Dispatchers.Main) {
+                if (generation != store.sessionGeneration || store.sessionChanging) throw CancellationException("会话已切换")
+                webView().evaluateJavascript(buildFetchScript(id, path, csrf, method, body, contentType, present), null)
+            }
+            val result = withTimeoutOrNull(Config.FETCH_TIMEOUT_MS) { deferred.await() }
+            if (generation != store.sessionGeneration) throw CancellationException("会话已切换")
+            if (result == null || method != "GET" || result.status >= 400 || result.status == 0) {
+                diagnostics.log(
+                    "[诊断] B $method $path -> ${result?.status ?: "超时"} challenged=${result?.challenged}" +
+                        " body=${result?.let { NetDiagnostics.bodyFeatures(it.body) } ?: "-"} hasCsrf=${!csrf.isNullOrBlank()}",
+                )
+            }
+            if (result?.challenged == true) store.requireVerification()
+            return result ?: TransportResult(0, "WebView fetch 超时", false)
+        } finally {
+            pending.remove(id)
+            withContext(kotlinx.coroutines.NonCancellable + Dispatchers.Main) {
+                webViewInstance?.evaluateJavascript("window.__requestAbort?.[${JSONObject.quote(id)}]?.abort()", null)
+            }
         }
-        val result = withTimeoutOrNull(Config.FETCH_TIMEOUT_MS) { deferred.await() }
-        pending.remove(id)
-        return result ?: TransportResult(0, "WebView fetch 超时", false)
     }
 
     suspend fun reset() = withContext(Dispatchers.Main) {
@@ -1500,6 +2678,10 @@ class BrowserSession(
         webView.loadUrl("about:blank")
         webView.clearCache(true)
         webView.clearHistory()
+    }
+
+    suspend fun clearResourceCache() = withContext(Dispatchers.Main) {
+        webViewInstance?.clearCache(true)
     }
 
     private fun buildFetchScript(
@@ -1510,33 +2692,55 @@ class BrowserSession(
         body: String?,
         contentType: String,
         present: Boolean = true,
-    ): String = """
+    ): String {
+        val targetUrl = if (path.startsWith("http://") || path.startsWith("https://")) {
+            path
+        } else {
+            "${Config.BASE_URL}${if (path.startsWith("/")) "" else "/"}$path"
+        }
+        return """
         (function () {
           var id = ${JSONObject.quote(id)};
-          fetch(${JSONObject.quote(path)}, {
+          window.__requestAbort = window.__requestAbort || {};
+          var controller = new AbortController();
+          window.__requestAbort[id] = controller;
+          var csrfToken = ${JSONObject.quote(csrf.orEmpty())};
+          if (!csrfToken) {
+            var meta = document.querySelector('meta[name="csrf-token"]');
+            if (meta && meta.content) csrfToken = meta.content;
+          }
+          var headers = {
+            'Accept': 'application/json',
+            'X-Requested-With': 'XMLHttpRequest'
+            ${if (present) ", 'Discourse-Present': 'true'" else ""}
+            ${if (path.startsWith("/topics/timings")) ", 'Discourse-Background': 'true', 'X-SILENCE-LOGGER': 'true'" else ""}
+            ${if (body == null) "" else ", 'Content-Type': " + JSONObject.quote(contentType)}
+          };
+          if (csrfToken) {
+            headers['X-CSRF-Token'] = csrfToken;
+          }
+          fetch(${JSONObject.quote(targetUrl)}, {
+            signal: controller.signal,
             method: ${JSONObject.quote(method)},
             ${if (body == null) "" else "body: ${JSONObject.quote(body)},"}
             credentials: 'include',
-            headers: {
-              'Accept': 'application/json',
-              'X-Requested-With': 'XMLHttpRequest'
-              ${if (present) ", 'Discourse-Present': 'true'" else ""}
-              ${if (body == null) "" else ", 'Content-Type': " + JSONObject.quote(contentType)}
-              ${if (csrf == null) "" else ", 'X-CSRF-Token': " + JSONObject.quote(csrf)}
-            }
+            headers: headers
           }).then(function (r) {
             return r.text().then(function (t) {
-              $BRIDGE_NAME.onResult(id, r.status, r.headers.get('cf-mitigated') || '', t);
+              $BRIDGE_NAME.onResult(id, r.status, r.headers.get('cf-mitigated') || '', t, r.headers.get('retry-after') || '');
             });
           }).catch(function (e) {
-            $BRIDGE_NAME.onResult(id, 0, '', String(e));
+            $BRIDGE_NAME.onResult(id, 0, '', String(e), '');
+          }).finally(function () {
+            delete window.__requestAbort[id];
           });
         })();
-    """.trimIndent()
+        """.trimIndent()
+    }
 
     private suspend fun evalString(script: String): String = withContext(Dispatchers.Main) {
         suspendCancellableCoroutine { continuation ->
-            webView().evaluateJavascript(script) { raw -> continuation.resume(decodeJsValue(raw)) }
+            webView().evaluateJavascript(script) { raw -> if (continuation.isActive) continuation.resume(decodeJsValue(raw)) }
         }
     }
 
@@ -1554,6 +2758,10 @@ class BrowserSession(
         const val BRIDGE_NAME = "__ldb"
         const val CF_CLEARANCE_COOKIE = "cf_clearance"
         const val CF_CHALLENGE_PATH = "/challenge"
+        const val UNREACHABLE_GRACE_MS = 3_000L
+        const val VERIFY_STALL_MS = 3_500L
+        const val VERIFY_REVEAL_DELAY_MS = 600L
+        const val VERIFY_FALLBACK_REVEAL_MS = 1_800L
 
         /**
          * 登录页的第一方 bootstrap 路径。
@@ -1563,6 +2771,7 @@ class BrowserSession(
 
         const val CF_SETTLE_DELAY_MS = 1_500L
         const val CF_PROBE_INTERVAL_MS = 750L
+        const val AUTH_ABORT_ACK_TIMEOUT_MS = 2_000L
 
         /** 邮件链接兑换时，首个 onPageFinished 之后还要复查几轮 Cookie。 */
         const val EMAIL_LINK_RECHECK_TIMES = 15
@@ -1580,6 +2789,8 @@ class BrowserSession(
         const val HCAPTCHA_CALLBACK_SETTLE_DELAY_MS = 300L
         const val POLL_INTERVAL_MS = 700L
         const val LAYOUT_TIMEOUT_MS = 1_500L
+        /** 同批并发请求在锁内合并跳过重验证的时间窗口（8 秒，覆盖单轮重载耗时）。 */
+        const val COALESCE_CLEAR_WINDOW_MS = 8_000L
 
         /** 探测登录 WebView 的真实执行上下文,顺带回报是否正停在 CF 挑战页。 */
         const val AUTH_CONTEXT_PROBE_JS = """
@@ -1629,8 +2840,92 @@ class BrowserSession(
                 html.indexOf('"errortype":"notfound"') !== -1 ||
                 html.indexOf('404-body') !== -1 ||
                 html.indexOf('exist or is private') !== -1 ||
-                html.indexOf('page you requested') !== -1;
+                html.indexOf('page you requested') !== -1 ||
+                html.indexOf('该页面不存在') !== -1;
             })();
         """
+
+        /**
+         * 对齐 Fluxdo 的 _documentStartMaskScript：
+         * 1. 在页面卸载（beforeunload/pagehide）瞬间立即在 DOM 顶层铺满纯色遮罩并通知原生层隐藏 WebView；
+         * 2. 通过 MutationObserver 实时监听源站 404 DOM 特征，一旦命中同一帧内立刻遮罩并通知收口。
+         */
+        fun buildOriginFallbackMaskScript(maskColorHex: String): String = """
+            (function () {
+              window.__linuxdoCfMaskColor = ${JSONObject.quote(maskColorHex)};
+              function root() {
+                return document.body || document.documentElement;
+              }
+              function ensureMask() {
+                var r = root();
+                if (!r) return null;
+                var mask = document.getElementById('__linuxdoCfMask');
+                if (!mask) {
+                  mask = document.createElement('div');
+                  mask.id = '__linuxdoCfMask';
+                  mask.style.cssText = 'position:fixed!important;top:0!important;left:0!important;right:0!important;bottom:0!important;width:100vw!important;height:100vh!important;margin:0!important;padding:0!important;background:' +
+                    (window.__linuxdoCfMaskColor || '#f2f2f7') +
+                    '!important;z-index:2147483647!important;pointer-events:auto!important;';
+                  r.appendChild(mask);
+                }
+                return mask;
+              }
+              window.__linuxdoShowCfMask = function (force) {
+                if (window.__linuxdoCfMaskSuppressed && !force) return;
+                window.__linuxdoCfMaskSuppressed = false;
+                var mask = ensureMask();
+                if (mask) mask.style.display = 'block';
+              };
+              window.__linuxdoHideCfMask = function () {
+                window.__linuxdoCfMaskSuppressed = true;
+                var mask = document.getElementById('__linuxdoCfMask');
+                if (mask) mask.style.display = 'none';
+              };
+              function looksLikeOrigin404() {
+                try {
+                  var html = document.documentElement ? document.documentElement.innerHTML : '';
+                  var title = document.title || '';
+                  var haystack = (html + ' ' + title).toLowerCase();
+                  return haystack.indexOf('page-not-found') !== -1 ||
+                    haystack.indexOf('discourse-no-results') !== -1 ||
+                    haystack.indexOf('"errortype":"notfound"') !== -1 ||
+                    haystack.indexOf('404-body') !== -1 ||
+                    haystack.indexOf('exist or is private') !== -1 ||
+                    haystack.indexOf('page you requested') !== -1 ||
+                    haystack.indexOf('该页面不存在') !== -1;
+                } catch (e) {
+                  return false;
+                }
+              }
+              function probeOrigin404() {
+                if (window.__linuxdoOrigin404Notified || !looksLikeOrigin404()) return;
+                window.__linuxdoOrigin404Notified = true;
+                window.__linuxdoShowCfMask(true);
+                try {
+                  window.$BRIDGE_NAME.onChallengeOriginReached('dom-observer');
+                } catch (e) {}
+              }
+              probeOrigin404();
+              if (!window.__linuxdoCfObserverInstalled) {
+                window.__linuxdoCfObserverInstalled = true;
+                try {
+                  var observer = new MutationObserver(probeOrigin404);
+                  observer.observe(document.documentElement || document, {
+                    childList: true,
+                    subtree: true,
+                    characterData: true
+                  });
+                } catch (e) {}
+                function notifyNav(reason) {
+                  window.__linuxdoShowCfMask(true);
+                  try {
+                    window.$BRIDGE_NAME.onChallengeNavigating(reason);
+                  } catch (e) {}
+                }
+                window.addEventListener('beforeunload', function () { notifyNav('beforeunload'); });
+                window.addEventListener('pagehide', function () { notifyNav('pagehide'); });
+              }
+            })();
+        """.trimIndent()
     }
 }

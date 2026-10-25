@@ -4,8 +4,12 @@ import org.linuxdo.android.data.TopicPage
 import org.linuxdo.android.data.TopicNotificationLevel
 import org.linuxdo.android.data.PostFlagReason
 import org.linuxdo.android.data.FloatingAction
+import org.linuxdo.android.data.ExcerptCache
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.Spring
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
@@ -22,6 +26,8 @@ import androidx.compose.animation.core.snap
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.togetherWith
+import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
@@ -61,12 +67,14 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.material3.pulltorefresh.rememberPullToRefreshState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -78,6 +86,7 @@ import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -110,15 +119,22 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import coil.compose.AsyncImage
+import coil.request.ImageRequest
 import java.util.Locale
 import kotlin.math.min
 import kotlin.math.roundToInt
 import org.jsoup.Jsoup
 import org.linuxdo.android.data.Category
 import org.linuxdo.android.data.Topic
+import org.linuxdo.android.data.originalImageUrl
+import org.linuxdo.android.data.thumbnailUrlForList
+import org.linuxdo.android.net.IMAGE_AUTO_RETRY_LIMIT
+import org.linuxdo.android.net.awaitImageRetrySlot
+import org.linuxdo.android.net.isTransientImageError
 import org.linuxdo.android.data.TopicSortOrder
 import org.linuxdo.android.data.HomeFeedType
 import org.linuxdo.android.data.TopicListItem
+import org.linuxdo.android.ui.TopicUnreadDotPosition
 import org.linuxdo.android.ui.design.IosActivityIndicator
 import org.linuxdo.android.ui.design.IosDivider
 import org.linuxdo.android.ui.design.IosLargeTitleScaffold
@@ -151,8 +167,10 @@ fun TopicListScreen(
     onRefresh: () -> Unit,
     onLoadMore: () -> Unit,
     onOpenTopic: (Topic) -> Unit,
+    onOpenUser: (String, String?, String?, String?) -> Unit = { _, _, _, _ -> },
     modifier: Modifier = Modifier,
     onBack: (() -> Unit)? = null,
+    showLargeTitle: Boolean = true,
     active: Boolean = true,
     scrollToTopRequest: Int = 0,
     trailing: @Composable () -> Unit = {},
@@ -179,6 +197,19 @@ fun TopicListScreen(
     onNavigateToDrafts: (() -> Unit)? = null,
     onNavigateToSearch: (() -> Unit)? = null,
     onNavigateToCategories: (() -> Unit)? = null,
+    onNavigateToHistory: (() -> Unit)? = null,
+    onNavigateToConnect: (() -> Unit)? = null,
+    onNavigateToChat: (() -> Unit)? = null,
+    feedGraphicMode: Boolean = true,
+    feedDisplayMode: String = if (feedGraphicMode) "graphic" else "small_image",
+    showTopicUnreadDot: Boolean = true,
+    topicUnreadDotPosition: TopicUnreadDotPosition = TopicUnreadDotPosition.Avatar,
+    onPrefetchExcerpt: ((Long) -> Unit)? = null,
+    onPrefetchExcerpts: ((List<Topic>) -> Unit)? = null,
+    onScrollBusyChanged: ((Any, Boolean) -> Unit)? = null,
+    onBarsVisibilityChange: ((Boolean) -> Unit)? = null,
+    barsVisible: Boolean = true,
+    blockedUsernames: Set<String> = emptySet(),
 ) {
     val feedListStates = remember { mutableMapOf<HomeFeedType, LazyListState>() }
     val categoryListStates = remember { mutableMapOf<Int, LazyListState>() }
@@ -187,6 +218,35 @@ fun TopicListScreen(
         currentFeed != null -> feedListStates.getOrPut(currentFeed) { LazyListState() }
         currentCategoryId != null -> categoryListStates.getOrPut(currentCategoryId) { LazyListState() }
         else -> defaultListState
+    }
+    val scrollBusySource = remember { Any() }
+    LaunchedEffect(active, listState, listState.isScrollInProgress) {
+        onScrollBusyChanged?.invoke(scrollBusySource, active && listState.isScrollInProgress)
+    }
+    DisposableEffect(scrollBusySource) {
+        onDispose { onScrollBusyChanged?.invoke(scrollBusySource, false) }
+    }
+
+    val nestedScrollConnection = remember(listState) {
+        object : NestedScrollConnection {
+            override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
+                if (!active) return Offset.Zero
+                val deltaY = available.y
+                if (deltaY < -15f) {
+                    onBarsVisibilityChange?.invoke(false)
+                } else if (deltaY > 15f) {
+                    onBarsVisibilityChange?.invoke(true)
+                }
+                return Offset.Zero
+            }
+        }
+    }
+
+    LaunchedEffect(active, listState.firstVisibleItemIndex, listState.firstVisibleItemScrollOffset) {
+        if (!active) return@LaunchedEffect
+        if (listState.firstVisibleItemIndex == 0 && listState.firstVisibleItemScrollOffset <= 20) {
+            onBarsVisibilityChange?.invoke(true)
+        }
     }
     val pullState = rememberPullToRefreshState()
     val scope = rememberCoroutineScope()
@@ -245,13 +305,24 @@ fun TopicListScreen(
     }
 
 
-    val (pinnedGroups, plainItems) = remember(state.items) { pinnedPrefixGroups(state.items) }
+    val filteredItems = remember(state.items, blockedUsernames) {
+        if (blockedUsernames.isEmpty()) state.items
+        else state.items.filterNot { it.authorUsername?.lowercase() in blockedUsernames }
+    }
+
+    val (pinnedGroups, plainItems) = remember(filteredItems) { pinnedPrefixGroups(filteredItems) }
+
+    LaunchedEffect(active, filteredItems) {
+        if (active && filteredItems.isNotEmpty()) {
+            onPrefetchExcerpts?.invoke(filteredItems.map { it.topic })
+        }
+    }
 
     PullToRefreshBox(
         isRefreshing = state.refreshing,
         onRefresh = onRefresh,
         state = pullState,
-        modifier = modifier,
+        modifier = modifier.nestedScroll(nestedScrollConnection),
         indicator = {
             val fraction = pullState.distanceFraction
             // 初始加载时列表中央已有加载指示，这里再叠一个下拉转圈就成了两个圈。
@@ -274,6 +345,8 @@ fun TopicListScreen(
             listState = listState,
             onBack = onBack,
             compactTop = onBack == null,
+            showLargeTitle = showLargeTitle,
+            barsVisible = barsVisible,
             scrollToTopRequest = scrollToTopRequest,
             trailing = trailing,
             customLargeTitle = when {
@@ -353,6 +426,9 @@ fun TopicListScreen(
                                 FloatingAction.Drafts -> onNavigateToDrafts?.invoke()
                                 FloatingAction.Search -> onNavigateToSearch?.invoke()
                                 FloatingAction.Categories -> onNavigateToCategories?.invoke()
+                                FloatingAction.History -> onNavigateToHistory?.invoke()
+                                FloatingAction.Connect -> onNavigateToConnect?.invoke()
+                                FloatingAction.Chat -> onNavigateToChat?.invoke()
                             }
                         },
                         modifier = Modifier.fillMaxSize(),
@@ -361,7 +437,7 @@ fun TopicListScreen(
                     Column(
                         modifier = Modifier
                             .align(Alignment.BottomEnd)
-                            .padding(end = 14.dp, bottom = 18.dp),
+                            .padding(end = 14.dp, bottom = 68.dp),
                         horizontalAlignment = Alignment.CenterHorizontally,
                         verticalArrangement = Arrangement.spacedBy(10.dp),
                     ) {
@@ -396,7 +472,7 @@ fun TopicListScreen(
                         fontWeight = FontWeight.Medium,
                         modifier = Modifier
                             .align(Alignment.BottomCenter)
-                            .padding(horizontal = 16.dp, vertical = 22.dp)
+                            .padding(start = 16.dp, end = 16.dp, bottom = 68.dp)
                             .clip(RoundedCornerShape(10.dp))
                             .background(IosTheme.colors.card)
                             .border(1.dp, Color(0xFF34C759).copy(alpha = 0.4f), RoundedCornerShape(10.dp))
@@ -430,6 +506,8 @@ fun TopicListScreen(
                         onCopyLink = copyTopicLink,
                         onBookmark = bookmarkTopicAction,
                         onFlag = flagTopicAction,
+                        showTopicUnreadDot = showTopicUnreadDot,
+                        topicUnreadDotPosition = topicUnreadDotPosition,
                     )
                     IosDivider(startIndent = IosMetrics.screenPadding)
                 }
@@ -438,9 +516,17 @@ fun TopicListScreen(
             itemsIndexed(
                 items = plainItems,
                 key = { _, item -> "${keyPrefix}_${item.topic.id}" },
+                contentType = { _, item ->
+                    when {
+                        feedDisplayMode == "graphic" -> "topic-graphic"
+                        item.topic.thumbnailUrlForList() != null -> "topic-with-thumbnail"
+                        else -> "topic-text"
+                    }
+                },
             ) { index, item ->
                 val isHighlighted = item.topic.id in state.highlightedTopicIds
-                Column {
+                val isGraphic = feedDisplayMode == "graphic"
+                Column(modifier = Modifier.fillMaxWidth()) {
                     TopicRow(
                         item = item,
                         isHighlighted = isHighlighted,
@@ -452,10 +538,25 @@ fun TopicListScreen(
                         onCopyLink = { copyTopicLink(item.topic) },
                         onBookmark = bookmarkTopicAction?.let { fn -> { fn(item.topic) } },
                         onFlag = flagTopicAction?.let { fn -> { fn(item.topic) } },
+                        onOpenUser = onOpenUser,
                         onClick = { onOpenTopic(item.topic) },
+                        feedGraphicMode = isGraphic,
+                        feedDisplayMode = feedDisplayMode,
+                        onPrefetchExcerpt = onPrefetchExcerpt,
+                        showTopicUnreadDot = showTopicUnreadDot,
+                        topicUnreadDotPosition = topicUnreadDotPosition,
                     )
                     if (index < plainItems.lastIndex) {
-                        IosDivider(startIndent = IosMetrics.screenPadding)
+                        if (isGraphic) {
+                            Box(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .height(6.dp)
+                                    .background(IosTheme.colors.groupedBackground)
+                            )
+                        } else {
+                            IosDivider(startIndent = IosMetrics.screenPadding)
+                        }
                     }
                 }
             }
@@ -953,6 +1054,8 @@ fun PinnedGroupCard(
     onBookmark: ((Topic) -> Unit)? = null,
     onFlag: ((Topic) -> Unit)? = null,
     isHighlighted: Boolean = false,
+    showTopicUnreadDot: Boolean = true,
+    topicUnreadDotPosition: TopicUnreadDotPosition = TopicUnreadDotPosition.Avatar,
 ) {
     val head = items.firstOrNull() ?: return
     val rowBackground = topicRowBackground(isHighlighted)
@@ -966,13 +1069,28 @@ fun PinnedGroupCard(
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
-                UserAvatar(
-                    avatarUrl = head.avatarUrl,
-                    fallbackUrl = head.staticAvatarUrl,
-                    username = head.authorUsername,
-                    modifier = Modifier.size(24.dp),
-                    cornerRadius = 3.5.dp,
-                )
+                Box {
+                    UserAvatar(
+                        avatarUrl = head.avatarUrl,
+                        fallbackUrl = head.staticAvatarUrl,
+                        username = head.authorUsername,
+                        modifier = Modifier.size(24.dp),
+                        cornerRadius = 3.5.dp,
+                    )
+                    if (showTopicUnreadDot && topicUnreadDotPosition == TopicUnreadDotPosition.Avatar && items.any { it.topic.unseen }) {
+                        Box(
+                            Modifier
+                                .size(7.dp)
+                                .align(Alignment.TopEnd)
+                                .offset(x = 1.dp, y = (-1).dp)
+                                .clip(CircleShape)
+                                .background(IosTheme.colors.card)
+                                .padding(1.dp)
+                                .clip(CircleShape)
+                                .background(IosTheme.colors.accent)
+                        )
+                    }
+                }
                 Spacer(Modifier.width(6.dp))
                 Text(
                     text = head.displayName.ifBlank { "匿名" },
@@ -997,7 +1115,11 @@ fun PinnedGroupCard(
             Spacer(Modifier.height(6.dp))
             Box {
                 Text(
-                    text = titleWithBadges(entry.topic, IosTheme.colors.accent),
+                    text = titleWithBadges(
+                        entry.topic,
+                        IosTheme.colors.accent,
+                        includeUnseenDot = showTopicUnreadDot && topicUnreadDotPosition == TopicUnreadDotPosition.TitleLeft,
+                    ),
                     style = IosTheme.type.body,
                     color = IosTheme.colors.label,
                     maxLines = 2,
@@ -1028,12 +1150,120 @@ fun PinnedGroupCard(
 }
 
 /**
- * 紧凑高效风列表卡片(三段式)。
- *
- * 之所以不给摘要和多图预留固定区域:linux.do 的 /latest.json 对普通帖**不下发 excerpt**
- * (只有置顶帖和搜索结果有),图也只给单张 image_url。硬留版位要么大面积留白、一屏只剩两条,
- * 要么得逐帖拉详情去凑内容 —— 那是在拿跳盾风险换排版。所以这里"有就展开、没有就收起":
- * 顶栏(作者 + Lv + 分类)、主体(标题 + 按需摘要 + 按需首图)、底栏(回复 / 浏览 / 活动时间 + 标签)。
+ * 清洗话题正文摘录：
+ * 彻底过滤掉开头自动生成的图片属性、文件名、分辨率与体积信息（如 "image1540×734 54.4 KB"、"截图... 120KB" 等），
+ * 直接将真实正文字符串呈现给用户。
+ */
+internal fun cleanExcerpt(rawHtmlOrText: String?): String? {
+    if (rawHtmlOrText.isNullOrBlank()) return null
+    val parsed = try {
+        val doc = Jsoup.parseBodyFragment(rawHtmlOrText)
+        doc.select(".lightbox-wrapper, .lightbox, .meta, .informations, .filename, img, svg, video, audio").remove()
+        doc.text().trim()
+    } catch (_: Exception) {
+        rawHtmlOrText.trim()
+    }
+
+    if (parsed.isEmpty()) return null
+
+    var cleaned = parsed
+    val imageMetaPattern = Regex(
+        """^(?:(?:image|img|图片|截图|截屏|屏幕截图|微信截图|QQ截图|photo|screenshot|IMG_\d+|Screenshot[^\s]*|Pasted\s+image[^\s]*)\s*(?:\d{2,5}\s*[×xX*]\s*\d{2,5})?\s*(?:[\d.]+\s*(?:KB|MB|GB|B|千字节|兆字节))?|(?:[\w\-_.]+\.(?:png|jpe?g|gif|webp|bmp))\s*(?:\d{2,5}\s*[×xX*]\s*\d{2,5})?\s*(?:[\d.]+\s*(?:KB|MB|GB|B))?)\s*[,，:：、\s]*""",
+        RegexOption.IGNORE_CASE
+    )
+    val sizeOnlyPattern = Regex(
+        """^(?:\[(?:图片|image|图)\]|\d{2,5}\s*[×xX*]\s*\d{2,5}\s*(?:[\d.]+\s*(?:KB|MB|GB|B))?)\s*""",
+        RegexOption.IGNORE_CASE
+    )
+
+    var previous: String
+    do {
+        previous = cleaned
+        cleaned = cleaned.replace(imageMetaPattern, "").trim()
+        cleaned = cleaned.replace(sizeOnlyPattern, "").trim()
+    } while (cleaned != previous && cleaned.isNotEmpty())
+
+    return cleaned.takeIf { it.isNotBlank() }
+}
+
+/**
+ * 获取话题真实正文摘录:
+ * 1. 优先使用服务端下发的真实 excerpt (置顶帖、搜索结果)，并剥离首部图片元属性
+ * 2. 检查用户浏览过或后台轻量预取到的真实首楼正文
+ * 3. 严格遵循真实内容原则，绝不拼凑合成假话
+ */
+private fun getTopicRealExcerpt(topic: Topic): String? {
+    val fromTopic = cleanExcerpt(topic.excerpt)
+    if (fromTopic != null) return fromTopic
+
+    return cleanExcerpt(ExcerptCache.get(topic.id))
+}
+
+@Composable
+private fun rememberTopicThumbnailRequest(
+    url: String?,
+    widthPx: Int,
+    heightPx: Int,
+    retry: Int,
+): ImageRequest? {
+    val context = LocalContext.current
+    return remember(context, url, widthPx, heightPx, retry) {
+        url?.takeIf { it.isNotBlank() }?.let { thumbnailUrl ->
+            ImageRequest.Builder(context)
+                .data(thumbnailUrl)
+                .size(widthPx, heightPx)
+                // 同一资源在大图、小图模式下各自保持合适的内存解码尺寸。
+                .memoryCacheKey("topic-thumbnail:$thumbnailUrl:${widthPx}x${heightPx}")
+                // 磁盘缓存按完整 URL 存（Coil 默认键），与详情页、大图查看器共用：
+                // 任一处拉成功，另一处直接命中本地，不再额外打一次站内请求。
+                .setParameter("retry", retry, memoryCacheKey = null)
+                .crossfade(false)
+                .build()
+        }
+    }
+}
+
+@Composable
+private fun TopicThumbnailImage(
+    thumbnailUrl: String,
+    fallbackUrl: String?,
+    widthPx: Int,
+    heightPx: Int,
+    modifier: Modifier,
+) {
+    var useFallback by remember(thumbnailUrl, fallbackUrl) { mutableStateOf(false) }
+    var retry by remember(thumbnailUrl, fallbackUrl) { mutableIntStateOf(0) }
+    var pendingRetry by remember(thumbnailUrl, fallbackUrl) { mutableStateOf(false) }
+    val thumbnailRequest = rememberTopicThumbnailRequest(thumbnailUrl, widthPx, heightPx, retry)
+    val fallbackRequest = rememberTopicThumbnailRequest(fallbackUrl, widthPx, heightPx, retry)
+    val canFallback = !fallbackUrl.isNullOrBlank() && fallbackUrl != thumbnailUrl
+
+    // 列表在详情页下方始终保持组合，失败态不会因"返回列表"自然刷新；
+    // 瞬时失败（门禁冷却、429、网络抖动）等冷却结束后自己补拉，次数封顶避免风控。
+    if (pendingRetry) {
+        LaunchedEffect(retry) {
+            awaitImageRetrySlot(retry)
+            pendingRetry = false
+            retry++
+        }
+    }
+    AsyncImage(
+        model = if (useFallback) fallbackRequest else thumbnailRequest,
+        contentDescription = null,
+        contentScale = ContentScale.Crop,
+        modifier = modifier,
+        onError = { state ->
+            when {
+                isTransientImageError(state.result.throwable) && retry < IMAGE_AUTO_RETRY_LIMIT -> pendingRetry = true
+                !useFallback && canFallback -> useFallback = true
+            }
+        },
+    )
+}
+
+/**
+ * 现代知乎风列表卡片。
+ * 严格按照【大标题置顶 -> 作者行 -> 2行正文摘要 -> 底部操作行】分层排版。
  */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
@@ -1047,11 +1277,27 @@ fun TopicRow(
     onCopyLink: (() -> Unit)? = null,
     onBookmark: (() -> Unit)? = null,
     onFlag: (() -> Unit)? = null,
+    onOpenUser: (String, String?, String?, String?) -> Unit = { _, _, _, _ -> },
     onClick: () -> Unit,
+    feedGraphicMode: Boolean = true,
+    feedDisplayMode: String = if (feedGraphicMode) "graphic" else "small_image",
+    showTopicUnreadDot: Boolean = true,
+    topicUnreadDotPosition: TopicUnreadDotPosition = TopicUnreadDotPosition.Avatar,
+    onPrefetchExcerpt: ((Long) -> Unit)? = null,
 ) {
     var showLevelMenu by remember { mutableStateOf(false) }
     val hasAnyLongPress = onSetNotificationLevel != null || onCopyLink != null || onBookmark != null || onFlag != null
     val topic = item.topic
+    // 首次组合查一次本地库；之后改读内存态，详情页或预取记下封面时这一行会随之刷新。
+    val storedCoverUrl = remember(topic.id) { ExcerptCache.getCoverImage(topic.id) }
+    val coverImageUrl = ExcerptCache.peekCoverImage(topic.id) ?: storedCoverUrl
+    val largeThumbnailUrl = remember(topic.id, topic.imageUrl, topic.thumbnails, coverImageUrl) {
+        topic.thumbnailUrlForList(targetWidth = 960) ?: coverImageUrl
+    }
+    val smallThumbnailUrl = remember(topic.id, topic.imageUrl, topic.thumbnails, coverImageUrl) {
+        topic.thumbnailUrlForList(targetWidth = 320) ?: coverImageUrl
+    }
+    val originalImageUrl = remember(topic.id, topic.imageUrl) { topic.originalImageUrl() }
     val drawerWidth = with(LocalDensity.current) { 240.dp.toPx() }
     var dragging by remember(topic.id) { mutableStateOf(false) }
     var dragOffset by remember(topic.id) { mutableFloatStateOf(0f) }
@@ -1063,8 +1309,17 @@ fun TopicRow(
     val rowBackground = topicRowBackground(isHighlighted)
     val needle = query?.trim().orEmpty()
     val accent = IosTheme.colors.accent
-    val excerpt = remember(topic.id, topic.excerpt, needle, accent) {
-        val raw = topic.excerpt?.let { Jsoup.parseBodyFragment(it).text().trim() }?.takeIf { it.isNotEmpty() }
+
+    // 观察响应式真实正文（一旦预取成功或点开详情，立即自动重组刷新）
+    val realExcerpt = getTopicRealExcerpt(topic)
+    LaunchedEffect(topic.id, realExcerpt) {
+        if (realExcerpt == null && onPrefetchExcerpt != null) {
+            onPrefetchExcerpt(topic.id)
+        }
+    }
+
+    val excerpt = remember(realExcerpt, needle, accent) {
+        val raw = realExcerpt
         if (raw.isNullOrBlank()) null
         else if (needle.isEmpty()) buildAnnotatedString { append(raw) }
         else buildAnnotatedString {
@@ -1096,155 +1351,436 @@ fun TopicRow(
                 }
             }
         }
+        val isGraphic = feedDisplayMode == "graphic"
         Column(
-        Modifier
-            .fillMaxWidth()
-            .graphicsLayer { translationX = offset }
-            .background(rowBackground)
-            .then(if (onSetNotificationLevel == null) Modifier else Modifier.pointerInput(topic.id, drawerWidth, item.notificationLevelUpdating) {
-                if (!item.notificationLevelUpdating) detectHorizontalDragGestures(
-                    onDragStart = {
-                        dragOffset = if (currentRevealed) -drawerWidth else 0f
-                        dragging = true
-                        onReveal(true)
-                    },
-                    onHorizontalDrag = { change, distance ->
-                        change.consume()
-                        dragOffset = (dragOffset + distance).coerceIn(-drawerWidth, 0f)
-                    },
-                    onDragEnd = { dragging = false; onReveal(dragOffset < -drawerWidth / 3f) },
-                    onDragCancel = { dragging = false; onReveal(false) },
+            Modifier
+                .fillMaxWidth()
+                .graphicsLayer { translationX = offset }
+                .background(if (isHighlighted) IosTheme.colors.card.copy(alpha = 0.85f) else if (isGraphic) IosTheme.colors.card else rowBackground)
+                .then(if (onSetNotificationLevel == null) Modifier else Modifier.pointerInput(topic.id, drawerWidth, item.notificationLevelUpdating) {
+                    if (!item.notificationLevelUpdating) detectHorizontalDragGestures(
+                        onDragStart = {
+                            dragOffset = if (currentRevealed) -drawerWidth else 0f
+                            dragging = true
+                            onReveal(true)
+                        },
+                        onHorizontalDrag = { change, distance ->
+                            change.consume()
+                            dragOffset = (dragOffset + distance).coerceIn(-drawerWidth, 0f)
+                        },
+                        onDragEnd = { dragging = false; onReveal(dragOffset < -drawerWidth / 3f) },
+                        onDragCancel = { dragging = false; onReveal(false) },
+                    )
+                })
+                .combinedClickable(
+                    onClick = { if (revealed) onReveal(false) else onClick() },
+                    onLongClick = if (hasAnyLongPress && !item.notificationLevelUpdating) {
+                        { onReveal(false); showLevelMenu = true }
+                    } else null,
                 )
-            })
-            .combinedClickable(
-                onClick = { if (revealed) onReveal(false) else onClick() },
-                onLongClick = if (hasAnyLongPress && !item.notificationLevelUpdating) {
-                    { onReveal(false); showLevelMenu = true }
-                } else null,
-            )
-            .padding(horizontal = IosMetrics.screenPadding, vertical = 10.dp),
-    ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            // 作者区整体吃掉除分类外的全部宽度,分类才能稳定贴住右边界 ——
-            // 否则作者名和弹性空隙会平分剩余宽度,分类的位置就跟着用户名长短左右浮动,
-            // 上下相邻卡片的分类对不成一条竖线。
-            Row(
-                Modifier.weight(1f),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                UserAvatar(
-                    avatarUrl = item.avatarUrl,
-                    fallbackUrl = item.staticAvatarUrl,
-                    username = item.authorUsername,
-                    modifier = Modifier.size(24.dp),
-                    cornerRadius = 3.5.dp,
-                )
-                Spacer(Modifier.width(6.dp))
+                .padding(
+                    horizontal = if (isGraphic) 16.dp else IosMetrics.screenPadding,
+                    vertical = if (isGraphic) 14.dp else 10.dp,
+                ),
+        ) {
+            if (isGraphic) {
+                // ── 图文模式：标题置顶（知乎级粗体大标题，首字平齐无毛刺） ──
                 Text(
-                    text = item.displayName.ifBlank { "匿名" },
-                    style = IosTheme.type.footnote,
-                    color = IosTheme.colors.secondaryLabel,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f, fill = false),
-                )
-                item.trustLevel?.takeIf { it > 0 }?.let { level ->
-                    Spacer(Modifier.width(4.dp))
-                    LevelBadge(level)
-                }
-            }
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                item.notificationLevel?.takeIf { it != TopicNotificationLevel.Regular }?.let { level ->
-                    TopicNotificationLevelTag(level)
-                    Spacer(Modifier.width(6.dp))
-                }
-                item.category?.let {
-                    CategoryTag(it)
-                }
-            }
-        }
-        NotificationLevelMenu(
-            expanded = showLevelMenu && hasAnyLongPress,
-            currentLevel = item.notificationLevel,
-            updating = item.notificationLevelUpdating,
-            onDismiss = { showLevelMenu = false },
-            onPick = onSetNotificationLevel,
-            onCopyLink = onCopyLink,
-            onBookmark = onBookmark,
-            onFlag = onFlag,
-        )
-        Spacer(Modifier.height(6.dp))
-        Row {
-            Column(Modifier.weight(1f)) {
-                Text(
-                    text = titleWithBadges(topic, IosTheme.colors.accent, query),
-                    style = IosTheme.type.body,
+                    text = titleWithBadges(
+                        topic = topic,
+                        accent = IosTheme.colors.accent,
+                        query = query,
+                        includeUnseenDot = showTopicUnreadDot && topicUnreadDotPosition == TopicUnreadDotPosition.TitleLeft,
+                    ),
+                    style = IosTheme.type.body.copy(fontSize = 17.sp, fontWeight = FontWeight.Bold, lineHeight = 23.5.sp),
                     color = IosTheme.colors.label,
                     maxLines = 2,
                     overflow = TextOverflow.Ellipsis,
                     inlineContent = unseenDotContent(IosTheme.colors.accent),
                 )
-                excerpt?.let { text ->
-                    Spacer(Modifier.height(4.dp))
-                    Text(
-                        text = text,
-                        style = IosTheme.type.footnote,
-                        color = IosTheme.colors.secondaryLabel,
-                        maxLines = if (query.isNullOrBlank()) 2 else 3,
-                        overflow = TextOverflow.Ellipsis,
+
+                Spacer(Modifier.height(8.dp))
+
+                // ── 标题下方作者与分类信息行 ──
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
+                        Box {
+                            UserAvatar(
+                                avatarUrl = item.avatarUrl,
+                                fallbackUrl = item.staticAvatarUrl,
+                                username = item.authorUsername,
+                                modifier = Modifier
+                                    .size(26.dp)
+                                    .clickable(enabled = !item.authorUsername.isNullOrBlank()) {
+                                        item.authorUsername?.let { u ->
+                                            onOpenUser(u, item.avatarUrl, item.staticAvatarUrl, item.authorName ?: item.displayName)
+                                        }
+                                    },
+                                cornerRadius = 13.dp,
+                            )
+                            if (showTopicUnreadDot && topicUnreadDotPosition == TopicUnreadDotPosition.Avatar && topic.unseen) {
+                                Box(
+                                    Modifier
+                                        .size(7.dp)
+                                        .align(Alignment.TopEnd)
+                                        .offset(x = 1.dp, y = (-1).dp)
+                                        .clip(CircleShape)
+                                        .background(IosTheme.colors.card)
+                                        .padding(1.dp)
+                                        .clip(CircleShape)
+                                        .background(IosTheme.colors.accent)
+                                )
+                            }
+                        }
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            text = item.displayName.ifBlank { "匿名" },
+                            style = IosTheme.type.body.copy(fontSize = 13.5.sp, fontWeight = FontWeight.Medium),
+                            color = IosTheme.colors.label.copy(alpha = 0.82f),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.clickable(enabled = !item.authorUsername.isNullOrBlank()) {
+                                item.authorUsername?.let { u ->
+                                    onOpenUser(u, item.avatarUrl, item.staticAvatarUrl, item.authorName ?: item.displayName)
+                                }
+                            },
+                        )
+                        item.trustLevel?.takeIf { it > 0 }?.let { level ->
+                            Spacer(Modifier.width(5.dp))
+                            LevelBadge(level)
+                        }
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        item.notificationLevel?.takeIf { it != TopicNotificationLevel.Regular }?.let { level ->
+                            TopicNotificationLevelTag(level)
+                            Spacer(Modifier.width(6.dp))
+                        }
+                        item.category?.let { CategoryTag(it) }
+                    }
+                }
+
+                NotificationLevelMenu(
+                    expanded = showLevelMenu && hasAnyLongPress,
+                    currentLevel = item.notificationLevel,
+                    updating = item.notificationLevelUpdating,
+                    onDismiss = { showLevelMenu = false },
+                    onPick = onSetNotificationLevel,
+                    onCopyLink = onCopyLink,
+                    onBookmark = onBookmark,
+                    onFlag = onFlag,
+                )
+
+                // 3. 正文两行摘录 (严格保证两行知乎排版结构，固定最小高度防抖)
+                Spacer(Modifier.height(7.dp))
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .defaultMinSize(minHeight = 44.dp),
+                    contentAlignment = Alignment.TopStart,
+                ) {
+                    androidx.compose.animation.AnimatedContent(
+                        targetState = excerpt,
+                        transitionSpec = {
+                            androidx.compose.animation.fadeIn(animationSpec = androidx.compose.animation.core.tween(220)) togetherWith
+                                androidx.compose.animation.fadeOut(animationSpec = androidx.compose.animation.core.tween(150))
+                        },
+                        label = "excerpt-fade",
+                    ) { targetExcerpt ->
+                        if (targetExcerpt != null) {
+                            Text(
+                                text = targetExcerpt,
+                                style = IosTheme.type.footnote.copy(fontSize = 14.sp, lineHeight = 20.5.sp, fontWeight = FontWeight.Normal),
+                                color = IosTheme.colors.secondaryLabel,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        } else {
+                            Column(modifier = Modifier.padding(vertical = 4.dp)) {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth(0.92f)
+                                        .height(13.dp)
+                                        .clip(RoundedCornerShape(3.dp))
+                                        .background(IosTheme.colors.separator.copy(alpha = 0.22f))
+                                )
+                                Spacer(Modifier.height(6.dp))
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth(0.58f)
+                                        .height(13.dp)
+                                        .clip(RoundedCornerShape(3.dp))
+                                        .background(IosTheme.colors.separator.copy(alpha = 0.16f))
+                                )
+                            }
+                        }
+                    }
+                }
+
+                // 4. 封面大图预览 (16:9 高清全宽展示)
+                largeThumbnailUrl?.let { url ->
+                    Spacer(Modifier.height(9.dp))
+                    TopicThumbnailImage(
+                        thumbnailUrl = url,
+                        fallbackUrl = originalImageUrl,
+                        widthPx = 960,
+                        heightPx = 540,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(160.dp)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(IosTheme.colors.fieldBackground),
                     )
                 }
-            }
-            topic.imageUrl?.takeIf { it.isNotBlank() }?.let { url ->
-                Spacer(Modifier.width(10.dp))
-                AsyncImage(
-                    model = url,
-                    contentDescription = null,
-                    contentScale = ContentScale.Crop,
-                    modifier = Modifier
-                        .size(width = 72.dp, height = 54.dp)
-                        .clip(RoundedCornerShape(6.dp))
-                        .background(IosTheme.colors.fieldBackground),
-                )
-            }
-        }
-        Spacer(Modifier.height(7.dp))
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            MetaStat(formatCount(topic.totalReplies), textWidth = 30.dp) { ReplyGlyph(it) }
-            if (topic.views > 0) {
-                Spacer(Modifier.width(10.dp))
-                MetaStat(formatCount(topic.views), textWidth = 34.dp) { ViewGlyph(it) }
-            }
-            Spacer(Modifier.width(10.dp))
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                ClockGlyph(IosTheme.colors.tertiaryLabel)
-                Spacer(Modifier.width(3.dp))
+
+                // 5. 底部均匀互动栏 (评论 / 浏览 / 发布时间) - 居中平衡三等分对齐（微博/贴吧主流模式，视觉配重更稳）
+                Spacer(Modifier.height(10.dp))
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceAround,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    // 1. 评论 (细线气泡)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        ReplyGlyph(IosTheme.colors.tertiaryLabel)
+                        Spacer(Modifier.width(4.5.dp))
+                        Text(
+                            formatCount(topic.totalReplies),
+                            style = IosTheme.type.caption.copy(fontSize = 12.sp, fontFeatureSettings = "tnum"),
+                            color = IosTheme.colors.secondaryLabel
+                        )
+                    }
+                    // 2. 浏览 (细线眼睛图标)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        ViewGlyph(IosTheme.colors.tertiaryLabel)
+                        Spacer(Modifier.width(4.5.dp))
+                        Text(
+                            formatCount(topic.views),
+                            style = IosTheme.type.caption.copy(fontSize = 12.sp, fontFeatureSettings = "tnum"),
+                            color = IosTheme.colors.secondaryLabel
+                        )
+                    }
+                    // 3. 发布时间 (细线时钟)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        ClockGlyph(IosTheme.colors.tertiaryLabel)
+                        Spacer(Modifier.width(4.5.dp))
+                        Text(
+                            RelativeTime.format(topic.bumpedAt ?: topic.lastPostedAt ?: topic.createdAt),
+                            style = IosTheme.type.caption.copy(fontSize = 12.sp),
+                            color = IosTheme.colors.secondaryLabel
+                        )
+                    }
+                }
+            } else {
+                // ── 小图与纯文模式: 统一知乎结构 (大标题置顶 -> 作者行 -> 2行正文摘要 -> 底部操作行) ──
+                // 1. 标题置顶 (大一号半粗)
                 Text(
-                    text = RelativeTime.format(topic.bumpedAt ?: topic.lastPostedAt ?: topic.createdAt),
-                    style = IosTheme.type.caption,
-                    color = IosTheme.colors.secondaryLabel,
-                    maxLines = 1,
+                    text = titleWithBadges(
+                        topic = topic,
+                        accent = IosTheme.colors.accent,
+                        query = query,
+                        includeUnseenDot = showTopicUnreadDot && topicUnreadDotPosition == TopicUnreadDotPosition.TitleLeft,
+                    ),
+                    style = IosTheme.type.body.copy(fontSize = 16.5.sp, fontWeight = FontWeight.SemiBold, lineHeight = 22.sp),
+                    color = IosTheme.colors.label,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                    inlineContent = unseenDotContent(IosTheme.colors.accent),
                 )
+
+                Spacer(Modifier.height(6.dp))
+
+                // 2. 标题下方作者与分类行
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Row(
+                        Modifier.weight(1f),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Box {
+                            UserAvatar(
+                                avatarUrl = item.avatarUrl,
+                                fallbackUrl = item.staticAvatarUrl,
+                                username = item.authorUsername,
+                                modifier = Modifier
+                                    .size(22.dp)
+                                    .clickable(enabled = !item.authorUsername.isNullOrBlank()) {
+                                        item.authorUsername?.let { u ->
+                                            onOpenUser(u, item.avatarUrl, item.staticAvatarUrl, item.authorName ?: item.displayName)
+                                        }
+                                    },
+                                cornerRadius = 4.dp,
+                            )
+                            if (showTopicUnreadDot && topicUnreadDotPosition == TopicUnreadDotPosition.Avatar && topic.unseen) {
+                                Box(
+                                    Modifier
+                                        .size(6.5.dp)
+                                        .align(Alignment.TopEnd)
+                                        .offset(x = 1.dp, y = (-1).dp)
+                                        .clip(CircleShape)
+                                        .background(IosTheme.colors.card)
+                                        .padding(1.dp)
+                                        .clip(CircleShape)
+                                        .background(IosTheme.colors.accent)
+                                )
+                            }
+                        }
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            text = item.displayName.ifBlank { "匿名" },
+                            style = IosTheme.type.footnote.copy(fontSize = 13.sp, fontWeight = FontWeight.Medium),
+                            color = IosTheme.colors.secondaryLabel,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.clickable(enabled = !item.authorUsername.isNullOrBlank()) {
+                                item.authorUsername?.let { u ->
+                                    onOpenUser(u, item.avatarUrl, item.staticAvatarUrl, item.authorName ?: item.displayName)
+                                }
+                            },
+                        )
+                        item.trustLevel?.takeIf { it > 0 }?.let { level ->
+                            Spacer(Modifier.width(4.dp))
+                            LevelBadge(level)
+                        }
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        item.notificationLevel?.takeIf { it != TopicNotificationLevel.Regular }?.let { level ->
+                            TopicNotificationLevelTag(level)
+                            Spacer(Modifier.width(6.dp))
+                        }
+                        item.category?.let { CategoryTag(it) }
+                    }
+                }
+
+                NotificationLevelMenu(
+                    expanded = showLevelMenu && hasAnyLongPress,
+                    currentLevel = item.notificationLevel,
+                    updating = item.notificationLevelUpdating,
+                    onDismiss = { showLevelMenu = false },
+                    onPick = onSetNotificationLevel,
+                    onCopyLink = onCopyLink,
+                    onBookmark = onBookmark,
+                    onFlag = onFlag,
+                )
+
+                Spacer(Modifier.height(6.dp))
+
+                // 3. 两行正文摘要 (有图时小图右置混排，无图整宽，永远保持两行正文)
+                val hasSmallCover = feedDisplayMode == "small_image" && smallThumbnailUrl != null
+                if (hasSmallCover) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Box(modifier = Modifier.weight(1f)) {
+                            if (excerpt != null) {
+                                Text(
+                                    text = excerpt,
+                                    style = IosTheme.type.footnote.copy(fontSize = 13.sp, lineHeight = 18.5.sp, fontWeight = FontWeight.Normal),
+                                    color = IosTheme.colors.secondaryLabel,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            } else {
+                                Column(modifier = Modifier.padding(vertical = 2.dp)) {
+                                    Box(
+                                        modifier = Modifier
+                                            .fillMaxWidth(0.9f)
+                                            .height(12.dp)
+                                            .clip(RoundedCornerShape(3.dp))
+                                            .background(IosTheme.colors.separator.copy(alpha = 0.22f))
+                                    )
+                                    Spacer(Modifier.height(5.dp))
+                                    Box(
+                                        modifier = Modifier
+                                            .fillMaxWidth(0.55f)
+                                            .height(12.dp)
+                                            .clip(RoundedCornerShape(3.dp))
+                                            .background(IosTheme.colors.separator.copy(alpha = 0.16f))
+                                    )
+                                }
+                            }
+                        }
+                        Spacer(Modifier.width(10.dp))
+                        TopicThumbnailImage(
+                            thumbnailUrl = smallThumbnailUrl!!,
+                            fallbackUrl = originalImageUrl,
+                            widthPx = 240,
+                            heightPx = 168,
+                            modifier = Modifier
+                                .size(width = 74.dp, height = 52.dp)
+                                .clip(RoundedCornerShape(6.dp))
+                                .background(IosTheme.colors.fieldBackground),
+                        )
+                    }
+                } else {
+                    if (excerpt != null) {
+                        Text(
+                            text = excerpt,
+                            style = IosTheme.type.footnote.copy(fontSize = 13.sp, lineHeight = 18.5.sp, fontWeight = FontWeight.Normal),
+                            color = IosTheme.colors.secondaryLabel,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    } else {
+                        Column(modifier = Modifier.padding(vertical = 2.dp)) {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth(0.92f)
+                                    .height(12.dp)
+                                    .clip(RoundedCornerShape(3.dp))
+                                    .background(IosTheme.colors.separator.copy(alpha = 0.22f))
+                            )
+                            Spacer(Modifier.height(5.dp))
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth(0.58f)
+                                    .height(12.dp)
+                                    .clip(RoundedCornerShape(3.dp))
+                                    .background(IosTheme.colors.separator.copy(alpha = 0.16f))
+                            )
+                        }
+                    }
+                }
+
+                Spacer(Modifier.height(7.dp))
+
+                // 4. 底部紧凑互动行
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    MetaStat(formatCount(topic.totalReplies), textWidth = 30.dp) { ReplyGlyph(it) }
+                    if (topic.views > 0) {
+                        Spacer(Modifier.width(10.dp))
+                        MetaStat(formatCount(topic.views), textWidth = 34.dp) { ViewGlyph(it) }
+                    }
+                    Spacer(Modifier.width(10.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        ClockGlyph(IosTheme.colors.tertiaryLabel)
+                        Spacer(Modifier.width(3.dp))
+                        Text(
+                            text = RelativeTime.format(topic.bumpedAt ?: topic.lastPostedAt ?: topic.createdAt),
+                            style = IosTheme.type.caption,
+                            color = IosTheme.colors.secondaryLabel,
+                            maxLines = 1,
+                        )
+                    }
+                    Spacer(Modifier.weight(1f))
+                    topic.tags.take(2).forEach { tag ->
+                        Spacer(Modifier.width(4.dp))
+                        TagChip(tag)
+                    }
+                }
             }
-            Spacer(Modifier.weight(1f))
-            topic.tags.take(2).forEach { tag ->
-                Spacer(Modifier.width(4.dp))
-                TagChip(tag)
-            }
-        }
         }
     }
 }
 
 /** 一档信任等级的配色。描边与文字都留 Brush 口子,好让高等级上金属渐变和彩虹。 */
-private data class LevelPalette(
+internal data class LevelPalette(
     val background: Brush,
     val border: Brush,
     val content: Color,
     val contentBrush: Brush? = null,
 )
 
-private val RAINBOW = listOf(
+internal val RAINBOW = listOf(
     Color(0xFFFF4D6D), Color(0xFFFF9F1C), Color(0xFFFFD60A),
     Color(0xFF34C759), Color(0xFF0A84FF), Color(0xFFAF52DE),
 )
@@ -1258,7 +1794,7 @@ private val RAINBOW = listOf(
  * 这里一律用静态渐变、不挂流光动画:列表每行都要画一遍,动画那点光泽不值这个开销。
  */
 @Composable
-private fun LevelBadge(level: Int) {
+fun LevelBadge(level: Int, modifier: Modifier = Modifier) {
     val isDark = IosTheme.colors.isDark
     val shape = RoundedCornerShape(4.dp)
     val palette = when {
@@ -1303,7 +1839,7 @@ private fun LevelBadge(level: Int) {
         TextStyle(color = palette.content, fontSize = 10.sp, lineHeight = 12.sp, fontWeight = weight)
     }
     Row(
-        Modifier
+        modifier
             .clip(shape)
             .background(palette.background)
             .border(0.8.dp, palette.border, shape)
@@ -1320,7 +1856,7 @@ private fun LevelBadge(level: Int) {
 
 /** Lv4 专属小金冠。只有最高等级才画,所以列表里的数量天然很少。 */
 @Composable
-private fun CrownGlyph(color: Color) {
+internal fun CrownGlyph(color: Color) {
     Canvas(Modifier.size(8.dp)) {
         scale(size.width / 24f, size.height / 24f, pivot = Offset.Zero) {
             val crown = Path().apply {
@@ -1424,20 +1960,23 @@ private fun ClockGlyph(color: Color) {
  * 未读蓝点与置顶/关闭标记都内联进标题文本流,和标题共占 2 行配额,
  * 不在标题上方额外占一行 —— 紧凑卡片经不起多一行的开销。
  */
-private fun titleWithBadges(topic: Topic, accent: Color, query: String? = null) = buildAnnotatedString {
-    if (topic.unseen) {
+private fun titleWithBadges(
+    topic: Topic,
+    accent: Color,
+    query: String? = null,
+    includeUnseenDot: Boolean = true,
+) = buildAnnotatedString {
+    if (includeUnseenDot && topic.unseen) {
         appendInlineContent(UNSEEN_DOT, "•")
         append(" ")
     }
     if (topic.pinned) {
-        withStyle(SpanStyle(color = accent, fontWeight = FontWeight.SemiBold, fontSize = 15.sp)) {
-            append("置顶")
+        withStyle(SpanStyle(color = accent, fontWeight = FontWeight.Bold, fontSize = 14.sp)) {
+            append("置顶 ")
         }
-        append(" ")
     }
     if (topic.closed) {
-        withStyle(SpanStyle(color = accent.copy(alpha = 0.7f), fontSize = 15.sp)) { append("已关闭") }
-        append(" ")
+        withStyle(SpanStyle(color = accent.copy(alpha = 0.7f), fontSize = 14.sp)) { append("已关闭 ") }
     }
     val title = topic.title
     val needle = query?.trim().orEmpty()
@@ -1487,18 +2026,27 @@ internal fun formatCount(value: Int): String {
 
 @Composable
 internal fun CategoryTag(category: Category, prominent: Boolean = false) {
-    Row(verticalAlignment = Alignment.CenterVertically) {
+    val catColor = parseCategoryColor(category.color) ?: IosTheme.colors.accent
+    val isDark = IosTheme.colors.isDark
+    val pillBg = catColor.copy(alpha = if (isDark) 0.20f else 0.10f)
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .clip(RoundedCornerShape(4.dp))
+            .background(pillBg)
+            .padding(horizontal = 6.dp, vertical = 2.dp),
+    ) {
         Box(
             Modifier
-                .size(8.dp)
-                .clip(RoundedCornerShape(2.dp))
-                .background(parseCategoryColor(category.color) ?: IosTheme.colors.tertiaryLabel),
+                .size(if (prominent) 6.dp else 5.dp)
+                .clip(CircleShape)
+                .background(catColor),
         )
         Spacer(Modifier.width(4.dp))
         Text(
             text = category.name,
-            style = if (prominent) IosTheme.type.body else IosTheme.type.footnote,
-            color = if (prominent) IosTheme.colors.label else IosTheme.colors.secondaryLabel,
+            style = if (prominent) IosTheme.type.body.copy(fontSize = 12.5.sp, fontWeight = FontWeight.Medium) else IosTheme.type.footnote.copy(fontSize = 11.sp, fontWeight = FontWeight.Medium),
+            color = catColor,
             maxLines = 1,
         )
     }
@@ -1557,19 +2105,18 @@ private fun HomeFeedTitleBar(
     onFeedSelect: (HomeFeedType) -> Unit,
     trailing: @Composable () -> Unit,
 ) {
-    Row(
+    val activeColor = IosTheme.colors.label
+    val indicatorColor = IosTheme.colors.accent
+    Box(
         modifier = Modifier
             .fillMaxWidth()
             .height(IosMetrics.largeTitleHeight)
             .padding(bottom = 4.dp),
-        verticalAlignment = Alignment.Bottom,
+        contentAlignment = Alignment.BottomCenter,
     ) {
         Row(
-            modifier = Modifier
-                .weight(1f)
-                .padding(end = 8.dp),
             verticalAlignment = Alignment.Bottom,
-            horizontalArrangement = Arrangement.spacedBy(18.dp),
+            horizontalArrangement = Arrangement.spacedBy(22.dp),
         ) {
             HomeFeedType.entries.forEach { feed ->
                 val selected = feed == currentFeed
@@ -1578,13 +2125,13 @@ private fun HomeFeedTitleBar(
                     modifier = Modifier
                         .clip(RoundedCornerShape(6.dp))
                         .clickable { onFeedSelect(feed) }
-                        .padding(horizontal = 2.dp, vertical = 2.dp),
+                        .padding(horizontal = 4.dp, vertical = 2.dp),
                 ) {
                     Text(
                         text = feed.label,
-                        fontSize = if (selected) 21.sp else 16.sp,
+                        fontSize = if (selected) 17.5.sp else 15.sp,
                         fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
-                        color = if (selected) IosTheme.colors.label else IosTheme.colors.secondaryLabel,
+                        color = if (selected) activeColor else IosTheme.colors.secondaryLabel,
                     )
                     Spacer(Modifier.height(4.dp))
                     if (selected) {
@@ -1593,7 +2140,7 @@ private fun HomeFeedTitleBar(
                                 .width(18.dp)
                                 .height(3.dp)
                                 .clip(RoundedCornerShape(1.5.dp))
-                                .background(IosTheme.colors.accent),
+                                .background(indicatorColor),
                         )
                     } else {
                         Spacer(Modifier.height(3.dp))
@@ -1601,7 +2148,6 @@ private fun HomeFeedTitleBar(
                 }
             }
         }
-        trailing()
     }
 }
 
@@ -1610,36 +2156,43 @@ private fun HomeFeedCollapsedBar(
     currentFeed: HomeFeedType,
     onFeedSelect: (HomeFeedType) -> Unit,
 ) {
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(18.dp),
+    val activeColor = IosTheme.colors.label
+    val indicatorColor = IosTheme.colors.accent
+    Box(
+        modifier = Modifier.fillMaxWidth(),
+        contentAlignment = Alignment.Center,
     ) {
-        HomeFeedType.entries.forEach { feed ->
-            val selected = feed == currentFeed
-            Column(
-                horizontalAlignment = Alignment.CenterHorizontally,
-                modifier = Modifier
-                    .clip(RoundedCornerShape(6.dp))
-                    .clickable { onFeedSelect(feed) }
-                    .padding(horizontal = 2.dp, vertical = 2.dp),
-            ) {
-                Text(
-                    text = feed.label,
-                    fontSize = if (selected) 16.sp else 14.sp,
-                    fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
-                    color = if (selected) IosTheme.colors.label else IosTheme.colors.secondaryLabel,
-                )
-                Spacer(Modifier.height(2.dp))
-                if (selected) {
-                    Box(
-                        modifier = Modifier
-                            .width(16.dp)
-                            .height(2.5.dp)
-                            .clip(RoundedCornerShape(1.25.dp))
-                            .background(IosTheme.colors.accent),
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(20.dp),
+        ) {
+            HomeFeedType.entries.forEach { feed ->
+                val selected = feed == currentFeed
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(6.dp))
+                        .clickable { onFeedSelect(feed) }
+                        .padding(horizontal = 4.dp, vertical = 2.dp),
+                ) {
+                    Text(
+                        text = feed.label,
+                        fontSize = if (selected) 15.5.sp else 14.sp,
+                        fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+                        color = if (selected) activeColor else IosTheme.colors.secondaryLabel,
                     )
-                } else {
-                    Spacer(Modifier.height(2.5.dp))
+                    Spacer(Modifier.height(2.dp))
+                    if (selected) {
+                        Box(
+                            modifier = Modifier
+                                .width(16.dp)
+                                .height(2.5.dp)
+                                .clip(RoundedCornerShape(1.25.dp))
+                                .background(indicatorColor),
+                        )
+                    } else {
+                        Spacer(Modifier.height(2.5.dp))
+                    }
                 }
             }
         }
@@ -2130,10 +2683,10 @@ private fun FloatingAssistiveBall(
         // 2. 垂直方向：上半区（上方不足 142dp+56dp）朝下展开，下半区朝上展开
         val needExpandDownward = mainCenter.y < (with(density) { 142.dp.toPx() } + with(density) { 56.dp.toPx() })
 
-        // 静止淡出透明度：未交互时半透明（0.55f），触碰或展开时平滑升为 1.0f
+        // 静止淡出透明度：未交互时近乎透明（0.18f），触碰、拖拽或展开时平滑升为 1.0f，绝不遮挡阅读
         val idleAlpha by animateFloatAsState(
-            targetValue = if (isExpanded || isDragging) 1f else 0.55f,
-            animationSpec = tween(250),
+            targetValue = if (isExpanded || isDragging) 1f else 0.18f,
+            animationSpec = tween(220),
             label = "fabIdleAlpha",
         )
 
@@ -2288,7 +2841,9 @@ private fun FloatingAssistiveBall(
         }
 
         // 5. 主悬浮球（采用绝对像素平移，松手直接驻留目标坐标，支持全屏幕自由拖放）
-        val ballRotation = expandProgress * 90f
+        val ballRotation = expandProgress * 45f
+        val isDark = IosTheme.colors.isDark
+        val fabDarkBg = if (isDark) Color(0xFF383A3E) else Color(0xFF242629)
 
         Box(
             modifier = Modifier
@@ -2303,24 +2858,17 @@ private fun FloatingAssistiveBall(
                 .clip(CircleShape)
                 .then(
                     if (isSingle) {
-                        // 单功能直达：半透明浅色底 + 优雅微蓝细边，低调不突兀
                         Modifier
                             .background(IosTheme.colors.card.copy(alpha = 0.92f))
-                            .border(1.dp, Color(0xFF2196F3).copy(alpha = 0.35f), CircleShape)
+                            .border(1.dp, IosTheme.colors.separator, CircleShape)
                     } else if (isExpanded) {
-                        // 展开后主球：饱满纯净天蓝 + 纯白细边
                         Modifier
-                            .background(Color(0xFF2196F3))
-                            .border(1.2.dp, Color.White.copy(alpha = 0.6f), CircleShape)
+                            .background(if (isDark) Color(0xFF222426) else Color(0xFF141517))
+                            .border(1.2.dp, Color.White.copy(alpha = 0.3f), CircleShape)
                     } else {
-                        // 收缩静止态主球：半透明主题天蓝渐变底 + 柔和白边（完全融入内容流，不抢视线）
                         Modifier
-                            .background(
-                                Brush.linearGradient(
-                                    listOf(Color(0xFF42A5F5), Color(0xFF1E88E5)),
-                                ),
-                            )
-                            .border(1.dp, Color.White.copy(alpha = 0.5f), CircleShape)
+                            .background(fabDarkBg)
+                            .border(1.dp, Color.White.copy(alpha = 0.2f), CircleShape)
                     }
                 )
                 .pointerInput(isSingle, actions) {
@@ -2375,7 +2923,7 @@ private fun FloatingAssistiveBall(
                 ) {
                     FloatingActionIcon(
                         action = singleAction,
-                        tint = Color(0xFF2196F3),
+                        tint = if (isDark) Color.White else Color(0xFF181818),
                         modifier = Modifier.size(19.dp),
                     )
                     Spacer(Modifier.height(1.dp))
@@ -2386,7 +2934,7 @@ private fun FloatingAssistiveBall(
                     )
                 }
             } else {
-                // 多功能主球：旋转动画，三条横线 ≡ 平滑过渡为 ×
+                // 多功能主球：旋转动画，+ 号平滑过渡为 ×
                 Box(
                     modifier = Modifier.graphicsLayer {
                         rotationZ = ballRotation
@@ -2395,16 +2943,11 @@ private fun FloatingAssistiveBall(
                 ) {
                     Canvas(Modifier.size(20.dp)) {
                         scale(size.width / 24f, size.height / 24f, pivot = Offset.Zero) {
-                            if (expandProgress > 0.5f) {
-                                // × 图标
-                                drawLine(Color.White, Offset(6.5f, 6.5f), Offset(17.5f, 17.5f), strokeWidth = 2.4f, cap = StrokeCap.Round)
-                                drawLine(Color.White, Offset(17.5f, 6.5f), Offset(6.5f, 17.5f), strokeWidth = 2.4f, cap = StrokeCap.Round)
-                            } else {
-                                // 三条横线 ≡（汉堡菜单，圆润纯白）
-                                drawLine(Color.White, Offset(5f, 7f), Offset(19f, 7f), strokeWidth = 2.2f, cap = StrokeCap.Round)
-                                drawLine(Color.White, Offset(5f, 12f), Offset(19f, 12f), strokeWidth = 2.2f, cap = StrokeCap.Round)
-                                drawLine(Color.White, Offset(5f, 17f), Offset(19f, 17f), strokeWidth = 2.2f, cap = StrokeCap.Round)
-                            }
+                            val stroke = 2.4f
+                            // 水平横线
+                            drawLine(Color.White, Offset(5.5f, 12f), Offset(18.5f, 12f), strokeWidth = stroke, cap = StrokeCap.Round)
+                            // 垂直竖线
+                            drawLine(Color.White, Offset(12f, 5.5f), Offset(12f, 18.5f), strokeWidth = stroke, cap = StrokeCap.Round)
                         }
                     }
                 }
@@ -2420,6 +2963,9 @@ private fun floatingActionColor(action: FloatingAction): Color = when (action) {
     FloatingAction.Drafts -> Color(0xFF8C9BB0)      // 雅致灰紫蓝
     FloatingAction.Search -> Color(0xFF68A398)      // 柔和灰海青
     FloatingAction.Categories -> Color(0xFFEAA63B)  // 暖金琥珀
+    FloatingAction.History -> Color(0xFF7E57C2)     // 典雅紫罗兰
+    FloatingAction.Connect -> Color(0xFF1E88E5)     // LinuxDo 极客蓝
+    FloatingAction.Chat -> Color(0xFFE91E63)        // 活力珊瑚粉
 }
 
 /** 辅助悬浮按钮各功能的纯矢量精致手绘图标。 */
@@ -2491,6 +3037,66 @@ private fun FloatingActionIcon(
                     drawRoundRect(tint, Offset(13f, 4.5f), Size(6.5f, 6.5f), CornerRadius(r, r), style = stroke)
                     drawRoundRect(tint, Offset(4.5f, 13f), Size(6.5f, 6.5f), CornerRadius(r, r), style = stroke)
                     drawRoundRect(tint, Offset(13f, 13f), Size(6.5f, 6.5f), CornerRadius(r, r), style = stroke)
+                }
+                FloatingAction.History -> {
+                    // 历史时钟回旋箭头 🕒 ⟲
+                    drawArc(
+                        color = tint,
+                        startAngle = 40f,
+                        sweepAngle = 280f,
+                        useCenter = false,
+                        topLeft = Offset(4f, 4f),
+                        size = Size(16f, 16f),
+                        style = stroke,
+                    )
+                    val arrow = Path().apply {
+                        moveTo(9.5f, 2.5f)
+                        lineTo(4f, 4.5f)
+                        lineTo(5.5f, 10f)
+                    }
+                    drawPath(arrow, tint, style = stroke)
+                    drawLine(tint, Offset(12f, 12f), Offset(12f, 7.5f), strokeWidth = 2.1f, cap = StrokeCap.Round)
+                    drawLine(tint, Offset(12f, 12f), Offset(15.5f, 12f), strokeWidth = 2.1f, cap = StrokeCap.Round)
+                }
+                FloatingAction.Connect -> {
+                    // 极客互联双链 🔗
+                    val l1 = Path().apply {
+                        moveTo(10f, 13f)
+                        lineTo(8f, 15f)
+                        cubicTo(6.5f, 16.5f, 6.5f, 19f, 8f, 20.5f)
+                        cubicTo(9.5f, 22f, 12f, 22f, 13.5f, 20.5f)
+                        lineTo(15.5f, 18.5f)
+                    }
+                    val l2 = Path().apply {
+                        moveTo(14f, 11f)
+                        lineTo(16f, 9f)
+                        cubicTo(17.5f, 7.5f, 17.5f, 5f, 16f, 3.5f)
+                        cubicTo(14.5f, 2f, 12f, 2f, 10.5f, 3.5f)
+                        lineTo(8.5f, 5.5f)
+                    }
+                    drawPath(l1, tint, style = stroke)
+                    drawPath(l2, tint, style = stroke)
+                    drawLine(tint, Offset(9.5f, 14.5f), Offset(14.5f, 9.5f), strokeWidth = 2.1f, cap = StrokeCap.Round)
+                }
+                FloatingAction.Chat -> {
+                    // 实时聊天对话气泡 💬
+                    val bubble = Path().apply {
+                        moveTo(4.5f, 6f)
+                        cubicTo(4.5f, 4.5f, 5.5f, 4f, 7f, 4f)
+                        lineTo(17f, 4f)
+                        cubicTo(18.5f, 4f, 19.5f, 4.5f, 19.5f, 6f)
+                        lineTo(19.5f, 14f)
+                        cubicTo(19.5f, 15.5f, 18.5f, 16f, 17f, 16f)
+                        lineTo(9.5f, 16f)
+                        lineTo(5.5f, 19.5f)
+                        lineTo(5.5f, 16f)
+                        lineTo(4.5f, 16f)
+                        close()
+                    }
+                    drawPath(bubble, tint, style = stroke)
+                    drawCircle(tint, 1.1f, Offset(8.5f, 10f))
+                    drawCircle(tint, 1.1f, Offset(12f, 10f))
+                    drawCircle(tint, 1.1f, Offset(15.5f, 10f))
                 }
             }
         }

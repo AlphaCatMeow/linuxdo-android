@@ -85,6 +85,65 @@ private val LEVEL_NUMBER_REGEX = Regex("Lv\\s*(\\d+)", RegexOption.IGNORE_CASE)
 private fun extractLevelNumber(name: String): Int =
     LEVEL_NUMBER_REGEX.find(name)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 1
 
+/**
+ * 具有半透明磨砂亚克力/毛玻璃质感的分类卡片容器 (Glassmorphism)，
+ * 搭配 1px 细微高光玻璃边框与悬浮微投影，不改动全屏底色，模块自身通透出众。
+ */
+@Composable
+private fun GlassCategoryCard(
+    modifier: Modifier = Modifier,
+    content: @Composable ColumnScope.() -> Unit,
+) {
+    val isDark = IosTheme.colors.isDark
+    val cardShape = RoundedCornerShape(14.dp)
+    val glassBg = if (isDark) {
+        Brush.verticalGradient(
+            listOf(
+                Color(0xFF232630).copy(alpha = 0.68f),
+                Color(0xFF171920).copy(alpha = 0.52f),
+            )
+        )
+    } else {
+        Brush.verticalGradient(
+            listOf(
+                Color.White.copy(alpha = 0.88f),
+                Color.White.copy(alpha = 0.70f),
+            )
+        )
+    }
+    val glassBorder = if (isDark) {
+        Brush.verticalGradient(
+            listOf(
+                Color.White.copy(alpha = 0.22f),
+                Color.White.copy(alpha = 0.06f),
+            )
+        )
+    } else {
+        Brush.verticalGradient(
+            listOf(
+                Color.White.copy(alpha = 0.95f),
+                Color(0xFFE2E4E8).copy(alpha = 0.65f),
+            )
+        )
+    }
+
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(horizontal = IosMetrics.screenPadding)
+            .shadow(
+                elevation = 2.dp,
+                shape = cardShape,
+                ambientColor = Color.Black.copy(alpha = 0.04f),
+                spotColor = Color.Black.copy(alpha = 0.08f),
+            )
+            .clip(cardShape)
+            .background(glassBg)
+            .border(1.dp, glassBorder, cardShape),
+        content = content,
+    )
+}
+
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun CategoryListScreen(
@@ -240,8 +299,9 @@ fun CategoryListScreen(
 
     IosLargeTitleScaffold(
         title = "分类",
+        showLargeTitle = false,
         listState = listState,
-        compactTop = true,
+        compactTop = false,
         scrollToTopRequest = scrollToTopRequest,
         trailing = combinedTrailing,
     ) {
@@ -266,7 +326,7 @@ fun CategoryListScreen(
         itemsIndexed(groups, key = { _, pair -> pair.first.id }) { index, (parent, levels) ->
             var showCardMenu by remember { mutableStateOf(false) }
             val dragging = draggedId == parent.id
-            IosGroupCard(Modifier
+            GlassCategoryCard(Modifier
                 .animateItem(placementSpec = if (dragging) null else tween(180))
                 .zIndex(if (dragging) 1f else 0f)
                 .graphicsLayer {
@@ -413,7 +473,7 @@ private fun CustomSectionCard(
     val haptic = LocalHapticFeedback.current
     var expanded by rememberSaveable { mutableStateOf(true) }
 
-    IosGroupCard(
+    GlassCategoryCard(
         modifier = Modifier
             .padding(vertical = 8.dp)
             .combinedClickable(
@@ -1279,28 +1339,57 @@ private fun LevelBadgeChip(
     val label = "Lv.$level"
 
     when {
-        level <= 1 -> {
+        level <= 0 -> {
             val bgBrush = if (isDark) {
-                Brush.horizontalGradient(listOf(Color(0xFF13263E), Color(0xFF193354)))
+                Brush.horizontalGradient(listOf(Color(0xFF242528), Color(0xFF2C2D32)))
             } else {
-                Brush.horizontalGradient(listOf(Color(0xFFEAF3FF), Color(0xFFDCEBFF)))
+                Brush.horizontalGradient(listOf(Color(0xFFF2F3F5), Color(0xFFE9EBEF)))
             }
-            val borderColor = if (isDark) Color(0xFF2B548C) else Color(0xFFBBD7FF)
-            val contentColor = if (isDark) Color(0xFF6EAEFF) else Color(0xFF155FD0)
+            val borderColor = if (isDark) Color(0xFF3E4046) else Color(0xFFD6D9E0)
+            val contentColor = if (isDark) Color(0xFFA0A3A8) else Color(0xFF6B7280)
             Row(
                 modifier = Modifier
                     .clip(shape)
                     .background(bgBrush)
                     .border(0.8.dp, borderColor, shape)
                     .clickable(onClick = onClick)
-                    .padding(horizontal = 8.dp, vertical = 6.dp),
+                    .padding(horizontal = 8.dp, vertical = 5.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(3.dp),
             ) {
                 Text(
                     text = label,
-                    style = IosTheme.type.caption.copy(fontSize = 12.sp),
-                    fontWeight = FontWeight.SemiBold,
+                    style = IosTheme.type.caption.copy(fontSize = 11.5.sp),
+                    fontWeight = FontWeight.Medium,
+                    color = contentColor,
+                )
+                BadgeArrowIcon(color = contentColor)
+            }
+        }
+
+        level == 1 -> {
+            // ── Lv.1 清新天蓝 ──
+            val bgBrush = if (isDark) {
+                Brush.horizontalGradient(listOf(Color(0xFF0D2538), Color(0xFF13334C)))
+            } else {
+                Brush.horizontalGradient(listOf(Color(0xFFEBF5FF), Color(0xFFDCEEFE)))
+            }
+            val borderColor = if (isDark) Color(0xFF1A5276) else Color(0xFF90CDF4)
+            val contentColor = if (isDark) Color(0xFF63B3ED) else Color(0xFF096DD9)
+            Row(
+                modifier = Modifier
+                    .clip(shape)
+                    .background(bgBrush)
+                    .border(0.8.dp, borderColor, shape)
+                    .clickable(onClick = onClick)
+                    .padding(horizontal = 8.dp, vertical = 5.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(3.dp),
+            ) {
+                Text(
+                    text = label,
+                    style = IosTheme.type.caption.copy(fontSize = 11.5.sp),
+                    fontWeight = FontWeight.Medium,
                     color = contentColor,
                 )
                 BadgeArrowIcon(color = contentColor)
@@ -1308,6 +1397,7 @@ private fun LevelBadgeChip(
         }
 
         level == 2 -> {
+            // ── Lv.2 浅黄/温润琥珀底 + 铜金字（进阶，告别绿色） ──
             val bgBrush = if (isDark) {
                 Brush.horizontalGradient(listOf(Color(0xFF33230A), Color(0xFF47310E)))
             } else {
@@ -1319,16 +1409,16 @@ private fun LevelBadgeChip(
                 modifier = Modifier
                     .clip(shape)
                     .background(bgBrush)
-                    .border(0.9.dp, borderColor, shape)
+                    .border(0.8.dp, borderColor, shape)
                     .clickable(onClick = onClick)
-                    .padding(horizontal = 8.dp, vertical = 6.dp),
+                    .padding(horizontal = 8.dp, vertical = 5.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(3.dp),
             ) {
                 Text(
                     text = label,
-                    style = IosTheme.type.caption.copy(fontSize = 12.sp),
-                    fontWeight = FontWeight.Bold,
+                    style = IosTheme.type.caption.copy(fontSize = 11.5.sp),
+                    fontWeight = FontWeight.Medium,
                     color = contentColor,
                 )
                 BadgeArrowIcon(color = contentColor)

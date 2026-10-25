@@ -6,38 +6,58 @@ import java.nio.charset.StandardCharsets
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
+import kotlin.random.Random
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
+import java.util.concurrent.ConcurrentHashMap
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonArray
+import org.linuxdo.android.net.HttpHeaderUtils
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.decodeFromJsonElement
 import java.net.URI
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.longOrNull
+import kotlinx.serialization.json.intOrNull
 import org.jsoup.Jsoup
 import org.linuxdo.android.Config
+import org.linuxdo.android.net.ChallengeDetector
 import org.linuxdo.android.net.HttpStatusException
 import org.linuxdo.android.net.LoginRejectedException
 import org.linuxdo.android.net.NeedsInteractiveVerification
+import org.linuxdo.android.net.NetDiagnostics
 import org.linuxdo.android.net.NetworkTimeoutException
+import org.linuxdo.android.net.RateLimitException
 import org.linuxdo.android.net.RiskControlException
 import org.linuxdo.android.net.SecondFactorRequiredException
 import org.linuxdo.android.net.Transport
 import org.linuxdo.android.net.TransportResult
 import org.linuxdo.android.ui.html.CookedParser
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.RequestBody.Companion.toRequestBody
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.launch
 
 data class DiscourseTagInfo(
     val name: String,
@@ -95,10 +115,74 @@ class TopicRepository(
     private val reading: ReadingStore? = null,
     private val sessionStore: SessionStore? = null,
     private val fallbackTransportProvider: (() -> Transport)? = null,
+    private val httpClientProvider: (() -> OkHttpClient)? = null,
 ) {
     private val json = Json { ignoreUnknownKeys = true; coerceInputValues = true }
-    private val gate = Mutex()
-    private var lastRequestAt = 0L
+    private val ldcAuthGate = Mutex()
+    // 双轨调度器 (策略二)：getSemaphore, postGate 及滑动窗口限流器全部位于 companion object，全进程单例共享
+
+    init {
+        sessionStore?.let { store ->
+            val savedWallUntil = store.getRateLimitedUntil()
+            val nowWall = System.currentTimeMillis()
+            if (savedWallUntil > nowWall) {
+                val remaining = (savedWallUntil - nowWall).coerceAtMost(RATE_LIMIT_COOLDOWN_MS)
+                synchronized(rateLimitLock) {
+                    rateLimitedUntil = maxOf(rateLimitedUntil, SystemClock.elapsedRealtime() + remaining)
+                }
+            }
+        }
+    }
+
+    /** 429 冷却期间，后台任务应直接退让，不能把限流误当作需要过盾。 */
+    fun isRateLimitCoolingDown(): Boolean = Companion.isRateLimitCoolingDown()
+
+    /** 后台静默预取（首楼摘要、新话题探测）撞盾后的退避期内，这类请求一律不发。 */
+    fun isSilentPrefetchBackingOff(): Boolean =
+        SystemClock.elapsedRealtime() < silentPrefetchBackoffUntil
+
+    /**
+     * 后台静默预取撞到 CF 挑战/403 时进入退避，返回是否命中。
+     *
+     * 逐个话题连拉 /t/{id}/1.json 是典型的爬取特征，撞盾后若继续换下一个 ID 或回退 /raw，
+     * 只会把同一枚 cf_clearance 的风险分越推越高，连带前台正常浏览也被挑战。
+     */
+    fun enterSilentPrefetchBackoff(error: Throwable): Boolean {
+        val challenged = error is NeedsInteractiveVerification ||
+            (error is HttpStatusException && error.status == 403)
+        if (!challenged) return false
+        val wasBackingOff = isSilentPrefetchBackingOff()
+        silentPrefetchBackoffUntil = SystemClock.elapsedRealtime() + SILENT_PREFETCH_BACKOFF_MS
+        if (!wasBackingOff) {
+            diagnostics.log("后台预取撞盾，暂停摘要预取与新话题探测 ${SILENT_PREFETCH_BACKOFF_MS / 60_000L} 分钟")
+        }
+        return true
+    }
+
+    fun rateLimitRemainingMs(): Long = Companion.rateLimitRemainingMs()
+
+    private fun throwIfRateLimitCoolingDown() {
+        val remaining = rateLimitRemainingMs()
+        if (remaining > 0L) throw RateLimitException(remaining)
+    }
+
+    fun clearTimingsCache() {
+        Companion.clearTimingsCache(sessionStore?.currentUserId())
+    }
+
+    private fun enterRateLimitCooldown(
+        path: String,
+        retryAfterSeconds: Long? = null,
+        cfChallenge: Boolean = false,
+    ): RateLimitException {
+        val remaining = Companion.enterRateLimitCooldown(path, retryAfterSeconds, sessionStore, cfChallenge)
+        val kind = if (cfChallenge) "CF质询" else "429"
+        diagnostics.log(
+            "服务端限流($kind): $path，暂停自动网络请求 ${remaining / 1_000L}s，" +
+                "后台池惩罚 ${ApiQuotaPool.UNREAD_POLL.penaltyRemainingMs() / 1_000L}s",
+        )
+        return RateLimitException(remaining)
+    }
 
     /**
      * 阅读进度上报复用的 CSRF Token。
@@ -106,6 +190,34 @@ class TopicRepository(
      * 失效(403/挑战)时清空重取即可。
      */
     private var cachedCsrfToken: String? = null
+
+    fun clearCachedCsrfToken() {
+        cachedCsrfToken = null
+    }
+
+    fun resetTimingsCooldown() {
+        timingsCooldownUntil = 0L
+    }
+
+    suspend fun refreshCsrf(): String = obtainCsrf(forceRefresh = true)
+
+    /** 自动网络与会话自愈回调 (由 ViewModel 注册) */
+    var onAutoHealRequested: (suspend () -> Unit)? = null
+
+    data class Http403Event(val key: String, val timestamp: Long)
+
+    /** 记录 6 分钟滑动窗口内的 403 / 挑战拦截事件以智能触发自愈 */
+    private val recent403Events = java.util.Collections.synchronizedList(mutableListOf<Http403Event>())
+    private var lastAutoHealAt = 0L
+
+    fun notify403OrChallenged(key: String, reason: String = "") {
+        val now = SystemClock.elapsedRealtime()
+        synchronized(recent403Events) {
+            recent403Events.removeAll { now - it.timestamp > 360_000L }
+            recent403Events.add(Http403Event(key, now))
+            diagnostics.log("网络监控: 记录 403/挑战事件 (特征: $key, 来源: $reason)")
+        }
+    }
 
     /** 分类表全站共用且很少变,整个进程只拉一次。 */
     private var categoryCache: Map<Int, Category>? = null
@@ -151,11 +263,14 @@ class TopicRepository(
             if (ascending != null) add("ascending=$ascending")
         }.joinToString("&")
         val path = "${feed.apiPath}?$query"
-        val result = toPage(
-            response = json.decodeFromString(request(path, burst = page == 0, present = present)),
-            awaitCategories = awaitCategories,
-            excludeReadUnread = excludeRead,
-        )
+        val body = request(path, burst = page == 0, present = present)
+        val result = withContext(Dispatchers.Default) {
+            toPage(
+                response = json.decodeFromString(body),
+                awaitCategories = awaitCategories,
+                excludeReadUnread = excludeRead,
+            )
+        }
         return if (feed == HomeFeedType.Latest) result.copy(
             items = result.items.filterNot { it.notificationLevel == TopicNotificationLevel.Muted },
         ) else result
@@ -177,16 +292,17 @@ class TopicRepository(
             if (!order.isNullOrBlank()) add("order=$order")
             if (ascending != null) add("ascending=$ascending")
         }.joinToString("&")
-        return toPage(
-            json.decodeFromString(
-                request(
-                    "/c/${encode(slug.ifBlank { "category" })}/$categoryId.json?$query",
-                    burst = page == 0,
-                    present = present,
-                )
-            ),
-            awaitCategories = false,
+        val body = request(
+            "/c/${encode(slug.ifBlank { "category" })}/$categoryId.json?$query",
+            burst = page == 0,
+            present = present,
         )
+        return withContext(Dispatchers.Default) {
+            toPage(
+                json.decodeFromString(body),
+                awaitCategories = false,
+            )
+        }
     }
 
     suspend fun fetchUserCreatedTopics(username: String, page: Int): TopicPage =
@@ -276,10 +392,200 @@ class TopicRepository(
     ): TopicDetail {
         val position = postNumber?.takeIf { it > 1 }?.let { "/$it" }.orEmpty()
         val body = request("/t/$id$position.json?track_visit=$trackVisit", burst = burst, present = true)
-        return json.decodeFromString<TopicDetail>(body).also {
-            CookedParser.prewarm(it.postStream.posts)
+        return withContext(Dispatchers.Default) {
+            json.decodeFromString<TopicDetail>(body).also { detail ->
+                CookedParser.prewarm(detail.postStream.posts)
+                detail.postStream.posts.forEach { post ->
+                    AvatarCache.record(post.username, post.animatedAvatar)
+                }
+                detail.postStream.posts.firstOrNull { it.postNumber == 1 }?.let { firstPost ->
+                    val doc = Jsoup.parseBodyFragment(firstPost.cooked)
+                    val firstImg = doc.select("img").firstOrNull { img ->
+                        val src = img.attr("src")
+                        !img.hasClass("emoji") &&
+                        !img.hasClass("avatar") &&
+                        !src.contains("/user_avatar/") &&
+                        !src.contains("/images/emoji/") &&
+                        (src.startsWith("http") || src.startsWith("/"))
+                    }
+                    val coverUrl = firstImg?.attr("src")?.let { src ->
+                        if (src.startsWith("//")) "https:$src"
+                        else if (src.startsWith("/")) "${Config.BASE_URL}$src"
+                        else src
+                    }
+                    doc.select(".lightbox-wrapper, .lightbox, .meta, .informations, .filename, img, svg, video, audio").remove()
+                    val plainText = doc.text().trim()
+                    ExcerptCache.record(detail.id, plainText, coverUrl)
+                }
+            }
         }
     }
+
+    private val prefetchingIds = java.util.Collections.synchronizedSet(mutableSetOf<Long>())
+
+    /**
+     * 用搜索结果一次补齐列表中多个首楼摘要。搜索结果并不作为列表数据源，
+     * 只采纳与当前话题 ID 对得上的 in:first 命中，避免搜索排序影响列表本身。
+     */
+    suspend fun prefetchSearchExcerpts(topicIds: Collection<Long>, query: String) {
+        val requestedIds = topicIds.asSequence()
+            .filter { it > 0L && ExcerptCache.get(it) == null }
+            .toSet()
+        if (requestedIds.isEmpty() || query.isBlank() || isSilentPrefetchBackingOff()) return
+
+        val body = try {
+            request("/search.json?q=${encode(query)}", present = false)
+        } catch (error: Exception) {
+            if (error !is CancellationException) enterSilentPrefetchBackoff(error)
+            throw error
+        }
+        val excerpts = withContext(Dispatchers.Default) {
+            json.decodeFromString<SearchResponse>(body).posts.asSequence()
+                .filter { it.postNumber == 1 && it.topicId in requestedIds }
+                .mapNotNull { post ->
+                    post.blurb.trim().takeIf { it.isNotEmpty() }?.let { post.topicId to it }
+                }
+                .toMap()
+        }
+        excerpts.forEach { (topicId, excerpt) -> ExcerptCache.record(topicId, excerpt) }
+    }
+
+    /**
+     * 单楼轻量端点嗅探（GET /t/{topic_id}/1.json）。
+     * 仅返回首楼数据（不到 2KB），解析真实 HTML 渲染文本与第一张高清封面图。
+     */
+    private suspend fun fetchTopicOp(topicId: Long): Pair<String?, String?>? {
+        return try {
+            val body = request("/t/$topicId/1.json", present = false)
+            withContext(Dispatchers.Default) {
+                val element = json.parseToJsonElement(body).jsonObject
+                val postStream = element["post_stream"]?.jsonObject
+                val posts = postStream?.get("posts")?.jsonArray
+                val firstPost = posts?.firstOrNull()?.jsonObject ?: return@withContext null
+                val cooked = firstPost["cooked"]?.jsonPrimitive?.contentOrNull.orEmpty()
+                if (cooked.isBlank()) return@withContext null
+
+                val doc = Jsoup.parseBodyFragment(cooked)
+                doc.select("aside.quote, .lightbox-wrapper .meta, script, style").remove()
+                val text = doc.text().replace(Regex("""\s+"""), " ").trim()
+                val plainText = if (text.length > 150) text.take(150) else text
+
+                val firstImg = doc.select("img").firstOrNull { img ->
+                    val src = img.attr("src")
+                    !img.hasClass("emoji") &&
+                    !img.hasClass("avatar") &&
+                    !src.contains("/user_avatar/") &&
+                    !src.contains("/images/emoji/") &&
+                    (src.startsWith("http") || src.startsWith("/"))
+                }
+                val coverUrl = firstImg?.attr("src")?.let { src ->
+                    if (src.startsWith("//")) "https:$src"
+                    else if (src.startsWith("/")) "${Config.BASE_URL}$src"
+                    else src
+                }
+                (plainText.takeIf { it.isNotBlank() } to coverUrl)
+            }
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            // 撞盾必须向上抛：吞成 null 会让调用方回退 /raw 再打一枪。
+            if (enterSilentPrefetchBackoff(error)) throw error
+            null
+        }
+    }
+
+    private suspend fun fetchRawOpFallback(topicId: Long): Pair<String?, String?>? {
+        return try {
+            val raw = request("/raw/$topicId", present = false)
+            withContext(Dispatchers.Default) {
+                val plainText = rawExcerptToPlainText(raw).takeIf { it.isNotEmpty() }
+                val coverUrl = extractMarkdownFirstImage(raw)
+                (plainText to coverUrl)
+            }
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            enterSilentPrefetchBackoff(error)
+            null
+        }
+    }
+
+    private fun extractMarkdownFirstImage(raw: String): String? {
+        val mdMatch = Regex("""!\[[^\]]*]\((https?://[^)\s]+|/uploads/[^)\s]+)""").find(raw)
+        if (mdMatch != null) {
+            val url = mdMatch.groupValues[1]
+            return if (url.startsWith("/")) "${Config.BASE_URL}$url" else url
+        }
+        val htmlMatch = Regex("""<img\b[^>]*src=["'](https?://[^"'\s]+|/uploads/[^"'\s]+)["']""", RegexOption.IGNORE_CASE).find(raw)
+        if (htmlMatch != null) {
+            val url = htmlMatch.groupValues[1]
+            return if (url.startsWith("/")) "${Config.BASE_URL}$url" else url
+        }
+        return null
+    }
+
+    /**
+     * 仅拉取首楼的原始文本与封面图，供未命中的可视列表项兜底。
+     * 优先单楼端点，失败回退到 raw 接口，绝不进入完整话题详情页或改变阅读状态。
+     */
+    suspend fun prefetchExcerpt(topicId: Long): String? {
+        if (topicId <= 0L) return null
+        ExcerptCache.get(topicId)?.let { return it }
+        if (isSilentPrefetchBackingOff()) return null
+        if (!ApiQuotaPool.EXCERPT_PREFETCH.tryAcquire()) return null
+        if (!prefetchingIds.add(topicId)) return null
+        return try {
+            val op = fetchTopicOp(topicId) ?: fetchRawOpFallback(topicId)
+            val plainText = op?.first
+            val coverUrl = op?.second
+            if (!plainText.isNullOrBlank() || !coverUrl.isNullOrBlank()) {
+                ExcerptCache.record(topicId, plainText, coverUrl)
+            }
+            if (op != null) ApiQuotaPool.EXCERPT_PREFETCH.onSuccess()
+            plainText
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Exception) {
+            null
+        } finally {
+            prefetchingIds.remove(topicId)
+        }
+    }
+
+    private fun rawExcerptToPlainText(raw: String): String {
+        val withoutExportHeader = raw.replace(RAW_EXPORT_HEADER, "")
+        val withoutAttachments = withoutExportHeader
+            .replace(RAW_ATTACHMENT_MARKDOWN, " ")
+            .replace(RAW_ATTACHMENT_PLAIN_LINE, " ")
+        val withoutMedia = withoutAttachments
+            .replace(Regex("""!\[[^\]]*]\([^)]*\)"""), " ")
+            .replace(Regex("""<img\b[^>]*>""", RegexOption.IGNORE_CASE), " ")
+        val withoutLinks = withoutMedia.replace(
+            Regex("""\[([^\]]+)]\([^)]*\)"""),
+            "${'$'}1",
+        )
+        val withoutMarkers = withoutLinks
+            .replace(Regex("""(?m)^\s{0,3}(?:#{1,6}\s+|>\s*|[-+*]\s+|\d+[.)]\s+)"""), "")
+            .replace(Regex("""[`*_~]"""), "")
+        return Jsoup.parseBodyFragment(withoutMarkers).text()
+            .replace(Regex("""\s+"""), " ")
+            .trim()
+    }
+
+    /** `/raw/{topicId}` 首行是导出元信息，不属于用户正文。 */
+    private val RAW_EXPORT_HEADER = Regex(
+        """\A\s*[^|\r\n]+\s*\|\s*\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+(?:UTC|GMT|[A-Z]{2,5}|[+-]\d{2}:?\d{2})\s*\|\s*#\d+\s*(?:\r?\n)?""",
+    )
+
+    /** Discourse 附件 Markdown 与可选的紧随体积行，例如 `[200.txt|attachment](upload://...)\n(2.4 KB)`。 */
+    private val RAW_ATTACHMENT_MARKDOWN = Regex(
+        """(?is)!?\[[^\]\r\n]*\|attachment]\([^)\r\n]*\)[ \t]*(?:\r?\n[ \t]*\([ \t]*[\d.,]+[ \t]*(?:B|KB|MB|GB|TB)[ \t]*\))?""",
+    )
+
+    /** 容错处理被服务端展开过的附件标题行。 */
+    private val RAW_ATTACHMENT_PLAIN_LINE = Regex(
+        """(?im)^[ \t]*[^\r\n|]{1,200}\|attachment[ \t]*(?:\r?\n[ \t]*\([ \t]*[\d.,]+[ \t]*(?:B|KB|MB|GB|TB)[ \t]*\))?[ \t]*$""",
+    )
 
     /**
      * 上报阅读进度(`POST /topics/timings`),让网页端的未读蓝点消失、总结页的
@@ -288,37 +594,151 @@ class TopicRepository(
      * 走全局 gate 串行节流。此为可丢弃的统计请求，遇 Cloudflare 挑战或服务异常直接返回 false，
      * 绝不抛异常打断用户正常阅读。
      */
+    private var timingsCooldownUntil = 0L
+
+    /**
+     * 路径 B 已证明能过 timings 时置位：A 的 OkHttp 指纹/出口拿着同一枚 cf_clearance 仍会被
+     * POST 写规则挑战，继续先打 A 只会每次多吃一个 403，所以后续心跳直接走 B。
+     */
+    @Volatile private var preferWebViewTimings = false
+
+    /** timings 被 CF 挑战且静默兜底无果，需要请用户手工过盾（由 ViewModel 展示横幅）。 */
+    var onTimingsVerificationRequired: (() -> Unit)? = null
+
+    /** timings 重新同步成功，横幅可以收起。 */
+    var onTimingsRecovered: (() -> Unit)? = null
+
+    private fun markTimingsSynced() {
+        timingsCooldownUntil = 0L
+        onTimingsRecovered?.invoke()
+    }
+
+    /** 用户手工过盾后调用：解除熔断并让下一次心跳优先走 WebView 网络栈。 */
+    fun onManualVerificationCompleted() {
+        timingsCooldownUntil = 0L
+        preferWebViewTimings = true
+        cachedCsrfToken = null
+    }
+
     suspend fun recordTopicTimings(topicId: Long, topicTimeMs: Long, postNumbers: List<Int>): Boolean {
+        if (sessionStore?.sessionChanging == true) {
+            diagnostics.logThrottled("timings-gate", "[诊断] 阅读进度跳过: 会话切换中")
+            return false
+        }
         if (topicId <= 0L) return false
+        if (isRateLimitCoolingDown()) {
+            diagnostics.logThrottled("timings-gate", "[诊断] 阅读进度跳过: 429 冷却还剩 ${rateLimitRemainingMs() / 1000}s")
+            return false
+        }
+        val now = SystemClock.elapsedRealtime()
+        if (now < timingsCooldownUntil) {
+            diagnostics.logThrottled("timings-gate", "[诊断] 阅读进度跳过: 熔断冷却还剩 ${(timingsCooldownUntil - now) / 1000}s")
+            return false
+        }
         val numbers = postNumbers.filter { it > 0 }.distinct().sorted()
         if (numbers.isEmpty()) {
             diagnostics.log("阅读进度未上报: 话题 $topicId 没有可见楼层")
             return false
         }
-        val topicTime = topicTimeMs.coerceIn(MIN_READ_TIME_MS, MAX_TOPIC_TIME_MS)
-        val perPost = (topicTime / numbers.size).coerceIn(MIN_READ_TIME_MS, MAX_POST_TIME_MS)
-        // Rails 的嵌套参数写法:timings[楼层号]=停留毫秒数。JSON body 在这个端点上不被认。
-        val form = buildString {
-            append("topic_id=").append(topicId)
-            append("&topic_time=").append(topicTime)
-            numbers.forEach { number -> append("&timings%5B").append(number).append("%5D=").append(perPost) }
-        }
-        val primaryTransport = transportProvider()
-        val fallbackTransport = fallbackTransportProvider?.invoke()
-        var currentTransport = primaryTransport
-        var isFallback = false
 
-        repeat(2) { attempt ->
-            val result = try {
-                val csrf = cachedCsrf() ?: run {
-                    diagnostics.log("阅读进度未上报: CSRF Token 获取失败")
-                    return false
-                }
-                gate.withLock {
-                    throttle()
+        val currentUserId = sessionStore?.currentUserId() ?: 0L
+
+        // ── 自动去重校验 ──
+        // 1. 真实已同步去重校验：当且仅当当前账号在当前批次的所有楼层此前都已被确认成功同步，才判定为去重并返回 true（上层安全剔除）
+        if (isTopicPostsReported(currentUserId, topicId, numbers)) {
+            diagnostics.log("阅读进度去重: 用户 $currentUserId 话题 $topicId ${numbers.size} 个楼层此前已全部成功同步，跳过请求")
+            return true
+        }
+
+        // 2. 避免在途重入并发：若当前话题已有正在发送的同步任务，返回 false！
+        // 关键：绝不虚报 true！返回 false 让上层 ViewModel 保留未发送的楼层，等在途完成后下一周期合并上报，绝不丢楼层
+        if (!inFlightTimingsTopics.add(topicId)) {
+            diagnostics.log("阅读进度待合并: 话题 $topicId 已有正在进行的同步任务，保留本批至下次合并")
+            return false
+        }
+
+        try {
+            val topicTime = topicTimeMs.coerceIn(MIN_READ_TIME_MS, MAX_TOPIC_TIME_MS)
+            val perPost = (topicTime / numbers.size).coerceIn(MIN_READ_TIME_MS, MAX_POST_TIME_MS)
+            // Rails 的嵌套参数写法:timings[楼层号]=停留毫秒数。JSON body 在这个端点上不被认。
+            val form = buildString {
+                append("topic_id=").append(topicId)
+                append("&topic_time=").append(topicTime)
+                numbers.forEach { number -> append("&timings%5B").append(number).append("%5D=").append(perPost) }
+            }
+            val primaryTransport = transportProvider()
+            val fallbackTransport = fallbackTransportProvider?.invoke()
+                ?.takeIf { it.name != primaryTransport.name }
+
+            suspend fun sendViaFallback(transport: Transport, csrfFallback: String?): TransportResult? = try {
+                postGate.withLock {
+                    if (isRateLimitCoolingDown()) return@withLock null
+                    throttlePost(burst = true)
+                    if (isRateLimitCoolingDown()) return@withLock null
+                    val fallbackCsrf = transport.obtainCsrfToken() ?: csrfFallback ?: return@withLock null
                     try {
-                        currentTransport.write("/topics/timings", "POST", form, csrf, Transport.FORM_CONTENT_TYPE, present = true)
-                    } finally { lastRequestAt = SystemClock.elapsedRealtime() }
+                        transport.write("/topics/timings", "POST", form, fallbackCsrf, Transport.FORM_CONTENT_TYPE, present = false)
+                    } finally {
+                        markPostCompleted()
+                    }
+                }
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                diagnostics.log("[诊断] timings 兜底异常 ${error.javaClass.simpleName}: ${error.message.orEmpty().take(60)}")
+                null
+            }
+
+            // ── 已验证可用时优先路径 B (WebView fetch) ──
+            if (preferWebViewTimings && fallbackTransport != null) {
+                val ready = fallbackTransport.isReady()
+                val preferred = if (ready) sendViaFallback(fallbackTransport, cachedCsrfToken) else null
+                diagnostics.log(
+                    "[诊断] timings 优先路径 B ready=$ready status=${preferred?.status ?: "未发出"} challenged=${preferred?.challenged}" +
+                        " body=${preferred?.let { NetDiagnostics.bodyFeatures(it.body) } ?: "-"}",
+                )
+                when {
+                    preferred == null -> Unit
+                    preferred.status == 429 -> {
+                        val cooldown = enterRateLimitCooldown("/topics/timings", preferred.retryAfterSeconds)
+                        timingsCooldownUntil = SystemClock.elapsedRealtime() + cooldown.retryAfterMs
+                        return false
+                    }
+                    preferred.status in 200..299 -> {
+                        markTimingsSynced()
+                        recordTopicPostsReported(currentUserId, topicId, numbers)
+                        diagnostics.log("阅读进度已同步(${fallbackTransport.name}): 话题 $topicId, ${numbers.size} 层(至 #${numbers.last()}), ${topicTime / 1000}s")
+                        return true
+                    }
+                    preferred.challenged -> {
+                        // B 也被挑战：WebView 侧凭据同样失效，回到 A 并请用户重新过盾
+                        preferWebViewTimings = false
+                        timingsCooldownUntil = SystemClock.elapsedRealtime() + 180_000L
+                        diagnostics.log("阅读进度上报未成功(${fallbackTransport.name} 遭 CF 挑战)，进入 3 分钟熔断冷却，等待用户手工验证")
+                        notify403OrChallenged("/topics/timings", "timings B CF挑战")
+                        onTimingsVerificationRequired?.invoke()
+                        return false
+                    }
+                    else -> Unit
+                }
+            }
+
+            // ── 尝试路径 A (OkHttp) ──
+            val primaryCsrf = cachedCsrf()
+            if (primaryCsrf.isNullOrBlank()) {
+                diagnostics.log("阅读进度未上报: CSRF Token 缺失 (hasCsrf=false)")
+                return false
+            }
+
+            val primaryResult = try {
+                postGate.withLock {
+                    if (isRateLimitCoolingDown()) return@withLock null
+                    throttlePost()
+                    if (isRateLimitCoolingDown()) return@withLock null
+                    try {
+                        primaryTransport.write("/topics/timings", "POST", form, primaryCsrf, Transport.FORM_CONTENT_TYPE, present = false)
+                    } finally {
+                        markPostCompleted()
+                    }
                 }
             } catch (error: CancellationException) {
                 throw error
@@ -326,43 +746,129 @@ class TopicRepository(
                 diagnostics.log("阅读进度上报异常(已忽略): ${error.javaClass.simpleName} ${error.message.orEmpty().take(80)}")
                 return false
             }
-            diagnostics.recordStatus(currentTransport.name, result.status, "/topics/timings")
-            when {
-                result.status in 200..299 -> {
-                    val tag = if (isFallback) "(${currentTransport.name} 兜底成功)" else "(路径 ${currentTransport.name})"
-                    diagnostics.log("阅读进度已同步$tag: 话题 $topicId, ${numbers.size} 层(至 #${numbers.last()}), ${topicTime / 1000}s")
-                    return true
-                }
-                result.challenged -> {
-                    cachedCsrfToken = null
-                    if (!isFallback && fallbackTransport != null && fallbackTransport.name != currentTransport.name) {
-                        diagnostics.log("阅读进度上报 ${currentTransport.name} 遭遇 Cloudflare 挑战，尝试 ${fallbackTransport.name} 兜底")
-                        currentTransport = fallbackTransport
-                        isFallback = true
-                    } else {
-                        diagnostics.log("阅读进度上报被 Cloudflare 挑战拦截(已静默放弃)")
-                        return false
+
+            if (primaryResult == null) {
+                diagnostics.log("[诊断] 阅读进度跳过: 发送前进入 429 冷却")
+                return false
+            }
+
+            diagnostics.recordStatus(primaryTransport.name, primaryResult.status, "/topics/timings")
+            if (primaryResult.status !in 200..299) {
+                diagnostics.log(
+                    "[诊断] timings 主路径失败 status=${primaryResult.status} challenged=${primaryResult.challenged}" +
+                        " body=${NetDiagnostics.bodyFeatures(primaryResult.body)} 话题=$topicId 楼层=${numbers.size}" +
+                        " hasFallback=${fallbackTransport != null}",
+                )
+                logTimingsCookieInventory("timings主路径${primaryResult.status}")
+            }
+
+            if (primaryResult.status == 429) {
+                val cooldown = enterRateLimitCooldown("/topics/timings", primaryResult.retryAfterSeconds)
+                timingsCooldownUntil = SystemClock.elapsedRealtime() + cooldown.retryAfterMs
+                return false
+            }
+
+            if (primaryResult.status in 200..299) {
+                markTimingsSynced()
+                recordTopicPostsReported(currentUserId, topicId, numbers)
+                diagnostics.log("阅读进度已同步(路径 ${primaryTransport.name}): 话题 $topicId, ${numbers.size} 层(至 #${numbers.last()}), ${topicTime / 1000}s, hasCsrf=${primaryCsrf.isNotBlank()}")
+                return true
+            }
+
+            // 遇到 BAD CSRF 时（精确收紧匹配：非 CF 挑战且服务端返回 BAD CSRF），仅轻度校准 _forum_session 并拉新 Token 重试
+            val isBadCsrf = primaryResult.status == 403 && !primaryResult.challenged && primaryResult.body.contains("BAD CSRF", ignoreCase = true)
+            if (isBadCsrf) {
+                diagnostics.log("阅读进度遇到 BAD CSRF，执行轻度会话校准并重试")
+                cachedCsrfToken = null
+                sessionStore?.calibrateForumSessionForBadCsrf()
+                val newCsrf = runCatching { obtainCsrf(forceRefresh = true) }.getOrNull()
+                if (newCsrf != null) {
+                    val retryResult = try {
+                        postGate.withLock {
+                            if (isRateLimitCoolingDown()) return@withLock null
+                            throttlePost(burst = true)
+                            try {
+                                primaryTransport.write("/topics/timings", "POST", form, newCsrf, Transport.FORM_CONTENT_TYPE, present = false)
+                            } finally {
+                                markPostCompleted()
+                            }
+                        }
+                    } catch (_: Exception) { null }
+                    diagnostics.log(
+                        "[诊断] timings BAD CSRF 重试结果 status=${retryResult?.status ?: "未发出"} challenged=${retryResult?.challenged}" +
+                            " body=${retryResult?.let { NetDiagnostics.bodyFeatures(it.body) } ?: "-"}",
+                    )
+                    if (retryResult != null && retryResult.status in 200..299) {
+                        markTimingsSynced()
+                        recordTopicPostsReported(currentUserId, topicId, numbers)
+                        diagnostics.log("阅读进度已同步(BAD CSRF 校准重试成功): 话题 $topicId, ${numbers.size} 层, hasCsrf=${newCsrf.isNotBlank()}")
+                        return true
                     }
-                }
-                result.status == 403 || result.status == 422 -> {
-                    // 常规 HTTP 403/422(多为 CSRF 过期失效):清空缓存 token 后重试一次
-                    cachedCsrfToken = null
-                    val isBadCsrf = result.body.contains("BAD CSRF", ignoreCase = true)
-                    val detail = if (isBadCsrf) "CSRF失效" else "HTTP ${result.status}"
-                    if (attempt == 0) {
-                        diagnostics.log("阅读进度上报 $detail，重取 CSRF 重试一次")
-                    } else {
-                        diagnostics.log("阅读进度上报失败($detail): ${result.body.take(80)}")
-                        return false
-                    }
-                }
-                else -> {
-                    diagnostics.log("阅读进度上报失败: HTTP ${result.status} ${result.body.take(80)}")
-                    return false
                 }
             }
+
+            // 仅当确认遭遇 Cloudflare 挑战拦截时，才转交路径 B (WebView fetch) 进行兜底
+            if (primaryResult.challenged && fallbackTransport != null) {
+                if (isRateLimitCoolingDown()) return false
+                diagnostics.log("阅读进度遭遇 Cloudflare 挑战，转交 ${fallbackTransport.name} 走原生 Chromium 网络栈兜底")
+                // 使用 NonCancellable 保护静默重验证与当次兜底上报：
+                // 避免用户看帖几秒退回列表（leaveTopic 取消单帖协程）时把正在进行的 WebView 静默过盾腰斩并误报风控横幅
+                val fallbackHandled = withContext(NonCancellable) {
+                    val alreadyReady = fallbackTransport.isReady()
+                    val fallbackReady = alreadyReady || fallbackTransport.revalidate("timings 挑战兜底")
+                    diagnostics.log("[诊断] timings 兜底就绪 alreadyReady=$alreadyReady ready=$fallbackReady")
+                    if (fallbackReady) {
+                        val fallbackResult = sendViaFallback(fallbackTransport, primaryCsrf)
+                        diagnostics.log(
+                            "[诊断] timings 兜底结果 status=${fallbackResult?.status ?: "未发出"} challenged=${fallbackResult?.challenged}" +
+                                " body=${fallbackResult?.let { NetDiagnostics.bodyFeatures(it.body) } ?: "-"}",
+                        )
+                        if (fallbackResult != null && fallbackResult.status == 429) {
+                            val cooldown = enterRateLimitCooldown("/topics/timings", fallbackResult.retryAfterSeconds)
+                            timingsCooldownUntil = SystemClock.elapsedRealtime() + cooldown.retryAfterMs
+                            return@withContext false
+                        }
+                        if (fallbackResult != null && fallbackResult.status in 200..299) {
+                            timingsCooldownUntil = 0L
+                            markTimingsSynced()
+                            preferWebViewTimings = true
+                            recordTopicPostsReported(currentUserId, topicId, numbers)
+                            val fallbackCsrf = fallbackTransport.obtainCsrfToken()
+                            diagnostics.log("阅读进度已同步(${fallbackTransport.name} 兜底成功): 话题 $topicId, ${numbers.size} 层, ${topicTime / 1000}s, hasCsrf=${!fallbackCsrf.isNullOrBlank()}")
+                            return@withContext true
+                        }
+                    }
+                    null
+                }
+                if (fallbackHandled != null) {
+                    return fallbackHandled
+                }
+            }
+
+            // 遇到失败（403/挑战/超时等），进入 3 分钟熔断冷却，期间不再发送阅读心跳，杜绝任何刷屏或阻塞
+            timingsCooldownUntil = SystemClock.elapsedRealtime() + 180_000L
+            val reason = if (isBadCsrf) "BAD CSRF" else if (primaryResult.challenged) "CF挑战" else "HTTP ${primaryResult.status}"
+            diagnostics.log("阅读进度上报未成功($reason)，进入 3 分钟熔断冷却，静默放弃本次同步")
+            // 仅对确认的 CF 挑战拦截记入 403/挑战事件，避免误伤
+            if (primaryResult.challenged) {
+                notify403OrChallenged("/topics/timings", "timings CF挑战")
+                onTimingsVerificationRequired?.invoke()
+            }
+            return false
+        } catch (cancelled: CancellationException) {
+            diagnostics.log("[诊断] 阅读进度上报协程被取消: 话题 $topicId (${cancelled.message.orEmpty().take(40)})")
+            throw cancelled
+        } finally {
+            inFlightTimingsTopics.remove(topicId)
         }
-        return false
+    }
+
+    private suspend fun logTimingsCookieInventory(stage: String) {
+        val store = sessionStore ?: return
+        val inventory = withContext(Dispatchers.Main) {
+            runCatching { store.cookieInventory() }.getOrElse { "读取失败: ${it.javaClass.simpleName}" }
+        }
+        diagnostics.log("[诊断] Cookie清单($stage): $inventory")
     }
 
     private suspend fun obtainCsrf(forceRefresh: Boolean = false): String {
@@ -381,25 +887,28 @@ class TopicRepository(
     suspend fun fetchPosts(topicId: Long, ids: List<Long>): List<Post> {
         require(ids.size in 1..20)
         val query = ids.joinToString("&") { "post_ids%5B%5D=$it" }
-        return json.decodeFromString<PostStreamResponse>(
-            request("/t/$topicId/posts.json?$query&track_visit=false"),
-        ).postStream.posts.also { CookedParser.prewarm(it) }
+        val body = request("/t/$topicId/posts.json?$query&track_visit=false")
+        return withContext(Dispatchers.Default) {
+            json.decodeFromString<PostStreamResponse>(body).postStream.posts.also { CookedParser.prewarm(it) }
+        }
     }
 
     suspend fun categoryById(id: Int?): Category? = id?.let { categories()[it] }
 
-    suspend fun fetchReplies(postId: Long, after: Int): List<Post> =
-        run {
-            val root = json.parseToJsonElement(request("/posts/$postId/replies.json?after=$after"))
+    suspend fun fetchReplies(postId: Long, after: Int): List<Post> {
+        val body = request("/posts/$postId/replies.json?after=$after")
+        return withContext(Dispatchers.Default) {
+            val root = json.parseToJsonElement(body)
             val array = when (root) {
                 is JsonArray -> root
                 is JsonObject -> (root["post_stream"] as? JsonObject)?.get("posts") as? JsonArray
                     ?: root["replies"] as? JsonArray
                     ?: root["posts"] as? JsonArray
                 else -> null
-            } ?: return@run emptyList()
+            } ?: return@withContext emptyList()
             array.map { json.decodeFromJsonElement(Post.serializer(), it) }.also { CookedParser.prewarm(it) }
         }
+    }
 
     suspend fun toggleReaction(postId: Long, reaction: String): Post {
         require(reaction.matches(Regex("[a-zA-Z0-9_+:-]+")))
@@ -413,7 +922,549 @@ class TopicRepository(
         return json.decodeFromString(mutate("/discourse-boosts/posts/$postId/boosts.json", "POST", body))
     }
 
+    suspend fun fetchBoost(boostId: Long): Boost =
+        json.decodeFromString(objectRequest("/discourse-boosts/boosts/$boostId").toString())
+
+    suspend fun flagBoost(boostId: Long, flagTypeId: Int, message: String? = null) {
+        val body = buildString {
+            append("flag_type_id=").append(flagTypeId)
+            message?.takeIf { it.isNotBlank() }?.let { append("&message=").append(encode(it.trim())) }
+        }
+        mutate(
+            "/discourse-boosts/boosts/$boostId/flags",
+            "POST",
+            body,
+            Transport.FORM_CONTENT_TYPE,
+        )
+    }
+
     suspend fun deleteBoost(boostId: Long) { mutate("/discourse-boosts/boosts/$boostId.json", "DELETE") }
+
+    suspend fun createPrivateMessage(targetUsernames: List<String>, title: String, raw: String): Long {
+        require(targetUsernames.isNotEmpty() && title.isNotBlank() && raw.isNotBlank())
+        val body = buildString {
+            append("title=").append(encode(title.trim()))
+            append("&raw=").append(encode(raw.trim()))
+            append("&archetype=private_message")
+            append("&target_recipients=").append(encode(targetUsernames.distinct().joinToString(",")))
+        }
+        val response = json.parseToJsonElement(
+            mutate("/posts.json", "POST", body, Transport.FORM_CONTENT_TYPE),
+        ).jsonObject
+        return response["topic_id"]?.jsonPrimitive?.longOrNull
+            ?: response["id"]?.jsonPrimitive?.longOrNull
+            ?: error("私信响应缺少话题 ID")
+    }
+
+    private val userCardCache = java.util.concurrent.ConcurrentHashMap<String, UserCardData>()
+
+    fun getCachedUserCard(username: String): UserCardData? {
+        val key = username.lowercase().trim().removePrefix("@")
+        return userCardCache[key]
+    }
+
+    fun clearUserCardCache() {
+        userCardCache.clear()
+    }
+
+    /**
+     * 多源深层探测动图头像：
+     * 1. 全局 AvatarCache 本地高速缓存；
+     * 2. /u/search/users.json?term={username}（Discourse 的 BasicUserSerializer 包含 animated_avatar）；
+     * 3. /user_actions.json?username={username}&offset=0&limit=1（动态历史中提取 acting_user_animated_avatar）；
+     * 4. /u/{username}.json（用户公开资料根对象）。
+     * 成功探测后自动录入 AvatarCache 全局单例。
+     */
+    suspend fun resolveAnimatedAvatar(username: String): String? {
+        val cleanUser = username.trim().removePrefix("@")
+        if (cleanUser.isBlank()) return null
+        val cached = AvatarCache.get(cleanUser)
+        if (!cached.isNullOrBlank() && isAnimatedAvatarPath(cached)) {
+            return cached
+        }
+
+        // 1. /u/search/users.json?term= (精准匹配 BasicUser)
+        val fromSearch = runCatching {
+            val searchJson = objectRequest("/u/search/users.json?term=${encode(cleanUser)}")
+            val users = searchJson.objects("users")
+            val matched = users.firstOrNull { it.text("username").equals(cleanUser, ignoreCase = true) }
+            matched?.text("animated_avatar")?.takeIf(::isAnimatedAvatarPath)
+        }.getOrNull()
+        if (!fromSearch.isNullOrBlank()) {
+            AvatarCache.record(cleanUser, fromSearch)
+            return fromSearch
+        }
+
+        // 2. /user_actions.json
+        val fromActions = runCatching {
+            val acts = objectRequest("/user_actions.json?username=${encode(cleanUser)}&offset=0&limit=1").objects("user_actions")
+            val firstAct = acts.firstOrNull()
+            val candidate = firstAct?.text("acting_user_animated_avatar")?.ifBlank { null }
+                ?: firstAct?.text("animated_avatar")?.ifBlank { null }
+            candidate?.takeIf(::isAnimatedAvatarPath)
+        }.getOrNull()
+        if (!fromActions.isNullOrBlank()) {
+            AvatarCache.record(cleanUser, fromActions)
+            return fromActions
+        }
+
+        // 3. /u/{username}.json
+        val fromUser = runCatching {
+            val uJson = objectRequest("/u/${encode(cleanUser)}.json")
+            val uUser = uJson["user"] as? JsonObject ?: uJson
+            val candidate = uUser.text("animated_avatar")
+            candidate.takeIf(::isAnimatedAvatarPath)
+        }.getOrNull()
+        if (!fromUser.isNullOrBlank()) {
+            AvatarCache.record(cleanUser, fromUser)
+            return fromUser
+        }
+
+        // 三条路径均未找到动图，写入负缓存，避免后续重复探测
+        AvatarCache.recordNonAnimated(cleanUser)
+        return null
+    }
+
+    data class UserCardStats(
+        val topicCount: Int = 0,
+        val postCount: Int = 0,
+        val likesReceived: Int = 0,
+        val badges: List<SummaryBadgeItem> = emptyList(),
+        val animatedAvatar: String? = null,
+        val isFollowed: Boolean? = null,
+    )
+
+    fun saveCachedUserCard(card: UserCardData) {
+        val key = card.username.lowercase().trim().removePrefix("@")
+        userCardCache[key] = card
+    }
+
+    /**
+     * 用户资料卡。对齐 fluxdo：请求轻量的 /u/{username}/card.json，配合 burst 模式快速返回，
+     * 绝不同步阻塞动图探测，配合内存缓存与 AvatarCache 实现 0ms 秒开。
+     */
+    suspend fun fetchUserCard(username: String, forceRefresh: Boolean = false): UserCardData {
+        val key = username.lowercase().trim().removePrefix("@")
+        val existingCached = userCardCache[key]
+        if (!forceRefresh && existingCached != null) {
+            val fallbackAnim = AvatarCache.get(key) ?: AvatarCache.get(existingCached.username)
+            if (existingCached.animatedAvatar.isNullOrBlank() && !fallbackAnim.isNullOrBlank() && isAnimatedAvatarPath(fallbackAnim)) {
+                val patched = existingCached.copy(animatedAvatar = fallbackAnim)
+                userCardCache[key] = patched
+                return patched
+            }
+            return existingCached
+        }
+        val root = objectRequest("/u/${encode(username)}/card.json", burst = true)
+        val user = root["user"] as? JsonObject ?: root
+        val card = json.decodeFromJsonElement<UserCardData>(user)
+        val isFollowedInJson = (user["is_followed"] as? JsonPrimitive)?.booleanOrNull
+            ?: (user["followed"] as? JsonPrimitive)?.booleanOrNull
+            ?: (user["following"] as? JsonPrimitive)?.booleanOrNull
+            ?: card.following
+
+        val candidateAnim = if (!card.animatedAvatar.isNullOrBlank() && isAnimatedAvatarPath(card.animatedAvatar)) {
+            card.animatedAvatar.also {
+                AvatarCache.record(card.username, it)
+                AvatarCache.record(username, it)
+            }
+        } else {
+            AvatarCache.get(card.username) ?: AvatarCache.get(username)
+        }
+        // 若之前已有缓存的统计数据，保留之，防止刷新时指标闪烁归零
+        val resolved = card.copy(
+            animatedAvatar = candidateAnim,
+            following = isFollowedInJson,
+            topicCount = if (card.topicCount > 0) card.topicCount else (existingCached?.topicCount ?: 0),
+            postCount = if (card.postCount > 0) card.postCount else (existingCached?.postCount ?: 0),
+            likesReceived = if (card.likesReceived > 0) card.likesReceived else (existingCached?.likesReceived ?: 0),
+            badges = if (card.badges.isNotEmpty()) card.badges else (existingCached?.badges ?: emptyList()),
+        )
+        userCardCache[key] = resolved
+        return resolved
+    }
+
+    /**
+     * 快速获取用户资料卡统计指标 (话题数、帖子数、获赞数、徽章与动图头像)
+     * 优先通过 /u/{username}.json 一次性拉取 user_stat，避免 summary.json 的复杂耗时查询。
+     */
+    suspend fun fetchUserCardStats(username: String): UserCardStats {
+        val cleanUser = username.trim().removePrefix("@")
+        val userPath = encode(cleanUser)
+        return try {
+            val raw = objectRequest("/u/$userPath.json", burst = true)
+            val userObj = raw["user"] as? JsonObject ?: raw
+            val statObj = userObj["user_stat"] as? JsonObject
+            val badgesList = userObj.objects("badges").ifEmpty { raw.objects("badges") }.map { b ->
+                SummaryBadgeItem(
+                    id = b.number("id") ?: 0L,
+                    name = b.text("name"),
+                    description = b.text("description").ifBlank { null },
+                    icon = b.text("icon").ifBlank { null },
+                    badgeTypeId = b.number("badge_type_id")?.toInt() ?: 0,
+                )
+            }
+            val anim = userObj.text("animated_avatar").takeIf(::isAnimatedAvatarPath)
+            if (!anim.isNullOrBlank()) {
+                AvatarCache.record(cleanUser, anim)
+            }
+            val isFollowed = (userObj["is_followed"] as? JsonPrimitive)?.booleanOrNull
+                ?: (userObj["followed"] as? JsonPrimitive)?.booleanOrNull
+                ?: (userObj["following"] as? JsonPrimitive)?.booleanOrNull
+
+            val topicCount = statObj?.number("topic_count")?.toInt() ?: 0
+            val postCount = statObj?.number("post_count")?.toInt() ?: 0
+            val likesReceived = statObj?.number("likes_received")?.toInt() ?: 0
+
+            if (topicCount == 0 && postCount == 0 && likesReceived == 0) {
+                val sumRaw = runCatching { objectRequest("/u/$userPath/summary.json", burst = true) }.getOrNull()
+                val sumObj = sumRaw?.get("user_summary") as? JsonObject
+                if (sumObj != null) {
+                    val sumBadges = sumRaw.objects("badges").map { b ->
+                        SummaryBadgeItem(
+                            id = b.number("id") ?: 0L,
+                            name = b.text("name"),
+                            description = b.text("description").ifBlank { null },
+                            icon = b.text("icon").ifBlank { null },
+                            badgeTypeId = b.number("badge_type_id")?.toInt() ?: 0,
+                        )
+                    }
+                    return UserCardStats(
+                        topicCount = sumObj.number("topic_count")?.toInt() ?: 0,
+                        postCount = sumObj.number("post_count")?.toInt() ?: 0,
+                        likesReceived = sumObj.number("likes_received")?.toInt() ?: 0,
+                        badges = if (badgesList.isNotEmpty()) badgesList else sumBadges,
+                        animatedAvatar = anim,
+                        isFollowed = isFollowed,
+                    )
+                }
+            }
+
+            UserCardStats(
+                topicCount = topicCount,
+                postCount = postCount,
+                likesReceived = likesReceived,
+                badges = badgesList,
+                animatedAvatar = anim,
+                isFollowed = isFollowed,
+            )
+        } catch (_: Exception) {
+            val sumRaw = objectRequest("/u/$userPath/summary.json", burst = true)
+            val sumObj = sumRaw["user_summary"] as? JsonObject ?: JsonObject(emptyMap())
+            val badgesList = sumRaw.objects("badges").map { b ->
+                SummaryBadgeItem(
+                    id = b.number("id") ?: 0L,
+                    name = b.text("name"),
+                    description = b.text("description").ifBlank { null },
+                    icon = b.text("icon").ifBlank { null },
+                    badgeTypeId = b.number("badge_type_id")?.toInt() ?: 0,
+                )
+            }
+            UserCardStats(
+                topicCount = sumObj.number("topic_count")?.toInt() ?: 0,
+                postCount = sumObj.number("post_count")?.toInt() ?: 0,
+                likesReceived = sumObj.number("likes_received")?.toInt() ?: 0,
+                badges = badgesList,
+            )
+        }
+    }
+
+    /**
+     * UserCardSerializer 不保证返回 animated_avatar。资料页已完成首屏展示后，
+     * 再从完整用户资料补齐该字段，避免为每张资料卡引入同步等待。
+     */
+    suspend fun enrichUserCardAvatar(username: String, card: UserCardData): UserCardData {
+        val cachedAnim = AvatarCache.get(username) ?: AvatarCache.get(card.username)
+        if (!cachedAnim.isNullOrBlank() && isAnimatedAvatarPath(cachedAnim)) {
+            val resolved = card.copy(animatedAvatar = cachedAnim)
+            userCardCache[username.lowercase().trim().removePrefix("@")] = resolved
+            return resolved
+        }
+        val finalAnim = resolveAnimatedAvatar(username) ?: resolveAnimatedAvatar(card.username)
+        val resolved = card.copy(
+            animatedAvatar = finalAnim ?: card.animatedAvatar,
+        )
+        val key = username.lowercase().trim().removePrefix("@")
+        val old = userCardCache[key]
+        val preserved = resolved.copy(
+            topicCount = if (resolved.topicCount > 0) resolved.topicCount else (old?.topicCount ?: 0),
+            postCount = if (resolved.postCount > 0) resolved.postCount else (old?.postCount ?: 0),
+            likesReceived = if (resolved.likesReceived > 0) resolved.likesReceived else (old?.likesReceived ?: 0),
+            badges = if (resolved.badges.isNotEmpty()) resolved.badges else (old?.badges ?: emptyList()),
+        )
+        userCardCache[key] = preserved
+        return preserved
+    }
+
+    suspend fun setFollow(username: String, following: Boolean) {
+        val method = if (following) "PUT" else "DELETE"
+        mutate("/follow/${encode(username)}", method)
+    }
+
+    private val followingCache = java.util.concurrent.ConcurrentHashMap<String, List<FollowUser>>()
+
+    fun getCachedFollowing(username: String): List<FollowUser>? {
+        val key = username.lowercase().trim().removePrefix("@")
+        followingCache[key]?.let { return it }
+        val raw = sessionStore?.getString("following_users_$key") ?: return null
+        return runCatching { json.decodeFromString<List<FollowUser>>(raw) }.getOrNull()?.also {
+            followingCache[key] = it
+        }
+    }
+
+    fun saveCachedFollowing(username: String, users: List<FollowUser>) {
+        val key = username.lowercase().trim().removePrefix("@")
+        followingCache[key] = users
+        runCatching {
+            sessionStore?.putString("following_users_$key", json.encodeToString(users))
+        }
+    }
+
+    suspend fun fetchFollowing(username: String): List<FollowUser> {
+        val list = fetchFollowList(username, "following")
+        saveCachedFollowing(username, list)
+        return list
+    }
+
+    private suspend fun fetchFollowList(username: String, listName: String): List<FollowUser> {
+        val result = json.parseToJsonElement(request("/u/${encode(username)}/follow/$listName")) as? JsonArray
+            ?: return emptyList()
+        return result.mapNotNull { element ->
+            runCatching { json.decodeFromJsonElement<FollowUser>(element) }.getOrNull()
+        }
+    }
+
+    fun getBlockedUsers(userId: Long = sessionStore?.currentUserId() ?: 0L): List<BlockedUser> {
+        val store = sessionStore ?: return emptyList()
+        val key = blockedUsersKey(userId)
+        val raw = store.getString(key) ?: migrateLegacyBlockedUsers(store, userId) ?: return emptyList()
+        return runCatching { json.decodeFromString<List<BlockedUser>>(raw) }.getOrDefault(emptyList())
+    }
+
+    fun saveBlockedUsers(users: List<BlockedUser>, userId: Long = sessionStore?.currentUserId() ?: 0L) {
+        runCatching {
+            sessionStore?.putString(blockedUsersKey(userId), json.encodeToString(users))
+        }
+    }
+
+    private fun blockedUsersKey(userId: Long): String =
+        if (userId > 0L) "${KEY_BLOCKED_USERS}_$userId" else KEY_BLOCKED_USERS
+
+    private fun migrateLegacyBlockedUsers(store: SessionStore, userId: Long): String? {
+        if (userId <= 0L) return null
+        val legacy = store.getString(KEY_BLOCKED_USERS)?.takeIf { it.isNotBlank() } ?: return null
+        store.putString(blockedUsersKey(userId), legacy)
+        store.removeString(KEY_BLOCKED_USERS)
+        return legacy
+    }
+
+    private val userBadgesCache = java.util.concurrent.ConcurrentHashMap<String, List<UserBadgeItem>>()
+
+    fun getCachedUserBadges(username: String): List<UserBadgeItem>? {
+        val key = username.lowercase().trim().removePrefix("@")
+        userBadgesCache[key]?.let { return it }
+        val raw = sessionStore?.getString("user_badges_$key") ?: return null
+        return runCatching { json.decodeFromString<List<UserBadgeItem>>(raw) }.getOrNull()?.also {
+            userBadgesCache[key] = it
+        }
+    }
+
+    fun saveCachedUserBadges(username: String, badges: List<UserBadgeItem>) {
+        val key = username.lowercase().trim().removePrefix("@")
+        userBadgesCache[key] = badges
+        runCatching {
+            sessionStore?.putString("user_badges_$key", json.encodeToString(badges))
+        }
+    }
+
+    private val trustReportMemoryCache = java.util.concurrent.ConcurrentHashMap<String, Pair<TrustReport, Long>>()
+    private val ldcUserInfoMemoryCache = java.util.concurrent.ConcurrentHashMap<String, Pair<LdcUserInfo, Long>>()
+
+    fun getCachedTrustReport(username: String): Pair<TrustReport, Long>? {
+        val key = username.lowercase().trim().removePrefix("@")
+        trustReportMemoryCache[key]?.let { return it }
+        val raw = sessionStore?.getString("trust_report_$key") ?: return null
+        val time = sessionStore?.getString("trust_report_time_$key")?.toLongOrNull() ?: 0L
+        return runCatching { json.decodeFromString<TrustReport>(raw) }.getOrNull()?.let { report ->
+            (report to time).also { trustReportMemoryCache[key] = it }
+        }
+    }
+
+    fun saveCachedTrustReport(username: String, report: TrustReport) {
+        val key = username.lowercase().trim().removePrefix("@")
+        val now = System.currentTimeMillis()
+        trustReportMemoryCache[key] = report to now
+        runCatching {
+            sessionStore?.putString("trust_report_$key", json.encodeToString(report))
+            sessionStore?.putString("trust_report_time_$key", now.toString())
+        }
+    }
+
+    fun getCachedLdcUserInfo(username: String): Pair<LdcUserInfo, Long>? {
+        val key = username.lowercase().trim().removePrefix("@")
+        ldcUserInfoMemoryCache[key]?.let { return it }
+        val raw = sessionStore?.getString("ldc_user_info_$key") ?: return null
+        val time = sessionStore?.getString("ldc_user_info_time_$key")?.toLongOrNull() ?: 0L
+        return runCatching { json.decodeFromString<LdcUserInfo>(raw) }.getOrNull()?.let { info ->
+            (info to time).also { ldcUserInfoMemoryCache[key] = it }
+        }
+    }
+
+    fun saveCachedLdcUserInfo(username: String, info: LdcUserInfo) {
+        val key = username.lowercase().trim().removePrefix("@")
+        val now = System.currentTimeMillis()
+        ldcUserInfoMemoryCache[key] = info to now
+        runCatching {
+            sessionStore?.putString("ldc_user_info_$key", json.encodeToString(info))
+            sessionStore?.putString("ldc_user_info_time_$key", now.toString())
+        }
+    }
+
+    private val cdkScoreMemoryCache = java.util.concurrent.ConcurrentHashMap<String, Pair<Int, Long>>()
+
+    fun getCachedCdkScore(username: String): Pair<Int, Long>? {
+        val key = username.lowercase().trim().removePrefix("@")
+        cdkScoreMemoryCache[key]?.let { return it }
+        val score = sessionStore?.getString("cdk_score_$key")?.toIntOrNull() ?: return null
+        val time = sessionStore?.getString("cdk_score_time_$key")?.toLongOrNull() ?: 0L
+        return (score to time).also { cdkScoreMemoryCache[key] = it }
+    }
+
+    fun saveCachedCdkScore(username: String, score: Int) {
+        val key = username.lowercase().trim().removePrefix("@")
+        val now = System.currentTimeMillis()
+        cdkScoreMemoryCache[key] = score to now
+        runCatching {
+            sessionStore?.putString("cdk_score_$key", score.toString())
+            sessionStore?.putString("cdk_score_time_$key", now.toString())
+        }
+    }
+
+    suspend fun fetchChatChannels(): List<ChatChannelSummary> {
+        val root = objectRequest("/chat/api/me/channels")
+        val tracking = ((root["tracking"] as? JsonObject)?.get("channel_tracking") as? JsonObject)
+            ?: JsonObject(emptyMap())
+        return (root.objects("public_channels") + root.objects("direct_message_channels"))
+            .mapNotNull { channel ->
+                val id = channel.number("id") ?: return@mapNotNull null
+                val chatable = channel["chatable"] as? JsonObject
+                val rawLastMessage = channel["last_message"] as? JsonObject
+                val lastMessage = rawLastMessage
+                    ?.takeIf { it.number("id") != null }
+                    ?.let { message ->
+                        val user = message["user"] as? JsonObject
+                        ChatMessageSummary(
+                            id = message.number("id") ?: return@let null,
+                            channelId = id,
+                            message = message.text("message"),
+                            cooked = message.text("cooked"),
+                            createdAt = message.text("created_at").ifBlank { null },
+                            user = user?.let { rawUser ->
+                                ChatUserSummary(
+                                    username = rawUser.text("username"),
+                                    name = rawUser.text("name").ifBlank { null },
+                                    avatarTemplate = rawUser.text("avatar_template").ifBlank { null },
+                                )
+                            },
+                        )
+                    }
+                val member = channel["current_user_membership"] as? JsonObject
+                val channelTracking = tracking[id.toString()] as? JsonObject
+                val dmUsers = chatable?.objects("users").orEmpty().mapNotNull { rawUser ->
+                    val username = rawUser.text("username")
+                    if (username.isBlank()) null
+                    else ChatUserSummary(
+                        username = username,
+                        name = rawUser.text("name").ifBlank { null },
+                        avatarTemplate = rawUser.text("avatar_template").ifBlank { null },
+                    )
+                }
+                ChatChannelSummary(
+                    id = id,
+                    title = channel.text("unicode_title").ifBlank { channel.text("title") },
+                    chatableType = channel.text("chatable_type"),
+                    categoryName = chatable?.text("name"),
+                    unreadCount = channelTracking?.text("unread_count")?.toIntOrNull() ?: 0,
+                    lastMessage = lastMessage,
+                    membership = member?.let {
+                        ChatMembership(
+                            following = it["following"]?.jsonPrimitive?.booleanOrNull ?: false,
+                            muted = it["muted"]?.jsonPrimitive?.booleanOrNull ?: false,
+                            lastReadMessageId = it["last_read_message_id"]?.jsonPrimitive?.longOrNull,
+                        )
+                    },
+                    dmUsers = dmUsers,
+                )
+            }
+            .distinctBy { it.id }
+            .sortedByDescending { it.lastMessage?.createdAt.orEmpty() }
+    }
+
+    suspend fun fetchChatMessages(channelId: Long, fromLastRead: Boolean = true): List<ChatMessageSummary> {
+        val body = request(
+            "/chat/api/channels/$channelId/messages?page_size=50&fetch_from_last_read=$fromLastRead",
+        )
+        val root = json.parseToJsonElement(body).jsonObject
+        return root.arrayObjects("messages").mapNotNull { message ->
+            runCatching {
+                json.decodeFromJsonElement<ChatMessageSummary>(message).copy(channelId = channelId)
+            }.getOrNull()
+        }
+    }
+
+    suspend fun markChatChannelRead(channelId: Long, messageId: Long?) {
+        val query = messageId?.let { "?message_id=$it" }.orEmpty()
+        mutate("/chat/api/channels/$channelId/read$query", "PUT")
+    }
+
+    suspend fun sendChatMessage(
+        channelId: Long,
+        message: String,
+        uploadIds: List<Long> = emptyList(),
+    ) {
+        require(message.isNotBlank())
+        val fields = mutableMapOf<String, JsonElement>(
+            "message" to JsonPrimitive(message.trim())
+        )
+        if (uploadIds.isNotEmpty()) {
+            fields["upload_ids"] = JsonArray(uploadIds.map { JsonPrimitive(it) })
+        }
+        val body = JsonObject(fields).toString()
+        mutate("/chat/$channelId", "POST", body)
+    }
+
+    suspend fun createOrGetDirectMessageChannel(targetUsername: String): ChatChannelSummary {
+        val body = JsonObject(
+            mapOf(
+                "target_usernames" to JsonArray(listOf(JsonPrimitive(targetUsername))),
+                "upsert" to JsonPrimitive(true),
+            )
+        ).toString()
+        val raw = mutate("/chat/api/direct-message-channels", "POST", body)
+        val root = json.parseToJsonElement(raw).jsonObject
+        val channelObj = (root["channel"] as? JsonObject) ?: (root["chat_channel"] as? JsonObject) ?: root
+        val id = channelObj.number("id") ?: throw IllegalStateException("返回数据中未找到有效频道 ID")
+        val chatable = channelObj["chatable"] as? JsonObject
+        val dmUsers = chatable?.objects("users").orEmpty().mapNotNull { rawUser ->
+            val username = rawUser.text("username")
+            if (username.isBlank()) null
+            else ChatUserSummary(
+                username = username,
+                name = rawUser.text("name").ifBlank { null },
+                avatarTemplate = rawUser.text("avatar_template").ifBlank { null },
+            )
+        }
+        return ChatChannelSummary(
+            id = id,
+            title = channelObj.text("unicode_title").ifBlank { channelObj.text("title").ifBlank { targetUsername } },
+            chatableType = channelObj.text("chatable_type").ifBlank { "DirectMessage" },
+            categoryName = null,
+            unreadCount = 0,
+            lastMessage = null,
+            membership = null,
+            dmUsers = dmUsers,
+        )
+    }
 
     /**
      * 发表回复。replyToPostNumber 为 null 时回复整个话题,否则回复指定楼层。
@@ -788,30 +1839,47 @@ class TopicRepository(
      * `synchronous=true` 让服务端同步处理完再返回,省掉轮询。
      */
     suspend fun uploadFile(fileName: String, mimeType: String, bytes: ByteArray): UploadedFile {
+        ensureRequestAllowed()
         UploadLimits.rejectReason(fileName, bytes.size.toLong())?.let { throw LoginRejectedException(it) }
         var revalidated = false
         var csrfRefreshed = false
+        var rateLimitRetried = false
         while (true) {
             val csrf = obtainCsrf(forceRefresh = csrfRefreshed)
-            val result = gate.withLock {
-                throttle(burst = true)
+            val result = postGate.withLock {
+                throttlePost(burst = true)
                 val transport = transportProvider()
                 try {
                     transport.upload(
                         "/uploads.json", csrf, fileName, mimeType, bytes,
                         mapOf("type" to "composer", "synchronous" to "true"),
                     )
-                } finally { lastRequestAt = SystemClock.elapsedRealtime() }
+                } finally { lastPostRequestAt = SystemClock.elapsedRealtime() }
             }
             diagnostics.recordStatus(transportProvider().name, result.status, "/uploads")
-            if (result.challenged) {
-                if (!revalidated && transportProvider().revalidate("/uploads.json")) {
-                    revalidated = true
-                    csrfRefreshed = true
-                    cachedCsrfToken = null
+            if (result.status == 429) {
+                val cfChallenge = isCfChallengeBody(result.body)
+                val cooldownEx = enterRateLimitCooldown("/uploads.json", result.retryAfterSeconds, cfChallenge = cfChallenge)
+                val waitSec = result.retryAfterSeconds ?: 3L
+                if (!cfChallenge && !rateLimitRetried && waitSec in 1L..AUTO_RETRY_MAX_WAIT_SECONDS) {
+                    rateLimitRetried = true
+                    delay(waitSec * 1_000L)
                     continue
                 }
-                throw NeedsInteractiveVerification("上传需要重新验证")
+                throw cooldownEx
+            }
+            if (result.challenged) {
+                cachedCsrfToken = null
+                sessionStore?.noteClearanceChallenged(result.sentClearanceFp)
+                // 对齐 v1.3.1：撞盾先静默过盾，连 CSRF 一起重取后重传一次。
+                if (!revalidated && sessionStore?.sessionChanging != true &&
+                    transportProvider().revalidate("/uploads.json", result.sentClearanceFp)
+                ) {
+                    revalidated = true
+                    csrfRefreshed = true
+                    continue
+                }
+                throw NeedsInteractiveVerification("上传需要重新验证", failedClearanceFp = result.sentClearanceFp)
             }
             if (result.status == 0) {
                 // 路径 B 的"不支持上传"也走这里,它把原因放在 body 里。
@@ -838,6 +1906,7 @@ class TopicRepository(
             val shortUrl = root.text("short_url").ifBlank { root.text("url") }
             if (shortUrl.isBlank()) throw LoginRejectedException("上传响应缺少文件地址")
             return UploadedFile(
+                id = root.number("id"),
                 shortUrl = shortUrl,
                 fileName = root.text("original_filename").ifBlank { fileName },
                 width = root.text("width").toIntOrNull() ?: 0,
@@ -849,6 +1918,21 @@ class TopicRepository(
     /** 取楼层原文。post_stream 下发的楼层只有 cooked,编辑前必须单独取一次 raw。 */
     suspend fun fetchPostRaw(postId: Long): String =
         objectRequest("/posts/$postId.json").text("raw")
+
+    suspend fun votePoll(postId: Long, pollName: String, optionIds: List<String>): DiscoursePoll {
+        require(optionIds.isNotEmpty())
+        val body = buildString {
+            append("post_id=").append(encode(postId.toString()))
+            append("&poll_name=").append(encode(pollName))
+            optionIds.distinct().forEach { optionId ->
+                append("&options%5B%5D=").append(encode(optionId))
+            }
+        }
+        val response = json.parseToJsonElement(
+            mutate("/polls/vote", "PUT", body, Transport.FORM_CONTENT_TYPE),
+        ).jsonObject
+        return json.decodeFromJsonElement(response["poll"] ?: error("投票响应缺少结果"))
+    }
 
     suspend fun fetchUnreadSummary(scope: NotificationScope): UnreadSummary {
         // Discourse 的 /notifications.json 不支持 filter=unread 参数；不带 recent=true 时会返回账号
@@ -880,6 +1964,10 @@ class TopicRepository(
         mutate("/notifications/mark-read.json", "PUT", JsonObject(mapOf("id" to JsonPrimitive(id))).toString())
     }
 
+    suspend fun markAllNotificationsRead() {
+        mutate("/notifications/mark-read.json", "PUT", "{}")
+    }
+
     suspend fun setSolution(postId: Long, accepted: Boolean) {
         mutate("/solution/${if (accepted) "accept" else "unaccept"}.json", "POST",
             JsonObject(mapOf("id" to JsonPrimitive(postId))).toString())
@@ -896,26 +1984,68 @@ class TopicRepository(
      * 重新加载首页,Discourse 可能借机换掉 _forum_session,旧 token 就失效了。
      * 只重试一次,再挑战就交给用户出面。
      */
-    private suspend fun mutate(path: String, method: String, body: String? = null): String {
+    private suspend fun mutate(
+        path: String,
+        method: String,
+        body: String? = null,
+        contentType: String = Transport.JSON_CONTENT_TYPE,
+    ): String {
+        ensureRequestAllowed()
         var revalidated = false
         var csrfRefreshed = false
+        var rateLimitRetried = false
         while (true) {
             val csrf = obtainCsrf(forceRefresh = csrfRefreshed)
-            val result = gate.withLock {
-                throttle(burst = true)
+            val result = postGate.withLock {
+                throttlePost(burst = true)
                 val transport = transportProvider()
-                try { transport.write(path, method, body, csrf) } finally { lastRequestAt = SystemClock.elapsedRealtime() }
+                try { transport.write(path, method, body, csrf, contentType) } finally { lastPostRequestAt = SystemClock.elapsedRealtime() }
             }
             diagnostics.recordStatus(transportProvider().name, result.status, path)
-            if (result.challenged) {
-                // clearChallenge 最长要等 30 秒,绝不能占着 gate 等 —— 那会把所有请求堵死。
-                if (!revalidated && transportProvider().revalidate(path)) {
-                    revalidated = true
-                    csrfRefreshed = true
+            if (result.status == 429) {
+                val challenge429 = ChallengeDetector.isChallenge429(result.status, result.cfMitigated, result.body)
+                if (challenge429 && !revalidated && sessionStore?.sessionChanging != true) {
                     cachedCsrfToken = null
+                    sessionStore?.noteClearanceChallenged(result.sentClearanceFp)
+                    if (isCarriedClearanceStale(result.sentClearanceFp) ||
+                        transportProvider().revalidate(path, result.sentClearanceFp)
+                    ) {
+                        revalidated = true
+                        csrfRefreshed = true
+                        continue
+                    }
+                }
+                val cfChallenge = challenge429 || isCfChallengeBody(result.body)
+                val cooldownEx = enterRateLimitCooldown(path, result.retryAfterSeconds, cfChallenge = cfChallenge)
+                val waitSec = result.retryAfterSeconds ?: 3L
+                if (!cfChallenge && !rateLimitRetried && waitSec in 1L..AUTO_RETRY_MAX_WAIT_SECONDS) {
+                    rateLimitRetried = true
+                    delay(waitSec * 1_000L)
                     continue
                 }
-                throw NeedsInteractiveVerification("提交需要重新验证")
+                throw cooldownEx
+            }
+            if (result.challenged || (result.status == 403 && ChallengeDetector.isChallenge(result.status, "", result.body))) {
+                cachedCsrfToken = null
+                if (!revalidated && isCarriedClearanceStale(result.sentClearanceFp)) {
+                    diagnostics.log("写请求携带过期 cf_clearance 撞盾(sent=${result.sentClearanceFp})，直接换新值并重取 CSRF 重放: $path")
+                    revalidated = true
+                    csrfRefreshed = true
+                    continue
+                }
+                sessionStore?.noteClearanceChallenged(result.sentClearanceFp)
+                // 对齐 v1.3.1：先静默过盾再连 CSRF 一起重发一次。CF 挑战在边缘拦截，源站没收到，重放安全。
+                // 不能在这里删 cf_clearance：删了之后所有请求都必然撞盾，静默过盾也失去了可续的凭据。
+                // clearChallenge 最长要等 30 秒，绝不能占着 postGate 等。
+                if (!revalidated && sessionStore?.sessionChanging != true &&
+                    transportProvider().revalidate(path, result.sentClearanceFp)
+                ) {
+                    revalidated = true
+                    csrfRefreshed = true
+                    continue
+                }
+                notify403OrChallenged("mutate $path challenged")
+                throw NeedsInteractiveVerification("安全验证已过期，请完成人机验证", failedClearanceFp = result.sentClearanceFp)
             }
             if (result.status == 0) throw NetworkTimeoutException()
             if ((result.status == 403 || result.status == 422) && !csrfRefreshed &&
@@ -926,6 +2056,9 @@ class TopicRepository(
                 continue
             }
             if (result.status !in 200..299) {
+                if (result.status == 403) {
+                    notify403OrChallenged("mutate $path 403")
+                }
                 val serverMessage = runCatching {
                     (json.parseToJsonElement(result.body).jsonObject["errors"] as? JsonArray)
                         ?.mapNotNull { (it as? JsonPrimitive)?.contentOrNull }?.joinToString("\n")?.take(400)
@@ -1023,10 +2156,389 @@ class TopicRepository(
             ProfileSection.Messages -> {
                 val result = toPage(json.decodeFromString(request("/topics/private-messages/$userPath.json?page=$cursor")))
                 ProfilePage(entries = result.items.map { item -> ProfileEntry(item.topic.id.toString(), item.topic.title,
-                    "${item.topic.replyCount} 回复 · ${item.topic.lastPostedAt?.take(10).orEmpty()}", item.topic.id) },
+                    "${item.topic.replyCount} 回复 · ${item.topic.lastPostedAt?.take(10).orEmpty()}", item.topic.id,
+                    unread = item.topic.unseen, avatarUrl = item.avatarUrl, actor = item.authorUsername) },
                     hasMore = result.hasMore, nextCursor = cursor + 1)
             }
         }
+    }
+
+    /** 获取用户在社区的回复历史列表 (filter=5 对应 Discourse user replies) */
+    suspend fun fetchUserReplies(username: String, cursor: Int): Pair<List<UserReplyItem>, Boolean> {
+        val userPath = URLEncoder.encode(username, "UTF-8")
+        val allCategories = categories()
+        val actions = objectRequest("/user_actions.json?username=$userPath&offset=${cursor * 30}&limit=30&filter=5")
+            .objects("user_actions")
+        val items = actions.mapIndexed { index, action ->
+            val catId = action.number("category_id")?.toInt()
+            val cat = catId?.let { allCategories[it] }
+            val avatarTpl = action.text("acting_avatar_template").ifBlank { action.text("avatar_template") }
+            val avatarUrl = if (avatarTpl.isNotBlank()) avatarUrlOf(avatarTpl) else null
+            UserReplyItem(
+                id = "${cursor * 30 + index}:${action.text("post_id")}",
+                topicId = action.number("topic_id") ?: 0L,
+                postNumber = action.text("post_number").toIntOrNull()?.takeIf { it > 0 },
+                title = action.text("title").ifBlank { "无标题话题" },
+                categoryId = catId?.toLong(),
+                categoryName = cat?.name,
+                categoryColor = cat?.color,
+                createdAt = action.text("created_at").ifBlank { null },
+                commentExcerpt = Jsoup.parseBodyFragment(action.text("excerpt")).text(),
+                username = action.text("acting_username").ifBlank { action.text("username").ifBlank { username } },
+                avatarUrl = avatarUrl,
+            )
+        }
+        return items to (actions.size >= 30)
+    }
+
+    /** 通用获取用户各类动态动作列表 (filter: 4=话题, 5=回复, 1=点赞, 17=投票, 15=已解决, 等等) */
+    suspend fun fetchUserActionItems(username: String, filter: String?, cursor: Int): Pair<List<UserReplyItem>, Boolean> {
+        val userPath = URLEncoder.encode(username, "UTF-8")
+        val allCategories = categories()
+        val filterParam = if (!filter.isNullOrBlank()) "&filter=$filter" else ""
+        val actions = objectRequest("/user_actions.json?username=$userPath&offset=${cursor * 30}&limit=30$filterParam")
+            .objects("user_actions")
+        val items = actions.mapIndexed { index, action ->
+            val catId = action.number("category_id")?.toInt()
+            val cat = catId?.let { allCategories[it] }
+            val avatarTpl = action.text("acting_avatar_template").ifBlank { action.text("avatar_template") }
+            val avatarUrl = if (avatarTpl.isNotBlank()) avatarUrlOf(avatarTpl) else null
+            UserReplyItem(
+                id = "${cursor * 30 + index}:${action.text("post_id")}",
+                topicId = action.number("topic_id") ?: 0L,
+                postNumber = action.text("post_number").toIntOrNull()?.takeIf { it > 0 },
+                title = action.text("title").ifBlank { "无标题话题" },
+                categoryId = catId?.toLong(),
+                categoryName = cat?.name,
+                categoryColor = cat?.color,
+                createdAt = action.text("created_at").ifBlank { null },
+                commentExcerpt = Jsoup.parseBodyFragment(action.text("excerpt")).text(),
+                username = action.text("acting_username").ifBlank { action.text("username").ifBlank { username } },
+                avatarUrl = avatarUrl,
+            )
+        }
+        return items to (actions.size >= 30)
+    }
+
+    suspend fun fetchUserSummary(username: String): UserSummaryData {
+        val userPath = URLEncoder.encode(username, "UTF-8")
+        val raw = objectRequest("/u/$userPath/summary.json")
+        val summary = raw["user_summary"] as? JsonObject ?: JsonObject(emptyMap())
+
+        val topicsList = raw.objects("topics").map { t ->
+            SummaryTopicItem(
+                id = t.number("id") ?: 0L,
+                title = t.text("title"),
+                likeCount = t.number("like_count")?.toInt() ?: 0,
+                createdAt = t.text("created_at").ifBlank { null },
+                categoryId = t.number("category_id"),
+            )
+        }
+        val topicMap = topicsList.associateBy { it.id }
+
+        val repliesList = summary.objects("replies").map { r ->
+            val topicId = r.number("topic_id") ?: 0L
+            val topic = topicMap[topicId]
+            val topicTitle = (r["topic"] as? JsonObject)?.text("title") ?: topic?.title ?: "#$topicId"
+            SummaryReplyItem(
+                topicId = topicId,
+                postNumber = r.number("post_number")?.toInt() ?: 1,
+                title = topicTitle,
+                likeCount = r.number("like_count")?.toInt() ?: 0,
+                createdAt = r.text("created_at").ifBlank { null },
+            )
+        }
+
+        val linksList = summary.objects("links").map { l ->
+            val topicId = l.number("topic_id")
+            val topic = topicId?.let { topicMap[it] }
+            val topicTitle = (l["topic"] as? JsonObject)?.text("title") ?: topic?.title
+            SummaryLinkItem(
+                url = l.text("url"),
+                title = l.text("title").ifBlank { null },
+                clicks = l.number("clicks")?.toInt() ?: 0,
+                postNumber = l.number("post_number")?.toInt(),
+                topicId = topicId,
+                topicTitle = topicTitle,
+            )
+        }
+
+        fun parseUserWithCount(list: List<JsonObject>): List<SummaryUserItem> = list.mapNotNull { u ->
+            val uName = u.text("username")
+            if (uName.isBlank()) null
+            else SummaryUserItem(
+                id = u.number("id") ?: 0L,
+                username = uName,
+                avatarTemplate = u.text("avatar_template").ifBlank { null },
+                count = u.number("count")?.toInt() ?: 0,
+            )
+        }
+
+        val mostReplied = parseUserWithCount(summary.objects("most_replied_to_users"))
+        val mostLikedBy = parseUserWithCount(summary.objects("most_liked_by_users"))
+        val mostLiked = parseUserWithCount(summary.objects("most_liked_users"))
+
+        val topCategories = summary.objects("top_categories").map { c ->
+            SummaryCategoryItem(
+                id = c.number("id") ?: 0L,
+                name = c.text("name"),
+                color = c.text("color").ifBlank { null },
+                topicCount = c.number("topic_count")?.toInt() ?: 0,
+                postCount = c.number("post_count")?.toInt() ?: 0,
+            )
+        }
+
+        val badgesList = raw.objects("badges").map { b ->
+            SummaryBadgeItem(
+                id = b.number("id") ?: 0L,
+                name = b.text("name"),
+                description = b.text("description").ifBlank { null },
+                icon = b.text("icon").ifBlank { null },
+                badgeTypeId = b.number("badge_type_id")?.toInt() ?: 0,
+            )
+        }
+
+        return UserSummaryData(
+            daysVisited = summary.number("days_visited")?.toInt() ?: 0,
+            postsReadCount = summary.number("posts_read_count")?.toInt() ?: 0,
+            likesReceived = summary.number("likes_received")?.toInt() ?: 0,
+            likesGiven = summary.number("likes_given")?.toInt() ?: 0,
+            topicCount = summary.number("topic_count")?.toInt() ?: 0,
+            postCount = summary.number("post_count")?.toInt() ?: 0,
+            timeRead = summary.number("time_read")?.toInt() ?: 0,
+            bookmarkCount = summary.number("bookmark_count")?.toInt() ?: 0,
+            topicsEntered = summary.number("topics_entered")?.toInt() ?: 0,
+            topTopics = topicsList,
+            topReplies = repliesList,
+            topLinks = linksList,
+            mostRepliedToUsers = mostReplied,
+            mostLikedByUsers = mostLikedBy,
+            mostLikedUsers = mostLiked,
+            topCategories = topCategories,
+            badges = badgesList,
+        )
+    }
+
+    /**
+     * 获取用户徽章数据：
+     * 1. 请求官方接口 /user-badges/{username}.json?grouped=true 获取用户已获得的徽章；
+     * 2. 请求全站徽章池 /badges.json 补全未获得的徽章；
+     * 3. 严格使用官方名称、描述 (HTML 清洗) 与图标/图片；
+     * 4. 优先排序已获取的徽章，后排未获取的徽章。
+     */
+    suspend fun fetchUserBadges(username: String): List<UserBadgeItem> = withContext(Dispatchers.IO) {
+        val userPath = URLEncoder.encode(username, "UTF-8")
+        val userBadgesRaw = runCatching {
+            objectRequest("/user-badges/$userPath.json?grouped=true")
+        }.getOrNull()
+
+        val allBadgesRaw = runCatching {
+            objectRequest("/badges.json")
+        }.getOrNull()
+
+        val userBadgesList = userBadgesRaw?.objects("user_badges").orEmpty()
+        val earnedMap = mutableMapOf<Long, Pair<String?, Int>>() // badgeId -> (grantedAt, count)
+        userBadgesList.forEach { ub ->
+            val bId = ub.number("badge_id") ?: return@forEach
+            val grantedAt = ub.text("granted_at").ifBlank { null }
+            val count = ub.number("count")?.toInt() ?: 1
+            earnedMap[bId] = Pair(grantedAt, count)
+        }
+
+        val badgeDefMap = mutableMapOf<Long, JsonObject>()
+        userBadgesRaw?.objects("badges")?.forEach { b ->
+            val id = b.number("id") ?: return@forEach
+            badgeDefMap[id] = b
+        }
+        allBadgesRaw?.objects("badges")?.forEach { b ->
+            val id = b.number("id") ?: return@forEach
+            if (!badgeDefMap.containsKey(id)) {
+                badgeDefMap[id] = b
+            }
+        }
+
+        val result = mutableListOf<UserBadgeItem>()
+        badgeDefMap.values.forEach { b ->
+            val id = b.number("id") ?: return@forEach
+            val name = b.text("name")
+            if (name.isBlank()) return@forEach
+            val rawDesc = b.text("description").ifBlank { null }
+            val cleanDesc = rawDesc?.let { org.jsoup.Jsoup.parseBodyFragment(it).text() } ?: rawDesc
+            val icon = b.text("icon").ifBlank { null }
+            val imageUrl = b.text("image_url").ifBlank { null }?.let { url ->
+                if (url.startsWith("/")) "https://linux.do$url" else url
+            }
+            val badgeTypeId = b.number("badge_type_id")?.toInt() ?: 3
+            val badgeGroupingId = b.number("badge_grouping_id")?.toInt() ?: 0
+            val grantCount = b.number("grant_count")?.toInt() ?: 0
+
+            val earnedInfo = earnedMap[id]
+            val isEarned = earnedInfo != null
+
+            result.add(
+                UserBadgeItem(
+                    id = id,
+                    badgeId = id,
+                    name = name,
+                    description = cleanDesc,
+                    icon = icon,
+                    imageUrl = imageUrl,
+                    badgeTypeId = badgeTypeId,
+                    badgeGroupingId = badgeGroupingId,
+                    grantCount = grantCount,
+                    grantedAt = earnedInfo?.first,
+                    count = earnedInfo?.second ?: 0,
+                    isEarned = isEarned,
+                )
+            )
+        }
+
+        // 优先已获得（按获得时间倒序），随后按未获得（按等级与获得人数排序）
+        val sorted = result.sortedWith(
+            compareByDescending<UserBadgeItem> { it.isEarned }
+                .thenByDescending { it.grantedAt ?: "" }
+                .thenBy { it.badgeTypeId }
+                .thenByDescending { it.grantCount }
+        )
+        saveCachedUserBadges(username, sorted)
+        sorted
+    }
+
+    suspend fun fetchUserBoosts(username: String, beforeBoostId: Long? = null): Pair<List<UserReplyItem>, Long?> {
+        val userPath = URLEncoder.encode(username, "UTF-8")
+        val query = if (beforeBoostId != null) "?before_boost_id=$beforeBoostId" else ""
+        val raw = objectRequest("/discourse-boosts/users/$userPath/boosts-given.json$query")
+        val boosts = raw.objects("boosts")
+        val items = boosts.mapNotNull { b ->
+            val id = b.number("id") ?: return@mapNotNull null
+            val post = b["post"] as? JsonObject
+            val cooked = b.text("cooked")
+            val postUrl = post?.text("url").orEmpty()
+            val parsedPostNumber = postUrl.trimEnd('/').split('/').lastOrNull()?.toIntOrNull()
+            val postNumber = parsedPostNumber ?: post?.number("post_number")?.toInt() ?: 1
+            val topicId = post?.number("topic_id") ?: 0L
+            val topicTitle = post?.text("topic_title")?.ifBlank { "话题 #$topicId" } ?: "话题 #$topicId"
+            val excerptText = Jsoup.parseBodyFragment(cooked.ifBlank { post?.text("excerpt").orEmpty() }).text()
+            UserReplyItem(
+                id = "boost_$id",
+                topicId = topicId,
+                postNumber = postNumber,
+                title = topicTitle,
+                categoryId = null,
+                categoryName = "Boost",
+                categoryColor = "F59E0B",
+                createdAt = b.text("created_at").ifBlank { null },
+                commentExcerpt = excerptText,
+                username = username,
+                avatarUrl = null,
+            )
+        }.distinctBy { it.id }
+        val minId = boosts.mapNotNull { it.number("id") }.minOrNull()
+        return items to (if (boosts.size >= 20) minId else null)
+    }
+
+    suspend fun fetchUserVotedTopics(username: String, page: Int = 0): Pair<List<UserReplyItem>, Boolean> {
+        val userPath = URLEncoder.encode(username, "UTF-8")
+        val query = if (page > 0) "?page=$page" else ""
+        val raw = objectRequest("/topics/voted-by/$userPath.json$query")
+        val allCategories = categories()
+        val users = raw.objects("users").associate { u ->
+            u.number("id") to (u.text("username") to u.text("avatar_template"))
+        }
+        val topicList = raw["topic_list"] as? JsonObject
+        val topics = topicList?.objects("topics").orEmpty()
+        val moreTopicsUrl = topicList?.text("more_topics_url")
+        val hasMore = !moreTopicsUrl.isNullOrBlank()
+        val items = topics.mapIndexedNotNull { index, t ->
+            val id = t.number("id") ?: return@mapIndexedNotNull null
+            val catId = t.number("category_id")?.toInt()
+            val cat = catId?.let { allCategories[it] }
+            val posters = t.objects("posters")
+            val originalPosterId = posters.firstOrNull()?.number("user_id")
+            val userInfo = originalPosterId?.let { users[it] }
+            val authorName = userInfo?.first?.takeIf { it.isNotBlank() } ?: username
+            val avatarTpl = userInfo?.second?.takeIf { it.isNotBlank() }
+            val resolvedAvatar = avatarTpl?.let { avatarUrlOf(it, 48) }
+            val replyCount = t.number("posts_count")?.minus(1)?.coerceAtLeast(0) ?: 0
+            UserReplyItem(
+                id = "vote_${page}_${index}_$id",
+                topicId = id,
+                postNumber = 1,
+                title = t.text("title").ifBlank { "投票话题 #$id" },
+                categoryId = catId?.toLong(),
+                categoryName = cat?.name,
+                categoryColor = cat?.color,
+                createdAt = t.text("created_at").ifBlank { null },
+                commentExcerpt = "已投票 · 获赞 ${t.number("like_count") ?: 0} · 回复 $replyCount",
+                username = authorName,
+                avatarUrl = resolvedAvatar,
+            )
+        }.distinctBy { it.topicId }
+        return items to hasMore
+    }
+
+    suspend fun fetchUserSolvedPosts(username: String, offset: Int = 0): Pair<List<UserReplyItem>, Boolean> {
+        val userPath = URLEncoder.encode(username, "UTF-8")
+        val raw = objectRequest("/solution/by_user.json?username=$userPath&offset=$offset")
+        val allCategories = categories()
+        val solvedPosts = raw.objects("user_solved_posts")
+        val items = solvedPosts.mapIndexedNotNull { index, s ->
+            val postId = s.number("post_id") ?: s.number("id") ?: return@mapIndexedNotNull null
+            val topicId = s.number("topic_id") ?: 0L
+            val catId = s.number("category_id")?.toInt()
+            val cat = catId?.let { allCategories[it] }
+            UserReplyItem(
+                id = "solved_${offset + index}_$postId",
+                topicId = topicId,
+                postNumber = s.number("post_number")?.toInt() ?: 1,
+                title = s.text("title").ifBlank { s.text("topic_title").ifBlank { "已采纳回答" } },
+                categoryId = catId?.toLong(),
+                categoryName = cat?.name ?: "已采纳解答",
+                categoryColor = cat?.color ?: "10B981",
+                createdAt = s.text("created_at").ifBlank { null },
+                commentExcerpt = Jsoup.parseBodyFragment(s.text("excerpt")).text(),
+                username = username,
+                avatarUrl = null,
+            )
+        }.distinctBy { it.id }
+        return items to (solvedPosts.size >= 30)
+    }
+
+    suspend fun fetchUserReactions(username: String, beforeReactionId: Long? = null): Pair<List<UserReplyItem>, Long?> {
+        val userPath = URLEncoder.encode(username, "UTF-8")
+        val query = if (beforeReactionId != null) "?username=$userPath&before_reaction_user_id=$beforeReactionId" else "?username=$userPath"
+        val rawStr = request("/discourse-reactions/posts/reactions.json$query")
+        val jsonEl = json.parseToJsonElement(rawStr)
+        val reactionList: List<JsonObject> = when (jsonEl) {
+            is JsonArray -> jsonEl.filterIsInstance<JsonObject>()
+            is JsonObject -> jsonEl.objects("reactions").ifEmpty { jsonEl.objects("posts") }
+            else -> emptyList()
+        }
+        val items = reactionList.mapNotNull { item ->
+            val id = item.number("id") ?: return@mapNotNull null
+            val post = item["post"] as? JsonObject
+            val reaction = item["reaction"] as? JsonObject
+            val reactionValue = reaction?.text("reaction_value")?.ifBlank { reaction?.text("id") } ?: "heart"
+            val topicId = post?.number("topic_id") ?: 0L
+            val postNumber = post?.number("post_number")?.toInt() ?: 1
+            val title = post?.text("topic_title")?.ifBlank { "回应动态" } ?: "回应动态"
+            val excerpt = Jsoup.parseBodyFragment(post?.text("excerpt").orEmpty()).text()
+            UserReplyItem(
+                id = "reaction_$id",
+                topicId = topicId,
+                postNumber = postNumber,
+                title = title,
+                categoryId = null,
+                categoryName = "回应 :$reactionValue:",
+                categoryColor = "E11D48",
+                createdAt = item.text("created_at").ifBlank { null },
+                commentExcerpt = excerpt,
+                username = username,
+                avatarUrl = null,
+            )
+        }.distinctBy { it.id }
+        val minId = reactionList.mapNotNull { it.number("id") }.minOrNull()
+        return items to (if (reactionList.size >= 20) minId else null)
     }
 
     /**
@@ -1153,6 +2665,9 @@ class TopicRepository(
     private fun JsonObject.number(key: String): Long? = (get(key) as? JsonPrimitive)?.longOrNull?.takeIf { it > 0 }
     private fun JsonObject.objects(key: String): List<JsonObject> = (get(key) as? JsonArray).orEmpty().mapNotNull { it as? JsonObject }
 
+    private fun JsonObject.arrayObjects(key: String): List<JsonObject> =
+        (get(key) as? JsonArray).orEmpty().mapNotNull { it as? JsonObject }
+
     private fun activityLabel(type: String): String = when (type) {
         "1" -> "点赞"; "2" -> "收到赞"; "4" -> "发表话题"; "5" -> "回复"; "6" -> "收到回复"
         "7" -> "被提及"; "9" -> "引用"; "11", "12" -> "消息"; else -> "活动"
@@ -1206,14 +2721,383 @@ class TopicRepository(
 
     /** 返回当前登录用户名;未登录(Discourse 返回 404)时为 null。这才是"登录态是否有效"的真实判断。 */
     suspend fun fetchCurrentUser(): String? {
+        val user = fetchCurrentUserDetails()
+        user?.id?.takeIf { it > 0L }?.let { sessionStore?.saveCurrentUserId(it) }
+        return user?.username
+    }
+
+    suspend fun fetchCurrentUserDetails(): DiscourseUser? {
+        val generation = sessionStore?.sessionGeneration
         val body = try {
             request("/session/current.json")
         } catch (error: HttpStatusException) {
             if (error.status == 404) return null
             throw error
         }
-        return json.parseToJsonElement(body).jsonObject["current_user"]
-            ?.jsonObject?.get("username")?.jsonPrimitive?.content
+        val user = json.parseToJsonElement(body).jsonObject["current_user"]?.jsonObject ?: return null
+        val id = user["id"]?.jsonPrimitive?.longOrNull ?: 0L
+        val username = user["username"]?.jsonPrimitive?.contentOrNull ?: return null
+        if (id <= 0L || username.isBlank()) throw IllegalStateException("会话响应格式不正确")
+        if (generation != sessionStore?.sessionGeneration) throw CancellationException("会话已切换")
+        if (generation != null) withContext(Dispatchers.Main) { sessionStore?.normalizeVerifiedAuthCookies(generation) }
+        val animatedFromSession = user["animated_avatar"]?.jsonPrimitive?.contentOrNull?.takeIf(::isAnimatedAvatarPath)
+        val animated = animatedFromSession
+            ?: AvatarCache.get(username)?.takeIf(::isAnimatedAvatarPath)
+            ?: resolveAnimatedAvatar(username)
+        if (!animated.isNullOrBlank()) {
+            AvatarCache.record(username, animated)
+        }
+        return DiscourseUser(
+            id = id,
+            username = username,
+            name = user["name"]?.jsonPrimitive?.contentOrNull,
+            avatarTemplate = user["avatar_template"]?.jsonPrimitive?.contentOrNull,
+            animatedAvatar = animated,
+            trustLevel = user["trust_level"]?.jsonPrimitive?.intOrNull,
+        )
+    }
+
+    suspend fun fetchTrustReport(): TrustReport? {
+        var html = try {
+            request("https://connect.linux.do/")
+        } catch (error: Exception) {
+            diagnostics.log("拉取 Connect 升级进度失败: ${error.message}")
+            return null
+        }
+
+        // 检查是否触发 Discourse Connect SSO 回调跳转
+        if (html.contains("redirect_url") && html.contains("sso_callback")) {
+            val redirectUrl = runCatching {
+                json.parseToJsonElement(html).jsonObject["redirect_url"]?.jsonPrimitive?.contentOrNull
+            }.getOrNull()
+            if (!redirectUrl.isNullOrBlank()) {
+                diagnostics.log("Connect 触发 SSO 授权，自动完成握手: $redirectUrl")
+                try {
+                    val ssoResp = request(redirectUrl)
+                    html = if (ssoResp.isNotBlank() && ssoResp.contains("tl3-ring")) {
+                        ssoResp
+                    } else {
+                        request("https://connect.linux.do/")
+                    }
+                } catch (error: Exception) {
+                    diagnostics.log("Connect SSO 握手完成或重定向: ${error.message}")
+                    html = try { request("https://connect.linux.do/") } catch (_: Exception) { html }
+                }
+            }
+        }
+
+        val report = TrustReport.fromHtml(html)
+        if (report == null) {
+            diagnostics.log("Connect 页面解析失败, HTML 长度=${html.length}, 内容: ${html.take(1000)}")
+        }
+        return report
+    }
+
+    /**
+     * 获取 LINUX DO Credit 用户积分信息。
+     * GET https://credit.linux.do/api/v1/oauth/user-info
+     */
+    suspend fun fetchLdcUserInfo(): LdcUserInfo {
+        val raw = request("https://credit.linux.do/api/v1/oauth/user-info", present = false)
+        val root = json.parseToJsonElement(raw).jsonObject
+        val dataElem = root["data"] as? JsonObject ?: throw IllegalStateException("LDC 响应缺少 data 字段")
+        fun readStr(key: String): String = (dataElem[key] as? JsonPrimitive)?.contentOrNull.orEmpty()
+        fun readInt(key: String): Int = (dataElem[key] as? JsonPrimitive)?.intOrNull ?: (readStr(key).toIntOrNull() ?: 0)
+        fun readLong(key: String): Long = (dataElem[key] as? JsonPrimitive)?.longOrNull ?: (readStr(key).toLongOrNull() ?: 0L)
+        fun readBool(key: String): Boolean = (dataElem[key] as? JsonPrimitive)?.booleanOrNull ?: (readStr(key).toBooleanStrictOrNull() ?: false)
+        return LdcUserInfo(
+            id = readLong("id"),
+            username = readStr("username"),
+            nickname = readStr("nickname"),
+            trustLevel = readInt("trust_level"),
+            avatarUrl = readStr("avatar_url"),
+            totalReceive = readStr("total_receive").ifBlank { "0" },
+            totalPayment = readStr("total_payment").ifBlank { "0" },
+            totalTransfer = readStr("total_transfer").ifBlank { "0" },
+            totalCommunity = readStr("total_community").ifBlank { "0" },
+            communityBalance = readStr("community_balance").ifBlank { "0" },
+            availableBalance = readStr("available_balance").ifBlank { "0" },
+            payScore = readInt("pay_score"),
+            isPayKey = readBool("is_pay_key"),
+            isAdmin = readBool("is_admin"),
+            remainQuota = readStr("remain_quota").ifBlank { "0" },
+            payLevel = readInt("pay_level"),
+            dailyLimit = readInt("daily_limit"),
+        )
+    }
+
+    /**
+     * 获取 CDK 社区分(score,-100~100,由 CDK 服务端按徽章结算)。
+     * GET https://cdk.linux.do/api/v1/oauth/user-info,依赖 CDK 自己的会话 Cookie,
+     * 未授权时返回 401,由调用方走 [authorizeCdk] 后重试。
+     */
+    suspend fun fetchCdkScore(): Int {
+        val raw = request("https://cdk.linux.do/api/v1/oauth/user-info", present = false)
+        val root = json.parseToJsonElement(raw).jsonObject
+        val data = root["data"] as? JsonObject ?: throw IllegalStateException("CDK 响应缺少 data 字段")
+        val primitive = data["score"] as? JsonPrimitive ?: throw IllegalStateException("CDK 响应缺少 score 字段")
+        return primitive.intOrNull ?: primitive.contentOrNull?.toIntOrNull()
+            ?: throw IllegalStateException("CDK score 格式不正确")
+    }
+
+    /**
+     * LINUX DO Credit 应用内静默/快速 OAuth 授权流程。
+     * 1. GET https://credit.linux.do/api/v1/oauth/login -> 获取 authUrl
+     * 2. GET authUrl (不自动重定向) -> 若 302 直接提取 code/state; 若 200 解析 HTML 的 a[href*="/oauth2/approve/"] 并 GET 之
+     * 3. 提取 302 重定向 Location 中的 code 与 state
+     * 4. POST https://credit.linux.do/api/v1/oauth/callback (携带 code, state 及 X-Requested-With: XMLHttpRequest)
+     */
+    private data class LdcOAuthResponse(
+        val status: Int,
+        val location: String?,
+        val body: String,
+    )
+
+    private fun sanitizeUrl(url: String?): String {
+        if (url.isNullOrBlank()) return ""
+        return url.replace(Regex("(?i)(code|state|token|client_secret|authenticity_token)=([^&]+)"), "$1=***")
+    }
+
+    /**
+     * OAuth 请求接入进程级双轨调度器：
+     * GET 请求受 [getSemaphore] (2 并发) 与滑动窗口 (4次/3秒) 约束；
+     * POST 请求受 [postGate] (1 并发绝对串行) 约束。
+     * 遇到 429 时统一进入全局退让，杜绝旁路超限穿透。
+     */
+    private suspend fun executeLdcOAuthRequest(
+        client: OkHttpClient,
+        request: Request,
+        label: String,
+    ): LdcOAuthResponse {
+        val isPost = request.method.equals("POST", ignoreCase = true)
+        val executeCall = suspend {
+            client.newCall(request).execute().use { response ->
+                val body = response.body?.string().orEmpty()
+                if (response.code == 429) {
+                    val retryAfter = HttpHeaderUtils.extractRetryAfterSeconds(
+                        retryAfterHeader = response.header("Retry-After"),
+                        resetHeader = response.header("x-ratelimit-reset") ?: response.header("ratelimit-reset"),
+                        body = body,
+                    )
+                    throw enterRateLimitCooldown(label, retryAfter)
+                }
+                LdcOAuthResponse(
+                    status = response.code,
+                    location = response.header("Location"),
+                    body = body,
+                )
+            }
+        }
+        return if (isPost) {
+            postGate.withLock {
+                throttlePost(burst = true)
+                try {
+                    executeCall()
+                } finally {
+                    markPostCompleted()
+                }
+            }
+        } else {
+            getSemaphore.withPermit {
+                acquireGetSlot { false }
+                executeCall()
+            }
+        }
+    }
+
+    suspend fun authorizeLdc(): Boolean = authorizeOAuthSite("credit.linux.do", "LDC")
+
+    /** CDK 与 LDC 是同一套 OAuth 握手(login -> connect approve -> callback),仅站点不同。 */
+    suspend fun authorizeCdk(): Boolean = authorizeOAuthSite("cdk.linux.do", "CDK")
+
+    private suspend fun authorizeOAuthSite(host: String, label: String): Boolean = ldcAuthGate.withLock {
+        withContext(Dispatchers.IO) {
+            val client = httpClientProvider?.invoke() ?: run {
+                diagnostics.log("authorize$label 失败: 未提供 httpClientProvider")
+                return@withContext false
+            }
+
+            try {
+                // 先同步 WebView Cookie 到 store
+                sessionStore?.let { s ->
+                    withContext(Dispatchers.Main) { s.syncFromWebView() }
+                }
+
+                diagnostics.log("开始 $label OAuth 授权流程...")
+
+                // 1. GET /api/v1/oauth/login
+                val loginReq = Request.Builder()
+                    .url("https://$host/api/v1/oauth/login")
+                    .header("Accept", "application/json")
+                    .header("X-Requested-With", "XMLHttpRequest")
+                    .get()
+                    .build()
+
+                val loginResp = executeLdcOAuthRequest(client, loginReq, "$label OAuth login")
+                if (loginResp.status !in 200..299) {
+                    diagnostics.log("$label OAuth login 请求失败: HTTP ${loginResp.status}")
+                    return@withContext false
+                }
+                val loginBody = loginResp.body
+                val authUrl = runCatching {
+                    val elem = json.parseToJsonElement(loginBody).jsonObject
+                    (elem["data"] as? JsonPrimitive)?.contentOrNull
+                }.getOrNull()
+
+                if (authUrl.isNullOrBlank()) {
+                    diagnostics.log("$label OAuth 获取 authUrl 失败: $loginBody")
+                    return@withContext false
+                }
+
+                diagnostics.log("$label OAuth 获得 authUrl: ${sanitizeUrl(authUrl)}")
+
+                // 创建禁止自动重定向的 client，用于捕获 302 Location
+                val noRedirectClient = client.newBuilder()
+                    .followRedirects(false)
+                    .followSslRedirects(false)
+                    .build()
+
+                // 2. GET authUrl
+                val authReq = Request.Builder()
+                    .url(authUrl)
+                    .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+                    .get()
+                    .build()
+
+                val authResp = executeLdcOAuthRequest(noRedirectClient, authReq, "$label OAuth authorize")
+                val authCode = authResp.status
+                var code: String? = null
+                var state: String? = null
+
+                if (authCode in 300..399) {
+                    val loc = authResp.location
+                    diagnostics.log("$label OAuth 直接 302 重定向: ${sanitizeUrl(loc)}")
+                    if (!loc.isNullOrBlank()) {
+                        code = extractQueryParam(loc, "code")
+                        state = extractQueryParam(loc, "state")
+                    }
+                } else if (authCode == 200) {
+                    val html = authResp.body
+                    val doc = Jsoup.parse(html)
+                    val approveLink = doc.select("a[href*=/oauth2/approve/]").firstOrNull()?.attr("href")
+                    if (!approveLink.isNullOrBlank()) {
+                        val approveUrl = if (approveLink.startsWith("http")) approveLink else "https://connect.linux.do$approveLink"
+                        // 拟人化延迟：模拟人类用户查看授权页并点击“同意”的自然停顿（600~950ms），消除秒级机器特征
+                        delay(Random.nextLong(600L, 950L))
+                        diagnostics.log("$label OAuth 发起 approve 链接请求: ${sanitizeUrl(approveUrl)}")
+
+                        val approveReq = Request.Builder()
+                            .url(approveUrl)
+                            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+                            .get()
+                            .build()
+
+                        val approveResp = executeLdcOAuthRequest(noRedirectClient, approveReq, "$label OAuth approve")
+                        val loc = approveResp.location
+                        diagnostics.log("$label OAuth approve 响应: ${approveResp.status}, Location: ${sanitizeUrl(loc)}")
+                        if (!loc.isNullOrBlank()) {
+                            code = extractQueryParam(loc, "code")
+                            state = extractQueryParam(loc, "state")
+                        }
+                    } else {
+                        // 尝试表单 POST 形式的授权（Rails / Discourse 常见表单）
+                        val form = doc.select("form").firstOrNull()
+                        val csrfToken = doc.select("input[name=authenticity_token]").firstOrNull()?.attr("value")
+                        if (form != null && !csrfToken.isNullOrBlank()) {
+                            val formAction = form.attr("action").ifBlank { authUrl }
+                            val actionUrl = if (formAction.startsWith("http")) formAction else "https://connect.linux.do$formAction"
+                            diagnostics.log("$label OAuth 发起表单 POST 授权: ${sanitizeUrl(actionUrl)}")
+                            val formBodyBuilder = okhttp3.FormBody.Builder()
+                                .add("authenticity_token", csrfToken)
+                                .add("commit", "Authorize")
+                            form.select("input[type=hidden]").forEach { hidden ->
+                                val name = hidden.attr("name")
+                                val value = hidden.attr("value")
+                                if (name.isNotBlank() && name != "authenticity_token") {
+                                    formBodyBuilder.add(name, value)
+                                }
+                            }
+                            val formReq = Request.Builder()
+                                .url(actionUrl)
+                                .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+                                .post(formBodyBuilder.build())
+                                .build()
+                            val formResp = executeLdcOAuthRequest(noRedirectClient, formReq, "$label OAuth form approve")
+                            val loc = formResp.location
+                            diagnostics.log("$label OAuth 表单授权响应: ${formResp.status}, Location: ${sanitizeUrl(loc)}")
+                            if (!loc.isNullOrBlank()) {
+                                code = extractQueryParam(loc, "code")
+                                state = extractQueryParam(loc, "state")
+                            }
+                        } else {
+                            diagnostics.log("$label OAuth 未在同意页找到 approve 链接或表单, HTML 长度=${html.length}")
+                            return@withContext false
+                        }
+                    }
+                } else {
+                    diagnostics.log("$label OAuth 请求 authUrl 异常状态码: $authCode")
+                    return@withContext false
+                }
+
+                if (code.isNullOrBlank() || state.isNullOrBlank()) {
+                    diagnostics.log("$label OAuth 未能提取到 code 或 state")
+                    return@withContext false
+                }
+
+                diagnostics.log("$label OAuth 提取到 code 与 state，正在提交 callback...")
+                // 拟人化延迟：模拟浏览器处理 302 重定向并提交回调的自然间隔（500~850ms）
+                delay(Random.nextLong(500L, 850L))
+
+                // 3. POST https://credit.linux.do/api/v1/oauth/callback
+                // 注意：必须携带 X-Requested-With: XMLHttpRequest，否则 credit.linux.do 会触发 CSRF 校验失败 403
+                val callbackJson = """{"code":"$code","state":"$state"}"""
+                val callbackReq = Request.Builder()
+                    .url("https://$host/api/v1/oauth/callback")
+                    .header("X-Requested-With", "XMLHttpRequest")
+                    .header("Content-Type", "application/json")
+                    .header("Accept", "application/json")
+                    .post(callbackJson.toRequestBody("application/json; charset=utf-8".toMediaType()))
+                    .build()
+
+                val callbackResp = executeLdcOAuthRequest(client, callbackReq, "$label OAuth callback")
+                val callbackBody = callbackResp.body
+                if (callbackResp.status !in 200..299) {
+                    diagnostics.log("$label OAuth callback 失败: HTTP ${callbackResp.status}, $callbackBody")
+                    return@withContext false
+                }
+
+                withContext(Dispatchers.Main) {
+                    runCatching {
+                        android.webkit.CookieManager.getInstance().flush()
+                    }
+                }
+
+                diagnostics.log("$label OAuth 授权握手圆满成功: $callbackBody")
+                true
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                diagnostics.log("$label OAuth 流程发生异常: ${e.message}")
+                false
+            }
+        }
+    }
+
+    private fun extractQueryParam(url: String, key: String): String? {
+        val queryStart = url.indexOf('?')
+        if (queryStart < 0) return null
+        val query = url.substring(queryStart + 1)
+        for (part in query.split('&')) {
+            val kv = part.split('=', limit = 2)
+            if (kv.isNotEmpty()) {
+                val k = runCatching { java.net.URLDecoder.decode(kv[0], "UTF-8") }.getOrDefault(kv[0])
+                if (k == key) {
+                    val v = if (kv.size > 1) kv[1] else ""
+                    return runCatching { java.net.URLDecoder.decode(v, "UTF-8") }.getOrDefault(v)
+                }
+            }
+        }
+        return null
     }
 
     /**
@@ -1358,96 +3242,121 @@ class TopicRepository(
         password: String,
         secondFactorToken: String? = null,
         secondFactorMethod: Int = 1,
-    ): Boolean = gate.withLock {
-        throttle()
-        val transport = transportProvider()
-        // 1. 获取 CSRF token (独立 20s 超时)
-        val csrfDeadlineNs = System.nanoTime() + Config.LOGIN_CALL_TIMEOUT_MS * 1_000_000L
-        val csrf = loginCsrf(transport, csrfDeadlineNs)
+    ): Boolean {
+        return postGate.withLock {
+            throttlePost()
+            val transport = transportProvider()
+            val csrfDeadlineNs = System.nanoTime() + Config.LOGIN_CALL_TIMEOUT_MS * 1_000_000L
+            val csrf = loginCsrf(transport, csrfDeadlineNs)
 
-        // 2. 发送登录请求（独立 20s 超时，登录固定两步请求，第二步走突发间隔）
-        throttle(burst = true)
-        val loginDeadlineNs = System.nanoTime() + Config.LOGIN_CALL_TIMEOUT_MS * 1_000_000L
-        val fields = mutableMapOf<String, JsonElement>(
-            "login" to JsonPrimitive(login),
-            "password" to JsonPrimitive(password),
-        )
-        val trimmedToken = secondFactorToken?.trim().orEmpty()
-        if (trimmedToken.isNotEmpty()) {
-            fields["second_factor_token"] = JsonPrimitive(trimmedToken)
-            fields["second_factor_method"] = JsonPrimitive(secondFactorMethod)
-        }
-        val body = JsonObject(fields).toString()
-        val loginResult = loginCall("/session.json", loginDeadlineNs) { transport.write("/session.json", "POST", body, csrf) }
-        diagnostics.recordStatus(transport.name, loginResult.status, "/session")
-        if (loginResult.challenged) throw NeedsInteractiveVerification("登录请求被 Cloudflare 拦截 (403 挑战)")
-        if (loginResult.status == 403) throw RiskControlException(403, "登录请求触发风控 (403)")
-        if (loginResult.status == 0) throw NetworkTimeoutException()
-        if (loginResult.status == 429) throw HttpStatusException(429, "登录尝试过于频繁，请稍后再试")
-        val responseObj = try {
-            json.parseToJsonElement(loginResult.body).jsonObject
-        } catch (e: Exception) {
-            if (loginResult.status in 200..299) return@withLock true
-            throw HttpStatusException(loginResult.status, "HTTP ${loginResult.status}: ${loginResult.body.take(150)}")
-        }
-        val error = responseObj["error"]?.jsonPrimitive?.contentOrNull
-            ?: responseObj["message"]?.jsonPrimitive?.contentOrNull
-        val reason = responseObj["reason"]?.jsonPrimitive?.contentOrNull
-        val totpEnabled = responseObj["totp_enabled"]?.jsonPrimitive?.booleanOrNull == true
-        val backupEnabled = responseObj["backup_enabled"]?.jsonPrimitive?.booleanOrNull == true
-        val securityKeyEnabled = responseObj["security_key_enabled"]?.jsonPrimitive?.booleanOrNull == true
-        val hasMulti2fa = responseObj["multiple_second_factor_methods"] != null
-        val isSecondFactor = reason?.contains("second_factor") == true ||
-            totpEnabled || backupEnabled || securityKeyEnabled || hasMulti2fa
-        if (isSecondFactor) {
-            if (trimmedToken.isEmpty()) {
-                diagnostics.log("账号已开启 2FA，等待输入两步验证码")
-                throw SecondFactorRequiredException(
-                    totpEnabled = totpEnabled || !backupEnabled,
-                    backupEnabled = backupEnabled,
-                    message = error?.takeIf { it.isNotBlank() } ?: "该账号已开启两步验证，请输入验证码",
-                )
-            } else {
-                diagnostics.log("2FA 验证码错误: $error")
-                throw LoginRejectedException(error?.takeIf { it.isNotBlank() } ?: "两步验证码错误或已过期，请重试")
+            throttlePost(burst = true)
+            val loginDeadlineNs = System.nanoTime() + Config.LOGIN_CALL_TIMEOUT_MS * 1_000_000L
+            val fields = mutableMapOf<String, JsonElement>(
+                "login" to JsonPrimitive(login),
+                "password" to JsonPrimitive(password),
+            )
+            val trimmedToken = secondFactorToken?.trim().orEmpty()
+            if (trimmedToken.isNotEmpty()) {
+                fields["second_factor_token"] = JsonPrimitive(trimmedToken)
+                fields["second_factor_method"] = JsonPrimitive(secondFactorMethod)
             }
+            val body = JsonObject(fields).toString()
+            val loginResult = try {
+                loginCall("/session.json", loginDeadlineNs) { transport.write("/session.json", "POST", body, csrf) }
+            } finally {
+                markPostCompleted()
+            }
+            diagnostics.recordStatus(transport.name, loginResult.status, "/session")
+            if (loginResult.status == 429) {
+                enterRateLimitCooldown("/session.json", loginResult.retryAfterSeconds)
+                throw HttpStatusException(429, "登录尝试过于频繁，请稍后再试")
+            }
+            if (loginResult.challenged) throw NeedsInteractiveVerification("登录请求被 Cloudflare 拦截 (403 挑战)")
+            if (loginResult.status == 403) throw RiskControlException(403, "登录请求触发风控 (403)")
+            if (loginResult.status == 0) throw NetworkTimeoutException()
+            val responseObj = try {
+                json.parseToJsonElement(loginResult.body).jsonObject
+            } catch (e: Exception) {
+                if (loginResult.status in 200..299) return@withLock true
+                throw HttpStatusException(loginResult.status, "HTTP ${loginResult.status}: ${loginResult.body.take(150)}")
+            }
+            val error = responseObj["error"]?.jsonPrimitive?.contentOrNull
+                ?: responseObj["message"]?.jsonPrimitive?.contentOrNull
+            val reason = responseObj["reason"]?.jsonPrimitive?.contentOrNull
+            val totpEnabled = responseObj["totp_enabled"]?.jsonPrimitive?.booleanOrNull == true
+            val backupEnabled = responseObj["backup_enabled"]?.jsonPrimitive?.booleanOrNull == true
+            val securityKeyEnabled = responseObj["security_key_enabled"]?.jsonPrimitive?.booleanOrNull == true
+            val hasMulti2fa = responseObj["multiple_second_factor_methods"] != null
+            val isSecondFactor = reason?.contains("second_factor") == true ||
+                totpEnabled || backupEnabled || securityKeyEnabled || hasMulti2fa
+            if (isSecondFactor) {
+                if (trimmedToken.isEmpty()) {
+                    diagnostics.log("账号已开启 2FA，等待输入两步验证码")
+                    throw SecondFactorRequiredException(
+                        totpEnabled = totpEnabled || !backupEnabled,
+                        backupEnabled = backupEnabled,
+                        message = error?.takeIf { it.isNotBlank() } ?: "该账号已开启两步验证，请输入验证码",
+                    )
+                } else {
+                    diagnostics.log("2FA 验证码错误: $error")
+                    throw LoginRejectedException(error?.takeIf { it.isNotBlank() } ?: "两步验证码错误或已过期，请重试")
+                }
+            }
+            if (!error.isNullOrBlank()) {
+                diagnostics.log("登录失败: $error")
+                throw LoginRejectedException(error)
+            }
+            if (loginResult.status !in 200..299) {
+                throw HttpStatusException(loginResult.status, "HTTP ${loginResult.status}: ${loginResult.body.take(150)}")
+            }
+            if (responseObj["user"] == null) {
+                throw LoginRejectedException("登录未返回有效用户凭据，响应: ${loginResult.body.take(150)}")
+            }
+            true
         }
-        if (!error.isNullOrBlank()) {
-            diagnostics.log("登录失败: $error")
-            throw LoginRejectedException(error)
-        }
-        if (loginResult.status !in 200..299) {
-            throw HttpStatusException(loginResult.status, "HTTP ${loginResult.status}: ${loginResult.body.take(150)}")
-        }
-        if (responseObj["user"] == null) {
-            throw LoginRejectedException("登录未返回有效用户凭据，响应: ${loginResult.body.take(150)}")
-        }
-        true
     }
 
     /**
      * 向指定邮箱发送一次性登录链接邮件（Discourse magic link）。
      * 用户从邮件链接中复制 token，再交由 ViewModel.loginWithEmailCode 处理。
      */
-    suspend fun sendEmailLogin(email: String) = gate.withLock {
-        throttle()
-        val transport = transportProvider()
-        val csrfDeadlineNs = System.nanoTime() + Config.LOGIN_CALL_TIMEOUT_MS * 1_000_000L
-        val csrf = loginCsrf(transport, csrfDeadlineNs)
-        throttle(burst = true)
-        val sendDeadlineNs = System.nanoTime() + Config.LOGIN_CALL_TIMEOUT_MS * 1_000_000L
-        val safeEmail = email.replace("\"", "\\\"")
-        val body = "{\"login\":\"$safeEmail\"}"
-        val result = loginCall("/u/email-login.json", sendDeadlineNs) { transport.write("/u/email-login.json", "POST", body, csrf) }
-        diagnostics.recordStatus(transport.name, result.status, "/u/email-login")
-        if (result.challenged) throw NeedsInteractiveVerification("发邮件请求被 Cloudflare 拦截")
-        if (result.status == 403) throw RiskControlException(403, "发送登录邮件触发风控 (403)")
-        if (result.status == 0) throw NetworkTimeoutException()
-        if (result.status !in 200..299) throw HttpStatusException(result.status, result.body.take(120))
+    suspend fun sendEmailLogin(email: String) {
+        postGate.withLock {
+            throttlePost()
+            val transport = transportProvider()
+            val csrfDeadlineNs = System.nanoTime() + Config.LOGIN_CALL_TIMEOUT_MS * 1_000_000L
+            val csrf = loginCsrf(transport, csrfDeadlineNs)
+            throttlePost(burst = true)
+            val sendDeadlineNs = System.nanoTime() + Config.LOGIN_CALL_TIMEOUT_MS * 1_000_000L
+            val safeEmail = email.replace("\"", "\\\"")
+            val body = "{\"login\":\"$safeEmail\"}"
+            val result = try {
+                loginCall("/u/email-login.json", sendDeadlineNs) { transport.write("/u/email-login.json", "POST", body, csrf) }
+            } finally {
+                markPostCompleted()
+            }
+            diagnostics.recordStatus(transport.name, result.status, "/u/email-login")
+            if (result.status == 429) {
+                enterRateLimitCooldown("/u/email-login.json", result.retryAfterSeconds)
+                throw HttpStatusException(429, "发送登录邮件过于频繁，请稍后再试")
+            }
+            if (result.challenged) throw NeedsInteractiveVerification("发邮件请求被 Cloudflare 拦截")
+            if (result.status == 403) throw RiskControlException(403, "发送登录邮件触发风控 (403)")
+            if (result.status == 0) throw NetworkTimeoutException()
+            if (result.status !in 200..299) throw HttpStatusException(result.status, result.body.take(120))
+        }
     }
 
     private suspend fun loginCsrf(transport: Transport, deadlineNs: Long = 0L): String {
-        val result = loginCall("/session/csrf.json", deadlineNs) { transport.get("/session/csrf.json") }
+        val result = getSemaphore.withPermit {
+            acquireGetSlot { false }
+            loginCall("/session/csrf.json", deadlineNs) { transport.get("/session/csrf.json") }
+        }
+        diagnostics.recordStatus(transport.name, result.status, "/session/csrf")
+        if (result.status == 429) {
+            enterRateLimitCooldown("/session/csrf.json", result.retryAfterSeconds)
+            throw HttpStatusException(429, "获取凭据过于频繁，请稍后再试")
+        }
         if (result.challenged) throw NeedsInteractiveVerification("CSRF 请求被 Cloudflare 拦截")
         if (result.status == 403) throw RiskControlException(403, "获取登录凭证触发风控 (403)")
         if (result.status == 0) throw NetworkTimeoutException()
@@ -1464,30 +3373,39 @@ class TopicRepository(
         token: String,
         secondFactorToken: String? = null,
         secondFactorMethod: Int = 1,
-    ) = gate.withLock {
-        throttle()
-        val transport = transportProvider()
-        val csrfDeadlineNs = System.nanoTime() + Config.LOGIN_CALL_TIMEOUT_MS * 1_000_000L
-        val csrf = loginCsrf(transport, csrfDeadlineNs)
-        throttle(burst = true)
-        val loginDeadlineNs = System.nanoTime() + Config.LOGIN_CALL_TIMEOUT_MS * 1_000_000L
-        val path = "/session/email-login/${encode(token)}"
-        val trimmed2fa = secondFactorToken?.trim().orEmpty()
-        val reqBody = if (trimmed2fa.isNotEmpty()) {
-            JsonObject(
-                mapOf(
-                    "second_factor_token" to JsonPrimitive(trimmed2fa),
-                    "second_factor_method" to JsonPrimitive(secondFactorMethod),
-                ),
-            ).toString()
-        } else {
-            "{}"
-        }
-        val result = loginCall(path, loginDeadlineNs) { transport.write(path, "POST", reqBody, csrf) }
-        diagnostics.recordStatus(transport.name, result.status, "/session/email-login")
-        if (result.challenged) throw NeedsInteractiveVerification("邮件登录请求被 Cloudflare 拦截")
-        if (result.status == 403) throw RiskControlException(403, "验证码登录触发风控 (403)")
-        if (result.status == 0) throw NetworkTimeoutException()
+    ) {
+        postGate.withLock {
+            throttlePost()
+            val transport = transportProvider()
+            val csrfDeadlineNs = System.nanoTime() + Config.LOGIN_CALL_TIMEOUT_MS * 1_000_000L
+            val csrf = loginCsrf(transport, csrfDeadlineNs)
+            throttlePost(burst = true)
+            val loginDeadlineNs = System.nanoTime() + Config.LOGIN_CALL_TIMEOUT_MS * 1_000_000L
+            val path = "/session/email-login/${encode(token)}"
+            val trimmed2fa = secondFactorToken?.trim().orEmpty()
+            val reqBody = if (trimmed2fa.isNotEmpty()) {
+                JsonObject(
+                    mapOf(
+                        "second_factor_token" to JsonPrimitive(trimmed2fa),
+                        "second_factor_method" to JsonPrimitive(secondFactorMethod),
+                    ),
+                ).toString()
+            } else {
+                "{}"
+            }
+            val result = try {
+                loginCall(path, loginDeadlineNs) { transport.write(path, "POST", reqBody, csrf) }
+            } finally {
+                markPostCompleted()
+            }
+            diagnostics.recordStatus(transport.name, result.status, "/session/email-login")
+            if (result.status == 429) {
+                enterRateLimitCooldown(path, result.retryAfterSeconds)
+                throw HttpStatusException(429, "验证邮件令牌过于频繁，请稍后再试")
+            }
+            if (result.challenged) throw NeedsInteractiveVerification("邮件登录请求被 Cloudflare 拦截")
+            if (result.status == 403) throw RiskControlException(403, "验证码登录触发风控 (403)")
+            if (result.status == 0) throw NetworkTimeoutException()
 
         val body = runCatching { json.parseToJsonElement(result.body).jsonObject }.getOrNull()
         val serverError = body?.get("error")?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
@@ -1518,6 +3436,7 @@ class TopicRepository(
             throw LoginRejectedException("登录链接无效或已过期，请重新获取")
         }
     }
+}
 
     /**
      * 登录链路的硬超时。
@@ -1548,7 +3467,7 @@ class TopicRepository(
             throw NetworkTimeoutException()
         } finally {
             deferred.cancel()
-            lastRequestAt = SystemClock.elapsedRealtime()
+            lastPostRequestAt = SystemClock.elapsedRealtime()
         }
     }
 
@@ -1577,6 +3496,7 @@ class TopicRepository(
     ): TopicPage {
         val known = if (awaitCategories) categories() else categoryCache.orEmpty()
         val usersById = response.users.associateBy { it.id }
+        response.users.forEach { u -> AvatarCache.record(u.username, u.animatedAvatar) }
         // 本地已读集合优先于服务端 unseen:纯净模式下压根没上报过,服务端当然还认为没读。
         val filteredTopics = response.topicList.topics.distinctBy { it.id }.filterNot { topic ->
             excludeReadUnread && reading?.isUnreadExcluded(topic.id, topic.postsCount) == true
@@ -1592,7 +3512,7 @@ class TopicRepository(
                 topic = if (topic.unseen && locallyRead) topic.copy(unseen = false) else topic,
                 authorUsername = author?.username ?: topic.lastPosterUsername,
                 authorName = author?.name,
-                avatarUrl = avatarUrlOf(author?.avatarTemplate, author?.animatedAvatar, size = 64),
+                avatarUrl = avatarUrlOf(author?.avatarTemplate, author?.animatedAvatar, size = 64, username = author?.username),
                 staticAvatarUrl = avatarUrlOf(author?.avatarTemplate, null, size = 64),
                 category = topic.categoryId?.let { known[it] },
                 trustLevel = author?.trustLevel,
@@ -1602,42 +3522,311 @@ class TopicRepository(
         return TopicPage(items = items, hasMore = response.topicList.moreTopicsUrl != null)
     }
 
-    private suspend fun request(path: String, burst: Boolean = false, present: Boolean = true): String = gate.withLock {
-        var attempt = 0
-        while (true) {
-            throttle(burst)
-            val transport = transportProvider()
-            val result = try {
-                transport.get(path, present = present)
-            } finally {
-                lastRequestAt = SystemClock.elapsedRealtime()
-            }
-            diagnostics.recordStatus(transport.name, result.status, path)
-            when {
-                result.challenged -> throw NeedsInteractiveVerification("请求 $path 仍被 Cloudflare 挑战拦截")
-                result.status in 200..299 -> return result.body
-                // 连不上服务器时重试只是让用户多等十几秒,直接报错;5xx 才是值得重试的服务端抖动。
-                result.status == 0 -> throw NetworkTimeoutException()
-                result.status >= 500 && attempt < MAX_RETRIES -> {
-                    delay(BACKOFF_BASE_MS shl attempt)
-                    attempt++
+    private fun ensureRequestAllowed() {
+        if (sessionStore?.sessionChanging == true) throw CancellationException("会话正在切换")
+    }
+
+    /**
+     * P0-1 carriedIsStale 判定：
+     * 检查本次请求发出时携带的 [sentClearanceFp] 是否已落后于 WebView 当前权威 cf_clearance 指纹。
+     * 若在途期间另一条并发请求或 WebView 已刷新凭据（且新凭据未被判死），返回 true 触发免 WebView 换值重放。
+     */
+    private suspend fun isCarriedClearanceStale(sentClearanceFp: String): Boolean {
+        val store = sessionStore ?: return false
+        if (store.sessionChanging) return false
+        val currentClearance = withContext(Dispatchers.Main) {
+            store.syncFromWebView()[Config.CF_CLEARANCE_COOKIE]?.takeIf { it.isNotBlank() }
+        } ?: return false
+        val currentFp = NetDiagnostics.fingerprint(currentClearance)
+        return currentFp != "-" &&
+            currentFp != sentClearanceFp &&
+            !store.isClearanceChallenged(currentClearance)
+    }
+
+    private suspend fun request(path: String, burst: Boolean = false, present: Boolean = true): String {
+        try {
+            return pacedGet(path, burst, present, allow429Challenge = true)
+        } catch (challenge: NeedsInteractiveVerification) {
+            // 对齐 v1.3.1 & P0-1/P0-3：撞盾先在隐藏 WebView 里按当前出口静默重签 cf_clearance（带锁内去重合并），成功再重试一次。
+            // 换代理/切直连后凭据与出口不一致时，这一步让第一个被挑战的请求就把凭据换掉，用户无感。
+            // 必须在串行闸门外做：静默过盾最长 30 秒，占着闸门会把所有 GET 堵死。
+            if (!silentRevalidateForGet(path, challenge.failedClearanceFp)) {
+                if (challenge.isFrom429) {
+                    throw enterRateLimitCooldown(path, null, cfChallenge = true)
                 }
-                else -> throw HttpStatusException(result.status, result.body.take(120))
+                throw challenge
+            }
+            return try {
+                pacedGet(path, burst, present, allow429Challenge = false)
+            } catch (retryChallenge: NeedsInteractiveVerification) {
+                // P0-4: CLEARED 后重放立撞 403 -> 判定为 cf_clearance 对 OkHttp 通道无效（典型：分应用代理/双栈出口不一致）
+                // 静默过盾进入 60s 熔断，避免后续请求反复空转重载 WebView；仅对前台 GET (present=true) 尝试单次切浏览器栈重放。
+                getRevalidateBlockedUntil = maxOf(
+                    getRevalidateBlockedUntil,
+                    SystemClock.elapsedRealtime() + CLEARANCE_MISMATCH_COOLDOWN_MS,
+                )
+                diagnostics.log(
+                    "静默过盾后重放仍被挑战(sent=${retryChallenge.failedClearanceFp})，判定凭据与 OkHttp 出口不匹配，" +
+                        "熔断静默过盾 ${CLEARANCE_MISMATCH_COOLDOWN_MS / 1_000L}s: $path",
+                )
+                if (present) {
+                    val primary = transportProvider()
+                    val fallback = fallbackTransportProvider?.invoke()?.takeIf { it.name != primary.name }
+                    if (fallback != null && fallback.isReady()) {
+                        diagnostics.log("前台 GET 尝试单次切换 ${fallback.name} 兜底重放: $path")
+                        val fbResult = fallback.getWithoutRevalidate(path, present = true)
+                        diagnostics.recordStatus(fallback.name, fbResult.status, path)
+                        if (fbResult.status in 200..299) {
+                            return fbResult.body
+                        }
+                    }
+                }
+                throw retryChallenge
             }
         }
-        @Suppress("UNREACHABLE_CODE")
-        error("unreachable")
     }
 
-    private suspend fun throttle(burst: Boolean = false) {
-        val interval = if (burst) Config.BURST_REQUEST_INTERVAL_MS else Config.MIN_REQUEST_INTERVAL_MS
-        val wait = interval - (SystemClock.elapsedRealtime() - lastRequestAt)
-        if (wait > 0) delay(wait)
+    /**
+     * 前台 GET 直接走读轨道（多账号测试分支实测又快又稳，不额外加间隔）。
+     * 后台静默 GET（摘要预取、新话题探测、静默未读）全进程串行、相邻至少 1 秒：
+     * 后台批量吃满读轨道会出现秒级连拉 /t/{id}/1.json，被 CF 判为爬取而挑战。
+     */
+    private suspend fun pacedGet(
+        path: String,
+        burst: Boolean,
+        present: Boolean,
+        allow429Challenge: Boolean = true,
+    ): String {
+        if (present) return dispatchGet(path, burst, present, allow429Challenge)
+        return backgroundGetGate.withLock {
+            val wait = Config.MIN_REQUEST_INTERVAL_MS - (SystemClock.elapsedRealtime() - lastBackgroundGetAt)
+            if (wait > 0) delay(wait)
+            try {
+                dispatchGet(path, burst, present, allow429Challenge)
+            } finally {
+                lastBackgroundGetAt = SystemClock.elapsedRealtime()
+            }
+        }
     }
 
-    private companion object {
+    /** GET 撞盾后的静默过盾；失败后 [GET_REVALIDATE_FAILURE_COOLDOWN_MS] 内不再拉起，避免直连过不了盾时反复空等。 */
+    private suspend fun silentRevalidateForGet(path: String, failedClearanceFp: String = "-"): Boolean {
+        if (sessionStore?.sessionChanging == true || isRateLimitCoolingDown()) return false
+        val now = SystemClock.elapsedRealtime()
+        if (now < getRevalidateBlockedUntil) {
+            diagnostics.logThrottled("get-revalidate", "GET 撞盾: 静默过盾冷却中，直接交由上层处理")
+            return false
+        }
+        val generation = sessionStore?.sessionGeneration
+        val cleared = transportProvider().revalidate(path, failedClearanceFp)
+        if (generation != null && generation != sessionStore?.sessionGeneration) {
+            throw CancellationException("会话已切换")
+        }
+        if (cleared) {
+            // 重验证会重新加载首页，Discourse 可能借机换掉 _forum_session
+            cachedCsrfToken = null
+        } else {
+            getRevalidateBlockedUntil = SystemClock.elapsedRealtime() + GET_REVALIDATE_FAILURE_COOLDOWN_MS
+            diagnostics.log("GET 撞盾静默过盾未通过，${GET_REVALIDATE_FAILURE_COOLDOWN_MS / 60_000L} 分钟内不再静默重试: $path")
+        }
+        return cleared
+    }
+
+    private suspend fun dispatchGet(
+        path: String,
+        burst: Boolean,
+        present: Boolean,
+        allow429Challenge: Boolean = true,
+    ): String {
+        ensureRequestAllowed()
+        if (!present) throwIfRateLimitCoolingDown()
+        return getSemaphore.withPermit {
+            ensureRequestAllowed()
+            if (!present) throwIfRateLimitCoolingDown()
+            var attempt = 0
+            var staleReplayed = false
+            while (true) {
+                acquireGetSlot { !present && isRateLimitCoolingDown() }
+                if (!present) throwIfRateLimitCoolingDown()
+                // 前台请求发出后，后台计量池在静默窗口内让行，避免与用户操作贴脸叠加
+                if (present) ApiQuotaPool.markForeground()
+                val transport = transportProvider()
+                val result = try {
+                    transport.get(path, present = present)
+                } finally {
+                    // 时间戳已在 acquireGetSlot 记录
+                }
+                diagnostics.recordStatus(transport.name, result.status, path)
+                when {
+                    result.status == 429 -> {
+                        val challenge429 = ChallengeDetector.isChallenge429(result.status, result.cfMitigated, result.body)
+                        if (challenge429 && allow429Challenge) {
+                            if (!staleReplayed && isCarriedClearanceStale(result.sentClearanceFp)) {
+                                staleReplayed = true
+                                diagnostics.log("429 CF 挑战携带过期凭据(sent=${result.sentClearanceFp})，换新值直接重放: $path")
+                                continue
+                            }
+                            sessionStore?.noteClearanceChallenged(result.sentClearanceFp)
+                            notify403OrChallenged("request $path 429-challenge")
+                            throw NeedsInteractiveVerification(
+                                "请求 $path 被 Cloudflare 速率挑战拦截",
+                                failedClearanceFp = result.sentClearanceFp,
+                                isFrom429 = true,
+                            )
+                        }
+                        val cfChallenge = challenge429 || isCfChallengeBody(result.body)
+                        val cooldownEx = enterRateLimitCooldown(
+                            path, result.retryAfterSeconds, cfChallenge = cfChallenge,
+                        )
+                        val waitSec = result.retryAfterSeconds ?: ((attempt + 1) * 2L)
+                        if (present && !cfChallenge && attempt < MAX_RETRIES && waitSec in 1L..AUTO_RETRY_MAX_WAIT_SECONDS) {
+                            diagnostics.log("前台请求 429 自动等待 ${waitSec}s 后重放(${attempt + 1}/$MAX_RETRIES): $path")
+                            delay(waitSec * 1_000L)
+                            attempt++
+                        } else {
+                            throw cooldownEx
+                        }
+                    }
+                    result.challenged -> {
+                        if (!staleReplayed && isCarriedClearanceStale(result.sentClearanceFp)) {
+                            staleReplayed = true
+                            diagnostics.log("检测到携带过期 cf_clearance 撞盾(sent=${result.sentClearanceFp})，跳过 WebView 直接换新值重放: $path")
+                            continue
+                        }
+                        sessionStore?.noteClearanceChallenged(result.sentClearanceFp)
+                        notify403OrChallenged("request $path challenged")
+                        throw NeedsInteractiveVerification(
+                            "请求 $path 被 Cloudflare 挑战拦截",
+                            failedClearanceFp = result.sentClearanceFp,
+                        )
+                    }
+                    result.status == 403 -> {
+                        notify403OrChallenged("request $path 403")
+                        throw HttpStatusException(result.status, result.body.take(120))
+                    }
+                    result.status in 200..299 -> return result.body
+                    // 连不上服务器时重试只是让用户多等十几秒,直接报错;5xx 才是值得重试的服务端抖动。
+                    result.status == 0 -> throw NetworkTimeoutException()
+                    result.status >= 500 && attempt < MAX_RETRIES -> {
+                        delay(BACKOFF_BASE_MS shl attempt)
+                        attempt++
+                    }
+                    else -> throw HttpStatusException(result.status, result.body.take(120))
+                }
+            }
+            @Suppress("UNREACHABLE_CODE")
+            error("unreachable")
+        }
+    }
+
+    companion object {
+        /** 策略二：读请求 (GET) 3 秒滑动窗口上限 6 次（对齐 fluxdo 2req/s），相邻请求最小错峰间隔 120ms。 */
+        const val GET_WINDOW_MS = 3_000L
+        const val GET_WINDOW_MAX_REQUESTS = 6
+        const val MIN_GET_SPACING_MS = 120L
+
+        // ── 进程级读写双轨调度器 (策略二核心) ──
+        // 1. 读轨道 (GET)：全应用进程共享，maxConcurrent = 3（对齐 fluxdo），滑动窗口限速 6次/3秒
+        val getSemaphore = Semaphore(3)
+        val getRateLimiterLock = Mutex()
+        val getRequestTimestamps = ArrayDeque<Long>(6)
+
+        // 2. 写轨道 (POST/PUT/DELETE)：全应用进程共享，maxConcurrent = 1 绝对串行
+        val postGate = Mutex()
+        @Volatile var lastPostRequestAt = 0L
+
+        /** 阅读进度已上报楼层缓存的最大容量（话题数），超出时按 LRU 自动淘汰，避免内存膨胀。 */
+        private const val MAX_REPORTED_TOPICS_CACHE = 200
+
+        // 3. Timings 阅读进度全进程共享上报跟踪与去重缓存（按 (userId, topicId) 隔离，LRU 淘汰）
+        val inFlightTimingsTopics = ConcurrentHashMap.newKeySet<Long>()
+        private val reportedPostsLock = Any()
+        private val reportedPostsMap = object : LinkedHashMap<Pair<Long, Long>, MutableSet<Int>>(128, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Pair<Long, Long>, MutableSet<Int>>?): Boolean {
+                return size > MAX_REPORTED_TOPICS_CACHE
+            }
+        }
+
+        fun isTopicPostsReported(userId: Long, topicId: Long, numbers: List<Int>): Boolean {
+            synchronized(reportedPostsLock) {
+                val set = reportedPostsMap[userId to topicId] ?: return false
+                return numbers.all { it in set }
+            }
+        }
+
+        fun recordTopicPostsReported(userId: Long, topicId: Long, numbers: List<Int>) {
+            synchronized(reportedPostsLock) {
+                val key = userId to topicId
+                val set = reportedPostsMap.getOrPut(key) { HashSet() }
+                set.addAll(numbers)
+            }
+        }
+
+        fun clearTimingsCache(userId: Long? = null) {
+            synchronized(reportedPostsLock) {
+                if (userId == null) {
+                    reportedPostsMap.clear()
+                } else {
+                    reportedPostsMap.keys.removeAll { it.first == userId }
+                }
+            }
+            inFlightTimingsTopics.clear()
+        }
+
+        /** 后台静默 GET 的全进程串行闸门与上一次完成时间。 */
+        val backgroundGetGate = Mutex()
+        @Volatile var lastBackgroundGetAt = 0L
+
+        /** GET 静默过盾失败后的冷却截止时间（elapsedRealtime）。 */
+        @Volatile var getRevalidateBlockedUntil = 0L
+        const val GET_REVALIDATE_FAILURE_COOLDOWN_MS = 2 * 60_000L
+        /** P0-4: 静默过盾成功但新 cf_clearance 对 OkHttp 仍立撞 403（出口/栈不一致）时的熔断时长。 */
+        const val CLEARANCE_MISMATCH_COOLDOWN_MS = 60_000L
+
+        /** 后台静默预取撞盾后的全进程退避截止时间（elapsedRealtime）。 */
+        @Volatile var silentPrefetchBackoffUntil = 0L
+        const val SILENT_PREFETCH_BACKOFF_MS = 2 * 60_000L
+
+        /** 同一应用进程内的所有仓库实例共用一段 429 冷却期。 */
+        val rateLimitLock = Any()
+        var rateLimitedUntil = 0L
+
+        fun isRateLimitCoolingDown(): Boolean = rateLimitRemainingMs() > 0L
+
+        fun rateLimitRemainingMs(): Long = synchronized(rateLimitLock) {
+            (rateLimitedUntil - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
+        }
+
+        fun enterRateLimitCooldown(
+            path: String,
+            retryAfterSeconds: Long? = null,
+            sessionStore: SessionStore? = null,
+            cfChallenge: Boolean = false,
+        ): Long {
+            val nowElapsed = SystemClock.elapsedRealtime()
+            val nowWall = System.currentTimeMillis()
+            val cooldownMs = HttpHeaderUtils.rateLimitCooldownMs(retryAfterSeconds, RATE_LIMIT_COOLDOWN_MS)
+            val remaining = synchronized(rateLimitLock) {
+                rateLimitedUntil = maxOf(rateLimitedUntil, nowElapsed + cooldownMs)
+                sessionStore?.setRateLimitedUntil(nowWall + cooldownMs)
+                (rateLimitedUntil - nowElapsed).coerceAtLeast(0L)
+            }
+            ApiQuotaPool.onServerRateLimited(remaining, cfChallenge)
+            return remaining
+        }
+
+        /** 429 响应体是 CF 质询页（Just a moment）而非 Discourse 的 JSON 限流提示。 */
+        fun isCfChallengeBody(body: String): Boolean {
+            val head = body.take(4_000)
+            return head.contains("challenge-platform") || head.contains("Just a moment", ignoreCase = true)
+        }
         const val MAX_RETRIES = 2
         const val BACKOFF_BASE_MS = 1_000L
+        /** 前台请求遇到 429 时允许静默自动等待重放的最大秒数（对齐 fluxdo）。 */
+        const val AUTO_RETRY_MAX_WAIT_SECONDS = 15L
+        /** 429 后后台任务默认静默退让时长（无 Retry-After 提示时的兜底值）。 */
+        const val RATE_LIMIT_COOLDOWN_MS = 10_000L
+        const val KEY_BLOCKED_USERS = "local_blocked_users_json"
 
         /** 通知分区一次加载的目标条数。 */
         const val PAGE_TARGET = 20
@@ -1652,5 +3841,51 @@ class TopicRepository(
         const val MIN_READ_TIME_MS = 1_000L
         const val MAX_POST_TIME_MS = 60_000L
         const val MAX_TOPIC_TIME_MS = 30 * 60 * 1_000L
+
+        /** 申请读轨道 (GET) 令牌，强制执行滑动窗口限频与防尖峰错峰 */
+        suspend fun acquireGetSlot(isCoolingDown: () -> Boolean) {
+            while (true) {
+                if (isCoolingDown()) {
+                    val remaining = synchronized(rateLimitLock) {
+                        (rateLimitedUntil - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
+                    }
+                    throw RateLimitException(remaining)
+                }
+                var waitMs = 0L
+                getRateLimiterLock.withLock {
+                    val now = SystemClock.elapsedRealtime()
+                    while (getRequestTimestamps.isNotEmpty() && now - getRequestTimestamps.first() >= GET_WINDOW_MS) {
+                        getRequestTimestamps.removeFirst()
+                    }
+                    if (getRequestTimestamps.size >= GET_WINDOW_MAX_REQUESTS) {
+                        val oldest = getRequestTimestamps.first()
+                        waitMs = GET_WINDOW_MS - (now - oldest) + 10L
+                    } else {
+                        val lastReq = getRequestTimestamps.lastOrNull() ?: 0L
+                        val elapsedSinceLast = now - lastReq
+                        if (elapsedSinceLast < MIN_GET_SPACING_MS) {
+                            waitMs = MIN_GET_SPACING_MS - elapsedSinceLast
+                        } else {
+                            getRequestTimestamps.addLast(now)
+                            return
+                        }
+                    }
+                }
+                if (waitMs > 0L) {
+                    delay(waitMs)
+                }
+            }
+        }
+
+        /** 写轨道 (POST) 串行安全节流 */
+        suspend fun throttlePost(burst: Boolean = false) {
+            val interval = if (burst) Config.BURST_REQUEST_INTERVAL_MS else Config.MIN_REQUEST_INTERVAL_MS
+            val wait = interval - (SystemClock.elapsedRealtime() - lastPostRequestAt)
+            if (wait > 0) delay(wait)
+        }
+
+        fun markPostCompleted() {
+            lastPostRequestAt = SystemClock.elapsedRealtime()
+        }
     }
 }

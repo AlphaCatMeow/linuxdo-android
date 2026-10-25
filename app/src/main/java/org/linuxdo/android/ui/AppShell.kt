@@ -26,6 +26,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.material3.Text
+import androidx.activity.compose.BackHandler
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -43,6 +44,10 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -52,8 +57,15 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.repeatOnLifecycle
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import androidx.compose.foundation.layout.Row
+import androidx.compose.material3.TextButton
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.sp
+import org.linuxdo.android.ui.screen.openExternal
 import org.linuxdo.android.net.BrowserSession
 import org.linuxdo.android.Config
+import org.linuxdo.android.data.HomeFeedType
 import org.linuxdo.android.data.NotificationPollInterval
 import org.linuxdo.android.data.compactCategoryGroups
 import org.linuxdo.android.ui.design.IosActivityIndicator
@@ -69,6 +81,17 @@ import org.linuxdo.android.ui.screen.SearchScreen
 import org.linuxdo.android.ui.screen.TopicListUiState
 import org.linuxdo.android.ui.screen.LoginScreen
 import org.linuxdo.android.ui.screen.categoryLevelOf
+import org.linuxdo.android.ui.screen.HistoryScreen
+import org.linuxdo.android.ui.screen.ConnectWebSheet
+import org.linuxdo.android.ui.screen.InAppBrowserSheet
+import org.linuxdo.android.ui.screen.openExternal
+import org.linuxdo.android.ui.screen.ChatListScreen
+import org.linuxdo.android.ui.screen.ChatRoomScreen
+import org.linuxdo.android.ui.screen.FollowListScreen
+import org.linuxdo.android.ui.screen.BlacklistScreen
+import org.linuxdo.android.ui.screen.UserCardBottomSheet
+import org.linuxdo.android.ui.screen.UserProfileScreen
+import org.linuxdo.android.ui.screen.PrivateMessageComposeSheet
 import org.linuxdo.android.ui.nav.MainTab
 import org.linuxdo.android.ui.nav.TabBar
 
@@ -85,7 +108,9 @@ fun AppShell(viewModel: MainViewModel, browser: BrowserSession) {
     val updateState by viewModel.updateState.collectAsStateWithLifecycle()
     // 全局 WebView 在 CF 验证时显示；登录人机验证使用独立对话框。
     val showWeb = state.screen == Screen.Verify
+    BackHandler(enabled = showWeb) { viewModel.cancelVerification() }
     val showWebLoginModal = state.screen == Screen.Login && loginUiState.showWebLoginDialog
+    val accountsState by viewModel.accounts.collectAsStateWithLifecycle()
     val themeMode by viewModel.themeMode.collectAsStateWithLifecycle()
     val lifecycle = LocalLifecycleOwner.current.lifecycle
 
@@ -95,33 +120,49 @@ fun AppShell(viewModel: MainViewModel, browser: BrowserSession) {
     LaunchedEffect(lifecycle, state.screen, state.latest.initialLoading, notificationPollInterval, customRealtimeSeconds) {
         if (state.screen == Screen.List && !state.latest.initialLoading) lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
             viewModel.refreshUnread(force = true)
+            // 前台未读角标与后台通知设置解耦：可见时始终按 10 秒基线轮询，
+            // 只有“实时”且自定义间隔更短时才加快，下限 5 秒避免触发限频。
             val pollDelayMs = when (notificationPollInterval) {
-                NotificationPollInterval.REALTIME -> (customRealtimeSeconds * 1000L).coerceAtLeast(1000L)
-                NotificationPollInterval.OFF -> Config.UNREAD_POLL_INTERVAL_MS
-                else -> (notificationPollInterval.seconds * 1000L).coerceIn(5_000L, Config.UNREAD_POLL_INTERVAL_MS)
+                NotificationPollInterval.REALTIME ->
+                    (customRealtimeSeconds * 1000L).coerceIn(5_000L, Config.UNREAD_POLL_INTERVAL_MS)
+                else -> Config.UNREAD_POLL_INTERVAL_MS
             }
             while (true) {
-                delay(pollDelayMs)
+                // 限流冷却期间直接睡到解封，不再每 10 秒空转一次
+                delay(viewModel.nextUnreadPollDelayMs(pollDelayMs))
                 viewModel.refreshUnread()
             }
         }
     }
 
+    var verifyPageState by remember(showWeb) { mutableStateOf(BrowserSession.VerifyPageState.LOADING) }
     LaunchedEffect(showWeb) {
         if (showWeb) {
+            verifyPageState = BrowserSession.VerifyPageState.LOADING
+            launch {
+                // 验证页未确认需要人工交互前用原生加载层遮住 WebView；主框架报错（DoH 直连下连不上）
+                // 或数秒仍未加载完则换成异常提示。
+                while (showWeb) {
+                    verifyPageState = viewModel.verifyPageState()
+                    delay(150)
+                }
+            }
             while (true) {
-                delay(1_000)
+                delay(300)
                 viewModel.pollVerification()
+                verifyPageState = viewModel.verifyPageState()
             }
         }
     }
+    val readSyncVerifyBanner by viewModel.readSyncVerifyBanner.collectAsStateWithLifecycle()
 
+    val skinPreset by viewModel.skinPreset.collectAsStateWithLifecycle()
     val dark = when (themeMode) {
         ThemeMode.System -> isSystemInDarkTheme()
         ThemeMode.Light -> false
         ThemeMode.Dark -> true
     }
-    IosTheme(dark = dark) {
+    IosTheme(dark = dark, skinPreset = skinPreset) {
         Box(
             Modifier
                 .fillMaxSize()
@@ -137,6 +178,18 @@ fun AppShell(viewModel: MainViewModel, browser: BrowserSession) {
 
             if (state.screen == Screen.Boot) BootScreen()
 
+            if (readSyncVerifyBanner && state.screen == Screen.List) {
+                ReadSyncVerifyBanner(
+                    onVerify = viewModel::openReadSyncVerification,
+                    onDismiss = viewModel::dismissReadSyncVerifyBanner,
+                    dark = dark,
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .padding(top = IosMetrics.navBarHeight + 4.dp, start = 12.dp, end = 12.dp)
+                        .zIndex(1f),
+                )
+            }
+
             // 原生登录页面。
             if (state.screen == Screen.Login) {
                 LoginScreen(
@@ -150,6 +203,7 @@ fun AppShell(viewModel: MainViewModel, browser: BrowserSession) {
                     onStartWebAuth = viewModel::startWebAuth,
                     onDismissRiskControl = viewModel::dismissRiskControlDialog,
                     onCancelWebAuth = viewModel::cancelWebAuth,
+                    onCancel = if (viewModel.canCancelAddAccount()) viewModel::cancelAddAccount else null,
                 )
             }
 
@@ -171,15 +225,47 @@ fun AppShell(viewModel: MainViewModel, browser: BrowserSession) {
                             Modifier.fillMaxSize()
                         },
                     ) {
-                        if (showWeb) WebTopBar(state.screen)
                         val context = LocalContext.current
-                        AndroidView(
-                            factory = { browser.attach(context) },
-                            onRelease = { browser.detach() },
+                        if (showWeb) {
+                            WebTopBar(state.screen, viewModel::cancelVerification, viewModel::retryVerification)
+                        }
+                        val webReady = !showWeb || verifyPageState == BrowserSession.VerifyPageState.READY
+                        Box(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .weight(1f),
-                        )
+                                .weight(1f)
+                                .clipToBounds(),
+                        ) {
+                            AndroidView(
+                                factory = { browser.attach(context) },
+                                onRelease = { browser.detach() },
+                                // 保持 View.VISIBLE 让 Chromium/Turnstile 正常跑帧，未就绪或已回源 404 时用 alpha=0f + 原生遮罩层挡住画面
+                                update = { view ->
+                                    if (view.visibility != android.view.View.VISIBLE) {
+                                        view.visibility = android.view.View.VISIBLE
+                                    }
+                                    val targetAlpha = if (webReady) 1f else 0f
+                                    if (view.alpha != targetAlpha) view.alpha = targetAlpha
+                                },
+                                modifier = Modifier.fillMaxSize(),
+                            )
+                            if (!webReady) {
+                                VerifyLoadingLayer(
+                                    stalled = verifyPageState == BrowserSession.VerifyPageState.STALLED,
+                                    onRetry = viewModel::retryVerification,
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .background(IosTheme.colors.groupedBackground)
+                                        .pointerInput(Unit) {
+                                            awaitPointerEventScope {
+                                                while (true) {
+                                                    awaitPointerEvent()
+                                                }
+                                            }
+                                        },
+                                )
+                            }
+                        }
                     }
                 }
             }
@@ -202,6 +288,84 @@ fun AppShell(viewModel: MainViewModel, browser: BrowserSession) {
                     onDismiss = viewModel::dismissUpdateDialog,
                 )
             }
+        }
+    }
+}
+
+/** 阅读同步被 CF 风控时的提示条：点击进入验证页，关闭则 10 分钟内不再提示。 */
+@Composable
+private fun ReadSyncVerifyBanner(
+    onVerify: () -> Unit,
+    onDismiss: () -> Unit,
+    dark: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    val warnBg = if (dark) Color(0xFF3A2E12) else Color(0xFFFEF3C7)
+    val warnText = if (dark) Color(0xFFFDE68A) else Color(0xFF92400E)
+    val warnBtn = if (dark) Color(0xFFF59E0B) else Color(0xFFB45309)
+
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .background(warnBg)
+            .clickable(onClickLabel = "进行安全验证", onClick = onVerify)
+            .padding(start = 14.dp, end = 4.dp, top = 8.dp, bottom = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = "阅读进度同步触发风控，需要完成 Cloudflare 安全验证",
+            color = warnText,
+            fontSize = 13.sp,
+            lineHeight = 18.sp,
+            modifier = Modifier.weight(1f),
+        )
+        TextButton(onClick = onVerify) {
+            Text("去验证", fontSize = 13.sp, color = warnBtn, fontWeight = FontWeight.Medium)
+        }
+        TextButton(onClick = onDismiss) {
+            Text("忽略", fontSize = 13.sp, color = warnText)
+        }
+    }
+}
+
+/** 验证页加载层：加载中显示转圈，加载异常时提示检查网络或代理。 */
+@Composable
+private fun VerifyLoadingLayer(
+    stalled: Boolean,
+    onRetry: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Column(
+        modifier = modifier.padding(horizontal = 32.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = androidx.compose.foundation.layout.Arrangement.Center,
+    ) {
+        if (stalled) {
+            Text(
+                text = "页面加载异常",
+                style = IosTheme.type.navTitle,
+                color = IosTheme.colors.label,
+            )
+            Text(
+                text = "请检查网络或代理后重试\nDoH 直连下验证页可能无法打开",
+                color = IosTheme.colors.secondaryLabel,
+                fontSize = 14.sp,
+                lineHeight = 20.sp,
+                textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                modifier = Modifier.padding(top = 8.dp),
+            )
+            TextButton(onClick = onRetry, modifier = Modifier.padding(top = 12.dp)) {
+                Text("重试", fontSize = 15.sp, fontWeight = FontWeight.Medium)
+            }
+        } else {
+            IosActivityIndicator(diameter = 28.dp)
+            Text(
+                text = "正在连接安全验证服务…",
+                color = IosTheme.colors.secondaryLabel,
+                fontSize = 14.sp,
+                modifier = Modifier.padding(top = 12.dp),
+            )
         }
     }
 }
@@ -319,11 +483,24 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
     val categoryTopics by viewModel.categoryTopics.collectAsStateWithLifecycle()
     val userTopicStates by viewModel.userTopicStates.collectAsStateWithLifecycle()
     val search by viewModel.search.collectAsStateWithLifecycle()
+    val searchHistory by viewModel.searchHistory.collectAsStateWithLifecycle()
     val profile by viewModel.profile.collectAsStateWithLifecycle()
+    val userBadges by viewModel.userBadges.collectAsStateWithLifecycle()
+    val isUserBadgesLoading by viewModel.isUserBadgesLoading.collectAsStateWithLifecycle()
     val notificationFilter by viewModel.notificationFilter.collectAsStateWithLifecycle()
     val composer by viewModel.composer.collectAsStateWithLifecycle()
     val topicCreator by viewModel.topicCreator.collectAsStateWithLifecycle()
     val drafts by viewModel.drafts.collectAsStateWithLifecycle()
+    val accountState by viewModel.accounts.collectAsStateWithLifecycle()
+    val history by viewModel.history.collectAsStateWithLifecycle()
+    val userCard by viewModel.userCard.collectAsStateWithLifecycle()
+    val followList by viewModel.followList.collectAsStateWithLifecycle()
+    val trustReport by viewModel.trustReport.collectAsStateWithLifecycle()
+    val ldcState by viewModel.ldcState.collectAsStateWithLifecycle()
+    val cdkScoreState by viewModel.cdkScore.collectAsStateWithLifecycle()
+    val chat by viewModel.chat.collectAsStateWithLifecycle()
+    val skinPreset by viewModel.skinPreset.collectAsStateWithLifecycle()
+    val userRepliesStates by viewModel.userRepliesStates.collectAsStateWithLifecycle()
     val topicSortOrder by viewModel.topicSortOrder.collectAsStateWithLifecycle()
     val topicSortAscending by viewModel.topicSortAscending.collectAsStateWithLifecycle()
     val floatingBallEnabled by viewModel.floatingBallEnabled.collectAsStateWithLifecycle()
@@ -333,6 +510,11 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
     val floatingBallOnRight by viewModel.floatingBallOnRight.collectAsStateWithLifecycle()
     val treeView by viewModel.treeView.collectAsStateWithLifecycle()
     val syncReadProgress by viewModel.syncReadProgress.collectAsStateWithLifecycle()
+    val showUnreadDot by viewModel.showUnreadDot.collectAsStateWithLifecycle()
+    val unreadDotPosition by viewModel.unreadDotPosition.collectAsStateWithLifecycle()
+    val showTopicUnreadDot by viewModel.showTopicUnreadDot.collectAsStateWithLifecycle()
+    val topicUnreadDotPosition by viewModel.topicUnreadDotPosition.collectAsStateWithLifecycle()
+    val isBottomBarVisible by viewModel.isBottomBarVisible.collectAsStateWithLifecycle()
     val themeMode by viewModel.themeMode.collectAsStateWithLifecycle()
     val updateState by viewModel.updateState.collectAsStateWithLifecycle()
     val autoRefreshIncoming by viewModel.autoRefreshIncoming.collectAsStateWithLifecycle()
@@ -349,44 +531,72 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
     val selectedDohServerUrl by viewModel.selectedDohServerUrl.collectAsStateWithLifecycle()
     val dohAutoFailover by viewModel.dohAutoFailover.collectAsStateWithLifecycle()
     val dohAutoOptimize by viewModel.dohAutoOptimize.collectAsStateWithLifecycle()
+    val dohForceOverProxy by viewModel.dohForceOverProxy.collectAsStateWithLifecycle()
     val dohLatencies by viewModel.dohLatencies.collectAsStateWithLifecycle()
     val dohSummaries by viewModel.dohSummaries.collectAsStateWithLifecycle()
     val isTestingAllDoh by viewModel.isTestingAllDoh.collectAsStateWithLifecycle()
+    val isSelfHealing by viewModel.isSelfHealing.collectAsStateWithLifecycle()
+    val feedGraphicMode by viewModel.feedGraphicMode.collectAsStateWithLifecycle()
+    val feedDisplayMode by viewModel.feedDisplayMode.collectAsStateWithLifecycle()
+    val blockedUsers by viewModel.blockedUsers.collectAsStateWithLifecycle()
+    val blockedUsernameSet = remember(blockedUsers) { blockedUsers.map { it.username.lowercase() }.toSet() }
 
     LaunchedEffect(pendingNotificationTarget) {
         val target = pendingNotificationTarget ?: return@LaunchedEffect
         selected = MainTab.Latest
-        stacks.getValue(MainTab.Latest).push(Route.TopicDetail(target.topicId, "", target.postNumber))
+        val stack = stacks.getValue(MainTab.Latest)
+        val currentRoute = stack.current
+        if (currentRoute is Route.TopicDetail && currentRoute.topicId == target.topicId) {
+            viewModel.loadTopic(
+                target.topicId,
+                postNumber = target.postNumber,
+                resumePostNumber = viewModel.resolveResumePostNumber(target.topicId, target.postNumber),
+                fromNotification = true,
+            )
+        } else {
+            stack.push(Route.TopicDetail(target.topicId, "", target.postNumber))
+        }
         viewModel.clearPendingNotificationTarget()
     }
 
+    val context = LocalContext.current
     val browsing = state.screen == Screen.List
     var detailOverlay by rememberSaveable { mutableStateOf(false) }
+    var showConnectSheet by rememberSaveable { mutableStateOf(false) }
+    var privateMessageRecipient by rememberSaveable { mutableStateOf<String?>(null) }
+    var globalBrowserUrl by rememberSaveable { mutableStateOf<String?>(null) }
     val openNotifications = {
         if (stack.current != Route.Notifications) stack.push(Route.Notifications)
         viewModel.loadProfile(org.linuxdo.android.data.ProfileSection.Notifications, refresh = true)
         viewModel.refreshUnread(force = true)
     }
 
-    Column(Modifier.fillMaxSize()) {
-        Box(Modifier.weight(1f)) {
+    Box(Modifier.fillMaxSize()) {
+        Box(Modifier.fillMaxSize()) {
             holder.SaveableStateProvider(selected.name) {
                 key(selected) {
                     IosNavHost(stack, interactive = browsing && !topicCreator.open) { route ->
                         val active = browsing && stack.current == route
                         LaunchedEffect(route, active) {
                             if (active) when (route) {
-                                is Route.TopicDetail -> viewModel.loadTopic(route.topicId, postNumber = route.postNumber)
+                                is Route.TopicDetail -> viewModel.loadTopic(
+                                    route.topicId,
+                                    postNumber = route.postNumber,
+                                    resumePostNumber = viewModel.resolveResumePostNumber(route.topicId, route.postNumber),
+                                )
                                 Route.CategoryList -> viewModel.loadCategories()
                                 is Route.CategoryTopics -> {
                                     if (!categories.loaded && !categories.loading) viewModel.loadCategories()
                                     viewModel.loadCategory(route.categoryId, route.slug)
                                 }
                                 is Route.UserTopics -> viewModel.loadUserTopics(route.username, route.isBookmark)
+                                is Route.UserReplies -> viewModel.loadUserReplies(route.username, filter = route.filter)
                                 Route.Drafts -> {
                                     if (!categories.loaded && !categories.loading) viewModel.loadCategories()
                                     viewModel.loadDrafts(refresh = true)
                                 }
+                                Route.Chat -> viewModel.loadChatChannels()
+                                is Route.FollowList -> viewModel.loadFollowing(route.username)
                                 else -> Unit
                             }
                         }
@@ -394,12 +604,36 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                             Route.TopicList -> TopicListScreen(
                                 title = state.homeFeed.label,
                                 state = state.latest,
+                                feedGraphicMode = feedGraphicMode,
+                                feedDisplayMode = feedDisplayMode,
+                                showTopicUnreadDot = showTopicUnreadDot,
+                                topicUnreadDotPosition = topicUnreadDotPosition,
+                                blockedUsernames = blockedUsernameSet,
                                 onRefresh = viewModel::refreshLatest,
                                 onLoadMore = viewModel::loadMoreLatest,
-                                onOpenTopic = { topic -> stack.push(Route.TopicDetail(topic.id, topic.title)) },
+                                onOpenTopic = { topic ->
+                                    viewModel.recordTopicListOpen(topic.id, topic.postsCount)
+                                    stack.push(Route.TopicDetail(topic.id, topic.title))
+                                },
+                                onOpenUser = { username, primaryAvatarUrl, staticAvatarUrl, displayName ->
+                                    viewModel.openUserCard(username, primaryAvatarUrl, staticAvatarUrl, displayName)
+                                },
+                                onPrefetchExcerpt = viewModel::prefetchTopicExcerpt,
+                                onPrefetchExcerpts = { topics ->
+                                    val query = when (state.homeFeed) {
+                                        HomeFeedType.Latest -> "in:first order:latest"
+                                        HomeFeedType.Hot -> "in:first order:activity"
+                                        HomeFeedType.Unread -> "in:first order:activity"
+                                        HomeFeedType.Posted -> "in:first order:latest"
+                                    }
+                                    viewModel.prefetchTopicExcerpts(topics, query)
+                                },
+                                onScrollBusyChanged = viewModel::setTopicListScrollBusy,
+                                onBarsVisibilityChange = viewModel::setBottomBarVisible,
+                                barsVisible = isBottomBarVisible,
                                 active = active,
                                 scrollToTopRequest = scrollToTopRequest,
-                                trailing = { UnreadBell(state.unreadCount, openNotifications) },
+                                trailing = {},
                                 currentFeed = state.homeFeed,
                                 onFeedSelect = viewModel::switchHomeFeed,
                                 hasUnread = state.unreadCount > 0,
@@ -426,9 +660,13 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                 onNavigateToDrafts = { stack.push(Route.Drafts) },
                                 onNavigateToSearch = { selected = MainTab.Search },
                                 onNavigateToCategories = { selected = MainTab.Categories },
+                                onNavigateToHistory = { stack.push(Route.BrowsingHistory) },
+                                onNavigateToConnect = { showConnectSheet = true },
+                                onNavigateToChat = { stack.push(Route.Chat) },
                             )
 
                             is Route.TopicDetail -> {
+                                val resumePostNumber = viewModel.resolveResumePostNumber(route.topicId, route.postNumber)
                                 val lifecycleState by lifecycle.currentStateFlow.collectAsStateWithLifecycle()
                                 val isForeground = active && lifecycleState.isAtLeast(Lifecycle.State.RESUMED)
                                 LaunchedEffect(route.topicId, isForeground) {
@@ -445,17 +683,23 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                     title = route.title,
                                     state = details[route.topicId] ?: DetailUiState(loading = true),
                                     onBack = { stack.pop() },
-                                    onRetry = { viewModel.retryTopic(route.topicId, route.postNumber) },
+                                    onRetry = { viewModel.retryTopic(route.topicId, resumePostNumber) },
                                     onRefresh = { viewModel.refreshTopic(route.topicId) },
                                     onLoadMore = { viewModel.loadTopic(route.topicId, more = true) },
                                     onLoadPrevious = { viewModel.loadTopic(route.topicId, previous = true) },
-                                    initialPostNumber = route.postNumber,
+                                    initialPostNumber = resumePostNumber,
                                     onUnknownTag = { viewModel.diagnostics.log("未知 cooked 标签: $it") },
                                     treeView = treeView,
+                                    showUnreadDot = showUnreadDot,
+                                    unreadDotPosition = unreadDotPosition,
                                     onLoadReplies = { viewModel.loadReplies(route.topicId, it) },
                                     onReact = { postId, reaction -> viewModel.react(route.topicId, postId, reaction) },
                                     onBoost = { postId, raw -> viewModel.createBoost(route.topicId, postId, raw) },
                                     onDeleteBoost = { postId, boostId -> viewModel.deleteBoost(route.topicId, postId, boostId) },
+                                    onFlagBoost = { postId, boostId, reasonId, message ->
+                                        viewModel.flagBoost(route.topicId, postId, boostId, reasonId, message)
+                                    },
+                                    onOpenUser = viewModel::openUserCard,
                                     onRefreshPost = { viewModel.refreshPost(route.topicId, it) },
                                     onSolution = { viewModel.setSolution(route.topicId, it) },
                                     composer = composer,
@@ -473,10 +717,14 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                         stack.push(Route.TopicDetail(id, title, postNumber))
                                     },
                                     active = active,
-                                    trailing = { UnreadBell(state.unreadCount, openNotifications) },
+                                    trailing = {},
                                     onToggleOrder = { viewModel.toggleCommentOrder(route.topicId) },
                                     onPostsVisible = { viewModel.onPostsVisible(route.topicId, it) },
                                     onOverlayActive = { detailOverlay = it },
+                                    onSetFilterUser = { viewModel.setTopicAuthorFilter(route.topicId, it) },
+                                    onVotePoll = { postId, pollName, optionIds ->
+                                        viewModel.votePoll(route.topicId, postId, pollName, optionIds)
+                                    },
                                     onSetNotificationLevel = { viewModel.setTopicNotificationLevel(route.topicId, it) },
                                     signedIn = state.username != null,
                                     onToggleBookmark = { viewModel.toggleBookmark(route.topicId, it) },
@@ -485,6 +733,7 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                     onSubmitFlag = { postId, reasonId, message ->
                                         viewModel.submitFlag(route.topicId, postId, reasonId, message)
                                     },
+                                    blockedUsernames = blockedUsernameSet,
                                 )
                             }
                             Route.CategoryList -> {
@@ -499,15 +748,14 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                         stack.push(Route.TopicDetail(topicId, title, postNumber))
                                     },
                                     onOpenWebUrl = { url ->
-                                        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
-                                        runCatching { context.startActivity(intent) }
+                                        globalBrowserUrl = url
                                     },
                                     onSaveCustomSection = viewModel::saveCustomSection,
                                     onDeleteCustomSection = viewModel::deleteCustomSection,
                                     scrollToTopRequest = scrollToTopRequest,
                                     onSaveOrder = viewModel::saveCategoryOrder,
                                     onResetOrder = viewModel::resetCategoryOrder,
-                                    trailing = { UnreadBell(state.unreadCount, openNotifications) },
+                                    trailing = {},
                                 )
                             }
 
@@ -534,12 +782,33 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                 TopicListScreen(
                                     title = route.name,
                                     state = categoryTopics[route.categoryId] ?: TopicListUiState(),
+                                    feedGraphicMode = feedGraphicMode,
+                                    feedDisplayMode = feedDisplayMode,
+                                    showTopicUnreadDot = showTopicUnreadDot,
+                                    topicUnreadDotPosition = topicUnreadDotPosition,
+                                    blockedUsernames = blockedUsernameSet,
                                     onRefresh = { viewModel.loadCategory(route.categoryId, route.slug, refresh = true) },
                                     onLoadMore = { viewModel.loadCategory(route.categoryId, route.slug, more = true) },
-                                    onOpenTopic = { stack.push(Route.TopicDetail(it.id, it.title)) },
+                                    onOpenTopic = {
+                                        viewModel.recordTopicListOpen(it.id, it.postsCount)
+                                        stack.push(Route.TopicDetail(it.id, it.title))
+                                    },
+                                    onOpenUser = { username, primaryAvatarUrl, staticAvatarUrl, displayName ->
+                                        viewModel.openUserCard(username, primaryAvatarUrl, staticAvatarUrl, displayName)
+                                    },
+                                    onPrefetchExcerpt = viewModel::prefetchTopicExcerpt,
+                                    onPrefetchExcerpts = { topics ->
+                                        viewModel.prefetchTopicExcerpts(
+                                            topics,
+                                            "category:${route.slug} in:first order:latest",
+                                        )
+                                    },
+                                    onScrollBusyChanged = viewModel::setTopicListScrollBusy,
+                                    onBarsVisibilityChange = viewModel::setBottomBarVisible,
+                                    barsVisible = isBottomBarVisible,
                                     onBack = { stack.pop() },
                                     active = active,
-                                    trailing = { UnreadBell(state.unreadCount, openNotifications) },
+                                    trailing = {},
                                     onApplyIncoming = { viewModel.applyIncomingTopics(state.homeFeed, categoryId = route.categoryId) },
                                     categoryVariants = variants,
                                     currentCategoryId = route.categoryId,
@@ -571,32 +840,87 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                     onNavigateToDrafts = { stack.push(Route.Drafts) },
                                     onNavigateToSearch = { selected = MainTab.Search },
                                     onNavigateToCategories = { selected = MainTab.Categories },
+                                    onNavigateToHistory = { stack.push(Route.BrowsingHistory) },
+                                    onNavigateToConnect = { showConnectSheet = true },
+                                    onNavigateToChat = { stack.push(Route.Chat) },
                                 )
                             }
 
-                            Route.Search -> SearchScreen(search, viewModel::updateSearch, viewModel::loadMoreSearch,
-                                onOpenTopic = { stack.push(Route.TopicDetail(it.id, it.title)) },
-                                onOrder = viewModel::setSearchOrder, active = active,
+                            Route.Search -> SearchScreen(
+                                state = search,
+                                onQuery = viewModel::updateSearch,
+                                onLoadMore = viewModel::loadMoreSearch,
+                                onOpenTopic = {
+                                    viewModel.recordTopicListOpen(it.id, it.postsCount)
+                                    stack.push(Route.TopicDetail(it.id, it.title))
+                                },
+                                onOrder = viewModel::setSearchOrder,
+                                active = active,
                                 scrollToTopRequest = scrollToTopRequest,
-                                trailing = { UnreadBell(state.unreadCount, openNotifications) })
+                                trailing = {},
+                                searchHistory = searchHistory,
+                                onSelectHistory = { keyword ->
+                                    viewModel.updateSearch(keyword)
+                                    viewModel.addSearchHistory(keyword)
+                                },
+                                onClearHistory = viewModel::clearSearchHistory,
+                            )
 
                             Route.Profile -> ProfileScreen(state.username, profile, viewModel::loadProfile,
-                                onOpenTopic = { id, title, postNumber -> stack.push(Route.TopicDetail(id, title, postNumber)) },
+                                onOpenTopic = { id, title, postNumber ->
+                                    val currentRoute = stack.current
+                                    if (currentRoute is Route.TopicDetail && currentRoute.topicId == id) {
+                                        viewModel.loadTopic(
+                                            id,
+                                            postNumber = postNumber,
+                                            resumePostNumber = viewModel.resolveResumePostNumber(id, postNumber),
+                                        )
+                                    } else {
+                                        stack.push(Route.TopicDetail(id, title, postNumber))
+                                    }
+                                },
                                 onOpenUserTopics = { username, title, isBookmark ->
                                     stack.push(Route.UserTopics(username, title, isBookmark))
+                                },
+                                onOpenUserReplies = { username ->
+                                    stack.push(Route.UserReplies(username))
+                                },
+                                onOpenUserActions = { username, title, filter ->
+                                    stack.push(Route.UserReplies(username, title, filter))
                                 },
                                 draftCount = drafts.items.size.toString(),
                                 onOpenDrafts = { stack.push(Route.Drafts) },
                                 onDiagnostics = { stack.push(Route.Diagnostics) },
                                 onSettings = { stack.push(Route.Settings) },
+                                accountState = accountState,
+                                onRefreshAccounts = viewModel::refreshAccounts,
+                                onSwitchAccount = viewModel::switchAccount,
+                                onRemoveAccount = viewModel::removeAccount,
+                                onAddAccount = viewModel::addAccount,
+                                onOpenConnect = { showConnectSheet = true },
+                                onOpenHistory = { stack.push(Route.BrowsingHistory) },
+                                onOpenFollowing = { state.username?.let { stack.push(Route.FollowList(it)) } },
+                                onOpenChat = { stack.push(Route.Chat) },
+                                onOpenBlacklist = { stack.push(Route.Blacklist) },
+                                onOpenUser = { username, primaryAvatar, staticAvatar ->
+                                    stack.push(Route.UserProfile(username, primaryAvatar, staticAvatar))
+                                },
+                                onComposePrivateMessage = { recipient -> privateMessageRecipient = recipient },
                                 onLogout = viewModel::logout,
+                                userBadges = userBadges,
+                                isUserBadgesLoading = isUserBadgesLoading,
+                                onRefreshUserBadges = viewModel::loadUserBadges,
+                                cdkScore = cdkScoreState.score.takeIf {
+                                    cdkScoreState.username.equals(state.username, ignoreCase = true)
+                                },
+                                onLoadCdkScore = { viewModel.loadCdkScore() },
                                 active = active,
                                 onReadNotification = viewModel::readNotification,
                                 notificationFilter = notificationFilter,
                                 onNotificationFilter = viewModel::setNotificationFilter,
                                 unreadFilters = state.unreadFilters,
                                 scrollToTopRequest = scrollToTopRequest,
-                                trailing = { UnreadBell(state.unreadCount, openNotifications) })
+                                trailing = {})
 
                             Route.Drafts -> DraftsScreen(
                                 state = drafts,
@@ -613,7 +937,64 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                     }
                                 },
                                 onDeleteDraft = viewModel::deleteDraft,
-                                trailing = { UnreadBell(state.unreadCount, openNotifications) },
+                                trailing = {},
+                            )
+
+                            Route.BrowsingHistory -> HistoryScreen(
+                                entries = history.entries,
+                                query = history.query,
+                                loading = history.loading,
+                                onQueryChange = viewModel::setHistoryQuery,
+                                onClear = viewModel::clearHistory,
+                                onOpenTopic = { id, title, postNumber ->
+                                    stack.push(Route.TopicDetail(id, title, postNumber))
+                                },
+                                onBack = { stack.pop() },
+                            )
+
+                            Route.Chat -> ChatListScreen(
+                                state = chat,
+                                active = active,
+                                onLoad = { viewModel.loadChatChannels() },
+                                onRefresh = { viewModel.loadChatChannels(refresh = true) },
+                                onOpenChannel = { channel -> stack.push(Route.ChatRoom(channel.id, channel.displayTitle)) },
+                                onBack = if (stack.canPop) ({ stack.pop() }) else null,
+                            )
+
+                            is Route.ChatRoom -> {
+                                val lifecycleState by lifecycle.currentStateFlow.collectAsStateWithLifecycle()
+                                val roomActive = active && lifecycleState.isAtLeast(Lifecycle.State.RESUMED)
+                                val channel = chat.channels.firstOrNull { it.id == route.channelId }
+                                    ?: org.linuxdo.android.data.ChatChannelSummary(id = route.channelId, title = route.title)
+                                val currentUsername = accountState.accounts.firstOrNull { it.userId == accountState.activeUserId }?.username
+                                ChatRoomScreen(
+                                    channel = channel,
+                                    state = chat,
+                                    active = roomActive,
+                                    currentUsername = currentUsername,
+                                    onLoad = viewModel::loadChatRoom,
+                                    onSend = viewModel::sendChatMessage,
+                                    onUploadAttachment = viewModel::uploadChatAttachment,
+                                    onOpenUser = viewModel::openUserCard,
+                                    onBack = { stack.pop() },
+                                )
+                            }
+
+                            is Route.FollowList -> FollowListScreen(
+                                state = followList,
+                                onBack = { stack.pop() },
+                                onRetry = { viewModel.loadFollowing(route.username, refresh = true) },
+                                onOpenUser = viewModel::openUserCard,
+                                onUnfollow = viewModel::unfollowUser,
+                                onUnfollowBatch = viewModel::unfollowBatch,
+                            )
+
+                            Route.Blacklist -> BlacklistScreen(
+                                users = blockedUsers,
+                                onBack = { stack.pop() },
+                                onOpenUser = viewModel::openUserCard,
+                                onRemove = viewModel::removeFromBlacklist,
+                                onRemoveBatch = viewModel::removeBatchFromBlacklist,
                             )
 
                             is Route.UserTopics -> {
@@ -621,12 +1002,27 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                 TopicListScreen(
                                     title = route.title,
                                     state = userTopicStates[key] ?: TopicListUiState(),
+                                    feedGraphicMode = feedGraphicMode,
+                                    feedDisplayMode = feedDisplayMode,
+                                    showTopicUnreadDot = showTopicUnreadDot,
+                                    topicUnreadDotPosition = topicUnreadDotPosition,
+                                    blockedUsernames = blockedUsernameSet,
                                     onRefresh = { viewModel.loadUserTopics(route.username, route.isBookmark, refresh = true) },
                                     onLoadMore = { viewModel.loadUserTopics(route.username, route.isBookmark, more = true) },
-                                    onOpenTopic = { stack.push(Route.TopicDetail(it.id, it.title)) },
+                                    onOpenTopic = {
+                                        viewModel.recordTopicListOpen(it.id, it.postsCount)
+                                        stack.push(Route.TopicDetail(it.id, it.title))
+                                    },
+                                    onScrollBusyChanged = viewModel::setTopicListScrollBusy,
+                                    onBarsVisibilityChange = viewModel::setBottomBarVisible,
+                                    barsVisible = isBottomBarVisible,
+                                    onOpenUser = { username, primaryAvatarUrl, staticAvatarUrl, displayName ->
+                                        viewModel.openUserCard(username, primaryAvatarUrl, staticAvatarUrl, displayName)
+                                    },
                                     onBack = { stack.pop() },
+                                    showLargeTitle = false,
                                     active = active,
-                                    trailing = { UnreadBell(state.unreadCount, openNotifications) },
+                                    trailing = {},
                                     onSetNotificationLevel = { topic, level ->
                                         viewModel.setTopicNotificationLevel(topic.id, level)
                                     },
@@ -648,6 +1044,42 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                     onNavigateToDrafts = { stack.push(Route.Drafts) },
                                     onNavigateToSearch = { selected = MainTab.Search },
                                     onNavigateToCategories = { selected = MainTab.Categories },
+                                    onNavigateToHistory = { stack.push(Route.BrowsingHistory) },
+                                    onNavigateToConnect = { showConnectSheet = true },
+                                    onNavigateToChat = { stack.push(Route.Chat) },
+                                )
+                            }
+
+                            is Route.UserReplies -> {
+                                val stateKey = if (route.filter == "5") route.username else "${route.username}:${route.filter}"
+                                val repliesState = userRepliesStates[stateKey] ?: org.linuxdo.android.data.UserRepliesUiState()
+                                org.linuxdo.android.ui.screen.UserRepliesScreen(
+                                    title = route.title,
+                                    state = repliesState,
+                                    onRefresh = { viewModel.loadUserReplies(route.username, refresh = true, filter = route.filter) },
+                                    onLoadMore = { viewModel.loadUserReplies(route.username, more = true, filter = route.filter) },
+                                    onOpenTopic = { id, title, postNumber ->
+                                        stack.push(Route.TopicDetail(id, title, postNumber))
+                                    },
+                                    onOpenUser = viewModel::openUserCard,
+                                    onBack = { stack.pop() },
+                                )
+                            }
+
+                            is Route.UserProfile -> {
+                                UserProfileScreen(
+                                    username = route.username,
+                                    initialAvatarUrl = route.initialAvatarUrl,
+                                    initialStaticAvatarUrl = route.initialStaticAvatarUrl,
+                                    onOpenTopic = { id, title, postNumber ->
+                                        stack.push(Route.TopicDetail(id, title, postNumber))
+                                    },
+                                    onOpenUser = viewModel::openUserCard,
+                                    onChat = { target ->
+                                        viewModel.openChatWithUser(target) { stack.push(it) }
+                                    },
+                                    onComposePrivateMessage = { recipient -> privateMessageRecipient = recipient },
+                                    onBack = { stack.pop() },
                                 )
                             }
 
@@ -657,6 +1089,14 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                 onOpenPage = { stack.push(Route.SettingsDetail(it)) },
                                 treeView = treeView,
                                 onTreeView = viewModel::setTreeView,
+                                showUnreadDot = showUnreadDot,
+                                onShowUnreadDot = viewModel::setShowUnreadDot,
+                                unreadDotPosition = unreadDotPosition,
+                                onUnreadDotPosition = viewModel::setUnreadDotPosition,
+                                showTopicUnreadDot = showTopicUnreadDot,
+                                onShowTopicUnreadDot = viewModel::setShowTopicUnreadDot,
+                                topicUnreadDotPosition = topicUnreadDotPosition,
+                                onTopicUnreadDotPosition = viewModel::setTopicUnreadDotPosition,
                                 onBack = { stack.pop() },
                                 themeMode = themeMode,
                                 onThemeMode = viewModel::setThemeMode,
@@ -695,6 +1135,8 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                 onDohAutoFailover = viewModel::setDohAutoFailover,
                                 dohAutoOptimize = dohAutoOptimize,
                                 onDohAutoOptimize = viewModel::setDohAutoOptimize,
+                                dohForceOverProxy = dohForceOverProxy,
+                                onDohForceOverProxy = viewModel::setDohForceOverProxy,
                                 dohLatencies = dohLatencies,
                                 dohSummaries = dohSummaries,
                                 isTestingAllDoh = isTestingAllDoh,
@@ -704,13 +1146,36 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
                                 onUpdateDohServer = viewModel::updateDohServer,
                                 onDeleteDohServer = viewModel::deleteDohServer,
                                 onResetDohServers = viewModel::resetDohServersToDefault,
+                                feedGraphicMode = feedGraphicMode,
+                                onFeedGraphicMode = viewModel::setFeedGraphicMode,
+                                feedDisplayMode = feedDisplayMode,
+                                onFeedDisplayMode = viewModel::setFeedDisplayMode,
+                                skinPreset = skinPreset,
+                                onSkinPreset = viewModel::setSkinPreset,
+                                isSelfHealing = isSelfHealing,
+                                onSelfHealNetwork = { viewModel.selfHealNetwork(context) },
                             )
 
                             Route.Notifications -> ProfileScreen(state.username, profile, viewModel::loadProfile,
-                                onOpenTopic = { id, title, postNumber -> stack.push(Route.TopicDetail(id, title, postNumber)) },
+                                onOpenTopic = { id, title, postNumber ->
+                                    viewModel.markNotificationTopicPending(id, postNumber)
+                                    val currentRoute = stack.current
+                                    if (currentRoute is Route.TopicDetail && currentRoute.topicId == id) {
+                                        viewModel.loadTopic(
+                                            id,
+                                            postNumber = postNumber,
+                                            resumePostNumber = viewModel.resolveResumePostNumber(id, postNumber),
+                                            fromNotification = true,
+                                        )
+                                    } else {
+                                        stack.push(Route.TopicDetail(id, title, postNumber))
+                                    }
+                                },
+                                onOpenUser = viewModel::openUserCard,
                                 onDiagnostics = { stack.push(Route.Diagnostics) }, onSettings = { stack.push(Route.Settings) },
-                                active = active, notificationOnly = true, onBack = { stack.pop() },
+                                active = active, notificationOnly = true, onBack = null,
                                 onReadNotification = viewModel::readNotification,
+                                onMarkAllNotificationsRead = viewModel::markAllNotificationsRead,
                                 notificationFilter = notificationFilter,
                                 onNotificationFilter = viewModel::setNotificationFilter,
                                 unreadFilters = state.unreadFilters)
@@ -750,16 +1215,77 @@ private fun MainNavigation(state: UiState, viewModel: MainViewModel, lifecycle: 
             }
         }
         val isKeyboardOpen = WindowInsets.ime.getBottom(LocalDensity.current) > 0
-        if (!composer.open && !topicCreator.open && !detailOverlay && !isKeyboardOpen) {
-            TabBar(selected, homeFeedLabel = state.homeFeed.label) { tab ->
+        val isDetailRoute = stack.current is Route.TopicDetail || stack.current is Route.ChatRoom
+        val shouldShowTabBar = isBottomBarVisible && !isDetailRoute && !composer.open && !topicCreator.open && !detailOverlay && !isKeyboardOpen
+        androidx.compose.animation.AnimatedVisibility(
+            visible = shouldShowTabBar,
+            modifier = Modifier.align(Alignment.BottomCenter),
+            enter = androidx.compose.animation.slideInVertically(animationSpec = androidx.compose.animation.core.tween(220)) { it } +
+                androidx.compose.animation.fadeIn(animationSpec = androidx.compose.animation.core.tween(180)),
+            exit = androidx.compose.animation.slideOutVertically(animationSpec = androidx.compose.animation.core.tween(220)) { it } +
+                androidx.compose.animation.fadeOut(animationSpec = androidx.compose.animation.core.tween(180)),
+        ) {
+            TabBar(selected, homeFeedLabel = state.homeFeed.label, unreadCount = state.unreadCount) { tab ->
                 if (browsing) {
                     if (tab == selected) {
                         stacks.getValue(tab).popToRoot()
                         scrollRequests.getValue(tab).intValue++
-                    } else selected = tab
+                    } else {
+                        selected = tab
+                        viewModel.setBottomBarVisible(true)
+                    }
                 }
             }
         }
+    }
+    if (showConnectSheet) {
+        ConnectWebSheet(
+            state = trustReport,
+            ldcState = ldcState,
+            onLoad = { viewModel.loadTrustReport() },
+            onRefresh = { viewModel.loadTrustReport(refresh = true) },
+            onLoadLdc = { viewModel.loadLdcUserInfo() },
+            onRefreshLdc = { viewModel.loadLdcUserInfo(refresh = true) },
+            onAuthorizeLdc = { viewModel.authorizeLdc() },
+            onOpenWebUrl = { globalBrowserUrl = it },
+            onDismiss = { showConnectSheet = false },
+        )
+    }
+    globalBrowserUrl?.let { url ->
+        InAppBrowserSheet(url = url, onDismiss = { globalBrowserUrl = null })
+    }
+    if (userCard.loading || userCard.user != null || userCard.error != null) {
+        UserCardBottomSheet(
+            state = userCard,
+            onDismiss = viewModel::closeUserCard,
+            onFollow = viewModel::toggleFollowUser,
+            onMessage = { username ->
+                viewModel.closeUserCard()
+                privateMessageRecipient = username
+            },
+            onChat = { username ->
+                viewModel.openChatWithUser(username) { route ->
+                    stack.push(route)
+                }
+            },
+            onOpenTopics = { username ->
+                viewModel.closeUserCard()
+                stack.push(Route.UserProfile(username))
+            },
+            onToggleBlock = viewModel::toggleBlacklistForUserCard,
+        )
+    }
+    privateMessageRecipient?.let { recipient ->
+        PrivateMessageComposeSheet(
+            initialRecipient = recipient,
+            onDismiss = { privateMessageRecipient = null },
+            onSend = viewModel::createPrivateMessage,
+            onUploadAttachment = viewModel::uploadAttachmentDirect,
+            onCreated = { topicId, title ->
+                viewModel.loadProfile(org.linuxdo.android.data.ProfileSection.Messages, refresh = true)
+                stack.push(Route.TopicDetail(topicId, title))
+            },
+        )
     }
 }
 

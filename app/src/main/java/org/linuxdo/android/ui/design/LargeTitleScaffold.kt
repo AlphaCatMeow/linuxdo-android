@@ -1,5 +1,12 @@
 package org.linuxdo.android.ui.design
 
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
+import androidx.compose.ui.unit.Dp
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -68,6 +75,8 @@ fun IosLargeTitleScaffold(
     onBack: (() -> Unit)? = null,
     compactTop: Boolean = false,
     showLargeTitle: Boolean = true,
+    barsVisible: Boolean = true,
+    bottomPadding: Dp = 64.dp,
     backLabel: String = "返回",
     scrollToTopRequest: Int = 0,
     trailing: @Composable () -> Unit = {},
@@ -88,11 +97,17 @@ fun IosLargeTitleScaffold(
         }
     }
 
+    val topPadding = if (showLargeTitle) {
+        if (compactTop) 0.dp else IosMetrics.navBarHeight
+    } else {
+        IosMetrics.navBarHeight
+    }
+
     Box(modifier.fillMaxSize().background(IosTheme.colors.groupedBackground)) {
         LazyColumn(
             state = listState,
             modifier = Modifier.fillMaxSize(),
-            contentPadding = PaddingValues(top = if (compactTop) 0.dp else IosMetrics.navBarHeight),
+            contentPadding = PaddingValues(top = topPadding, bottom = bottomPadding),
         ) {
             if (showLargeTitle) {
                 item(key = "ios-large-title") {
@@ -124,23 +139,30 @@ fun IosLargeTitleScaffold(
             content()
         }
 
-        if (!compactTop || collapse > 0.01f || !showLargeTitle) IosNavBar(
-            title = title,
-            titleAlpha = if (!showLargeTitle) 1f else collapse,
-            showDivider = if (!showLargeTitle) true else collapse > 0.01f,
-            backLabel = backLabel,
-            // 顶部时与大标题区同色、看起来融为一体,折叠后过渡成实色条。
-            // 不能用半透明近似毛玻璃:Compose 没有模糊,透出的是清晰可读的文字,很脏。
-            background = if (!showLargeTitle) IosTheme.colors.card else lerp(
-                IosTheme.colors.groupedBackground,
-                IosTheme.colors.card,
-                collapse,
-            ),
-            onBack = onBack,
-            trailing = trailing,
-            customTitle = customCollapsedTitle,
+        val showNavBar = (!compactTop || collapse > 0.01f || !showLargeTitle)
+        val atTop = listState.firstVisibleItemIndex == 0 && listState.firstVisibleItemScrollOffset <= 20
+        AnimatedVisibility(
+            visible = showNavBar && (barsVisible || atTop),
+            enter = slideInVertically(animationSpec = tween(220)) { -it } + fadeIn(animationSpec = tween(180)),
+            exit = slideOutVertically(animationSpec = tween(220)) { -it } + fadeOut(animationSpec = tween(180)),
             modifier = Modifier.align(Alignment.TopStart),
-        )
+        ) {
+            IosNavBar(
+                title = title,
+                titleAlpha = if (!showLargeTitle) 1f else collapse,
+                showDivider = if (!showLargeTitle) true else collapse > 0.01f,
+                backLabel = backLabel,
+                // 顶部时与大标题区同色、看起来融为一体,折叠后过渡成实色条。
+                background = if (!showLargeTitle) IosTheme.colors.card else lerp(
+                    IosTheme.colors.groupedBackground,
+                    IosTheme.colors.card,
+                    collapse,
+                ),
+                onBack = onBack,
+                trailing = trailing,
+                customTitle = customCollapsedTitle,
+            )
+        }
 
         floatingOverlay?.invoke(this)
     }

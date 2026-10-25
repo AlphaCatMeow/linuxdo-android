@@ -2,8 +2,10 @@
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp" android:height="108dp"
     android:viewportWidth="108" android:viewportHeight="108">
-    <path android:fillColor="#202226"
-        android:pathData="M34,27 Q34,24 37,24 L44,24 Q47,24 47,27 L47,63 L70,63 L49,84 L37,84 Q34,84 34,81 Z" />
-    <path android:fillColor="#4055DF"
-        android:pathData="M54,84 L76,62 Q78,61 78,64 L78,81 Q78,84 75,84 Z" />
+    <!-- 黑色大写字母 L 主体 -->
+    <path android:fillColor="#151517"
+        android:pathData="M34,26.5 Q34,24 36.5,24 L45.2,24 Q47.7,24 47.7,26.5 L47.7,63 L71.5,63 L50,84 L36.5,84 Q34,84 34,81.5 Z" />
+    <!-- 亮黄色/琥珀色几何三角折角 -->
+    <path android:fillColor="#FAB50F"
+        android:pathData="M55.25,84 L79.45,59.8 Q81.25,58 81.25,61.3 L81.25,73.5 Q81.25,84 70.5,84 Z" />
 </vector>

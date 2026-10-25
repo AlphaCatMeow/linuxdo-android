@@ -27,10 +27,19 @@ class WebViewFetchTransport(
         return result
     }
 
-    override suspend fun revalidate(reason: String): Boolean {
+    override suspend fun getWithoutRevalidate(path: String, present: Boolean): TransportResult =
+        browser.fetchJson(path, present = present, allowRevalidate = false)
+
+    override suspend fun revalidate(reason: String, failedClearanceFp: String): Boolean {
         diagnostics.recordSilentRevalidation()
-        return browser.clearChallenge("B: $reason")
+        return browser.clearChallenge("B: $reason", failedClearanceFp)
     }
+
+    override suspend fun ensureReady(): Boolean = browser.ensureReady()
+
+    override suspend fun isReady(): Boolean = browser.isPageCleared()
+
+    override suspend fun obtainCsrfToken(): String? = browser.currentCsrfToken()
 
     /**
      * 路径 B 不支持上传。

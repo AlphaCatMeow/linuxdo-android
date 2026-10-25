@@ -13,31 +13,98 @@ import androidx.core.content.edit
 class ReadingStore(context: Context) {
     private val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
-    /**
-     * 已读话题 ID。按写入顺序存成逗号分隔串并定长截断 —— 这是个"最近看过什么"的滚动窗口,
-     * 不是完整历史,所以超出容量时丢最早的那些(它们早就滚出列表了)。
-     */
-    private val seen: LinkedHashSet<Long> = linkedSetOf<Long>().apply {
-        prefs.getString(KEY_SEEN_TOPICS, null)
-            ?.split(',')
-            ?.mapNotNull { it.trim().toLongOrNull() }
-            ?.let(::addAll)
+    @Volatile
+    private var currentUserId: Long = 0L
+
+    private fun seenKey(userId: Long = currentUserId) =
+        if (userId > 0L) "${KEY_SEEN_TOPICS}_$userId" else KEY_SEEN_TOPICS
+
+    private fun postCountsKey(userId: Long = currentUserId) =
+        if (userId > 0L) "${KEY_SEEN_POST_COUNTS}_$userId" else KEY_SEEN_POST_COUNTS
+
+    private fun lastPostsKey(userId: Long = currentUserId) =
+        if (userId > 0L) "${KEY_LAST_SEEN_POSTS}_$userId" else KEY_LAST_SEEN_POSTS
+
+    private val seen: LinkedHashSet<Long> = linkedSetOf()
+    private val seenPostsCount: LinkedHashMap<Long, Int> = linkedMapOf()
+    private val lastSeenPostNumbers: LinkedHashMap<Long, Int> = linkedMapOf()
+
+    init {
+        synchronized(seen) {
+            synchronized(lastSeenPostNumbers) {
+                loadForUser(currentUserId)
+            }
+        }
     }
 
-    /** 记录各已读话题在本地最后点阅时的总楼层数(postsCount)，用于「未读」列表判断是否有新增楼层。 */
-    private val seenPostsCount: LinkedHashMap<Long, Int> = linkedMapOf<Long, Int>().apply {
-        prefs.getString(KEY_SEEN_POST_COUNTS, null)
-            ?.split(',')
+    private fun loadForUser(userId: Long) {
+        val sKey = seenKey(userId)
+        val cKey = postCountsKey(userId)
+        val lKey = lastPostsKey(userId)
+
+        var seenRaw = prefs.getString(sKey, null)
+        var countRaw = prefs.getString(cKey, null)
+        var lastPostsRaw = prefs.getString(lKey, null)
+
+        // 迁移旧版未带 userId 的全局数据
+        if (seenRaw == null && userId > 0L) {
+            val legacySeen = prefs.getString(KEY_SEEN_TOPICS, null)
+            if (!legacySeen.isNullOrBlank()) {
+                seenRaw = legacySeen
+                countRaw = prefs.getString(KEY_SEEN_POST_COUNTS, null)
+                lastPostsRaw = prefs.getString(KEY_LAST_SEEN_POSTS, null)
+                prefs.edit {
+                    putString(sKey, seenRaw)
+                    putString(cKey, countRaw)
+                    putString(lKey, lastPostsRaw)
+                    remove(KEY_SEEN_TOPICS)
+                    remove(KEY_SEEN_POST_COUNTS)
+                    remove(KEY_LAST_SEEN_POSTS)
+                }
+            }
+        }
+
+        seen.clear()
+        seenRaw?.split(',')
+            ?.mapNotNull { it.trim().toLongOrNull() }
+            ?.let(seen::addAll)
+
+        seenPostsCount.clear()
+        countRaw?.split(',')
             ?.forEach { entry ->
                 val parts = entry.split(':')
                 if (parts.size == 2) {
                     val id = parts[0].trim().toLongOrNull()
                     val count = parts[1].trim().toIntOrNull()
                     if (id != null && count != null && count > 0) {
-                        put(id, count)
+                        seenPostsCount[id] = count
                     }
                 }
             }
+
+        lastSeenPostNumbers.clear()
+        lastPostsRaw?.split(',')
+            ?.forEach { entry ->
+                val parts = entry.split(':')
+                if (parts.size == 2) {
+                    val id = parts[0].trim().toLongOrNull()
+                    val postNumber = parts[1].trim().toIntOrNull()
+                    if (id != null && id > 0L && postNumber != null && postNumber > 0) {
+                        lastSeenPostNumbers[id] = postNumber
+                    }
+                }
+            }
+    }
+
+    fun switchUser(userId: Long) {
+        val targetId = maxOf(0L, userId)
+        if (currentUserId == targetId) return
+        synchronized(seen) {
+            synchronized(lastSeenPostNumbers) {
+                currentUserId = targetId
+                loadForUser(targetId)
+            }
+        }
     }
 
     @Volatile
@@ -53,6 +120,25 @@ class ReadingStore(context: Context) {
     fun seenTopicIds(): Set<Long> = synchronized(seen) { seen.toSet() }
 
     fun isSeen(topicId: Long): Boolean = synchronized(seen) { topicId in seen }
+
+    fun getLastSeenPost(topicId: Long): Int? = synchronized(lastSeenPostNumbers) {
+        lastSeenPostNumbers[topicId]
+    }
+
+    fun recordLastSeenPost(topicId: Long, postNumber: Int) {
+        if (topicId <= 0L || postNumber <= 0) return
+        val (serialized, key) = synchronized(lastSeenPostNumbers) {
+            val previous = lastSeenPostNumbers[topicId] ?: 0
+            if (postNumber <= previous) return
+            lastSeenPostNumbers.remove(topicId)
+            lastSeenPostNumbers[topicId] = postNumber
+            while (lastSeenPostNumbers.size > MAX_SEEN_TOPICS) {
+                lastSeenPostNumbers.remove(lastSeenPostNumbers.keys.first())
+            }
+            lastSeenPostNumbers.entries.joinToString(",") { "${it.key}:${it.value}" } to lastPostsKey()
+        }
+        prefs.edit { putString(key, serialized) }
+    }
 
     /**
      * 判断话题在「未读」列表中是否已在本地读到最新楼层、应当排除：
@@ -72,7 +158,7 @@ class ReadingStore(context: Context) {
         var changed = false
         var seenCsv = ""
         var countsCsv = ""
-        synchronized(seen) {
+        val (sKey, cKey) = synchronized(seen) {
             // 重新 add 一次把它挪到队尾,保证活跃话题不会被当成最早的淘汰掉。
             val fresh = seen.remove(topicId).not()
             seen.add(topicId)
@@ -89,10 +175,11 @@ class ReadingStore(context: Context) {
             changed = fresh || countUpdated
             seenCsv = seen.joinToString(",")
             countsCsv = seenPostsCount.entries.joinToString(",") { "${it.key}:${it.value}" }
+            seenKey() to postCountsKey()
         }
         prefs.edit {
-            putString(KEY_SEEN_TOPICS, seenCsv)
-            putString(KEY_SEEN_POST_COUNTS, countsCsv)
+            putString(sKey, seenCsv)
+            putString(cKey, countsCsv)
         }
         return changed
     }
@@ -101,6 +188,7 @@ class ReadingStore(context: Context) {
         const val PREFS_NAME = "reading_preferences"
         const val KEY_SEEN_TOPICS = "seen_topic_ids"
         const val KEY_SEEN_POST_COUNTS = "seen_topic_post_counts"
+        const val KEY_LAST_SEEN_POSTS = "seen_topic_last_posts"
         const val KEY_SYNC_READ_PROGRESS = "sync_read_progress"
         const val MAX_SEEN_TOPICS = 2_000
     }

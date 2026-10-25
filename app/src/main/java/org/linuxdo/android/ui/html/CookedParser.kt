@@ -8,6 +8,7 @@ import org.jsoup.nodes.Node
 import org.jsoup.nodes.TextNode
 import org.linuxdo.android.Config
 import org.linuxdo.android.data.Post
+import org.linuxdo.android.data.DiscoursePoll
 
 data class InlineText(
     val text: String,
@@ -30,6 +31,21 @@ sealed interface CookedBlock {
         val width: Int = 0,
         val height: Int = 0,
     ) : CookedBlock
+    data class Video(val url: String, val posterUrl: String? = null, val title: String = "视频") : CookedBlock
+    data class Heading(val level: Int, val title: String, val anchor: String) : CookedBlock
+    data class Onebox(val url: String, val title: String, val description: String? = null) : CookedBlock
+    data class Poll(
+        val name: String,
+        val title: String,
+        val type: String,
+        val status: String,
+        val results: String,
+        val options: List<Option>,
+        val userVotes: Set<String>,
+        val voters: Int,
+    ) : CookedBlock {
+        data class Option(val id: String, val title: String, val votes: Int)
+    }
     data class ListBlock(val entries: List<List<CookedBlock>>, val start: Int?) : CookedBlock
     data object Divider : CookedBlock
 }
@@ -51,6 +67,7 @@ private val ATTACHMENT_EXTENSIONS = setOf(
 )
 
 private val IMAGE_EXTENSIONS = setOf("png", "jpg", "jpeg", "webp", "gif", "bmp", "svg", "avif", "heic")
+private val VIDEO_EXTENSIONS = setOf("mp4", "m4v", "mov", "webm", "m3u8")
 
 fun isDownloadableAttachmentUrl(url: String): Boolean {
     val uri = runCatching { URI(url) }.getOrNull() ?: return false
@@ -65,8 +82,25 @@ fun isDownloadableAttachmentUrl(url: String): Boolean {
 
 class CookedParser(private val onUnknown: (String) -> Unit = {}) {
     private val reported = mutableSetOf<String>()
+    private var pollModels: List<DiscoursePoll> = emptyList()
+    private var pollVotes: Map<String, List<String>> = emptyMap()
+    private var headingPrefix = "post"
+    private var headingOrdinal = 0
 
-    fun parse(html: String): List<CookedBlock> = blocks(Jsoup.parseBodyFragment(html).body().childNodes())
+    fun parse(html: String): List<CookedBlock> = parse(html, emptyList(), emptyMap(), "post")
+
+    private fun parse(
+        html: String,
+        polls: List<DiscoursePoll>,
+        votes: Map<String, List<String>>,
+        prefix: String,
+    ): List<CookedBlock> {
+        pollModels = polls
+        pollVotes = votes
+        headingPrefix = prefix
+        headingOrdinal = 0
+        return blocks(Jsoup.parseBodyFragment(html).body().childNodes())
+    }
 
     companion object {
         private const val CONTENT_IMAGES = "img:not(.emoji):not(.avatar)"
@@ -80,9 +114,23 @@ class CookedParser(private val onUnknown: (String) -> Unit = {}) {
             return parsed
         }
 
+        fun parsePostCached(post: Post, onUnknown: (String) -> Unit = {}): List<CookedBlock> {
+            if (post.cooked.isBlank()) return emptyList()
+            val key = "${post.id}\u0000${post.cooked}\u0000${post.polls}\u0000${post.pollsVotes}"
+            synchronized(blockCache) { blockCache.get(key) }?.let { return it }
+            val parsed = CookedParser(onUnknown).parse(
+                post.cooked,
+                post.polls,
+                post.pollsVotes,
+                "post-${post.id}",
+            )
+            synchronized(blockCache) { blockCache.put(key, parsed) }
+            return parsed
+        }
+
         fun prewarm(posts: Iterable<Post>) {
             for (post in posts) {
-                parseCached(post.cooked)
+                parsePostCached(post)
                 for (boost in post.boosts) {
                     parseCached(boost.cooked)
                 }
@@ -131,6 +179,53 @@ class CookedParser(private val onUnknown: (String) -> Unit = {}) {
         )
     }
 
+    private fun pollBlockOf(element: Element): CookedBlock.Poll? {
+        val name = element.attr("data-poll-name").ifBlank { "poll" }
+        val poll = pollModels.firstOrNull { it.name == name }
+        val apiOptions = poll?.options.orEmpty()
+        val options = if (apiOptions.isNotEmpty()) {
+            apiOptions.map { option ->
+                CookedBlock.Poll.Option(option.id, Jsoup.parseBodyFragment(option.html).text(), option.votes)
+            }
+        } else {
+            element.select("[data-poll-option-id]").mapNotNull { option ->
+                option.attr("data-poll-option-id").takeIf { it.isNotBlank() }?.let { id ->
+                    CookedBlock.Poll.Option(id, option.text(), option.attr("data-votes").toIntOrNull() ?: 0)
+                }
+            }
+        }
+        if (options.isEmpty()) return null
+        val userVotes = pollVotes[name].orEmpty().toSet()
+        val title = element.selectFirst(".poll-title")?.text()?.takeIf { it.isNotBlank() }
+            ?: poll?.title?.takeIf { it.isNotBlank() }
+            ?: element.attr("data-poll-question").ifBlank { "投票" }
+        return CookedBlock.Poll(
+            name = name,
+            title = title,
+            type = poll?.type ?: element.attr("data-poll-type").ifBlank { "regular" },
+            status = poll?.status ?: element.attr("data-poll-status").ifBlank { "open" },
+            results = poll?.results ?: element.attr("data-poll-results").ifBlank { "always" },
+            options = options,
+            userVotes = userVotes,
+            voters = poll?.voters ?: options.sumOf { it.votes },
+        )
+    }
+
+    private fun oneboxBlockOf(element: Element): CookedBlock.Onebox? {
+        val rawUrl = element.attr("data-onebox-url").ifBlank { element.selectFirst("a[href]")?.attr("href").orEmpty() }
+        val url = contentUrl(rawUrl) ?: return null
+        val title = element.selectFirst(".title, .onebox-body h1, .onebox-body h2, .onebox-body h3")
+            ?.text()?.takeIf { it.isNotBlank() } ?: runCatching { URI(url).host }.getOrNull().orEmpty()
+        val description = element.selectFirst(".description, .onebox-body p")?.text()?.takeIf { it.isNotBlank() }
+        return CookedBlock.Onebox(url, title, description)
+    }
+
+    private fun videoUrl(value: String): String? {
+        val url = contentUrl(value) ?: return null
+        val extension = runCatching { URI(url).path.substringAfterLast('.', "").lowercase() }.getOrDefault("")
+        return url.takeIf { extension in VIDEO_EXTENSIONS }
+    }
+
     private fun blocks(nodes: List<Node>): List<CookedBlock> {
         val output = mutableListOf<CookedBlock>()
         val pending = mutableListOf<InlineText>()
@@ -141,6 +236,16 @@ class CookedParser(private val onUnknown: (String) -> Unit = {}) {
         for (node in nodes) {
             val element = node as? Element
             if (element != null && isLightboxMeta(element)) continue
+            if (element?.hasClass("poll") == true) {
+                flush()
+                pollBlockOf(element)?.let(output::add)
+                continue
+            }
+            if (element?.hasClass("onebox") == true) {
+                flush()
+                oneboxBlockOf(element)?.let(output::add)
+                continue
+            }
             if (element != null && (element.hasClass("lightbox-wrapper") || element.hasClass("lightbox"))) {
                 flush()
                 element.select(CONTENT_IMAGES).mapNotNullTo(output, ::pictureBlockOf)
@@ -148,12 +253,35 @@ class CookedParser(private val onUnknown: (String) -> Unit = {}) {
             }
             when (element?.normalName()) {
                 "script", "style", "noscript" -> Unit
+                "video" -> {
+                    flush()
+                    val url = videoUrl(element.attr("src"))
+                        ?: element.selectFirst("source[src]")?.attr("src")?.let(::videoUrl)
+                    if (url != null) {
+                        output += CookedBlock.Video(
+                            url = url,
+                            posterUrl = contentUrl(element.attr("poster")),
+                            title = element.attr("title").ifBlank { "视频" },
+                        )
+                    }
+                }
+                "a" -> {
+                    val href = videoUrl(element.attr("href"))
+                    if (href != null) {
+                        flush()
+                        output += CookedBlock.Video(href, title = element.text().ifBlank { "播放视频" })
+                    } else pending += inline(element)
+                }
                 "pre" -> { flush(); output += CookedBlock.Code(element.wholeText().trimEnd()) }
                 "blockquote" -> { flush(); output += CookedBlock.Quote(blocks(element.childNodes())) }
                 "aside" -> {
                     flush()
-                    val children = blocks(element.childNodes())
-                    output += if (element.hasClass("quote")) listOf(CookedBlock.Quote(children)) else children
+                    if (element.hasClass("onebox")) {
+                        oneboxBlockOf(element)?.let(output::add)
+                    } else {
+                        val children = blocks(element.childNodes())
+                        output += if (element.hasClass("quote")) listOf(CookedBlock.Quote(children)) else children
+                    }
                 }
                 "ul", "ol" -> {
                     flush()
@@ -178,7 +306,15 @@ class CookedParser(private val onUnknown: (String) -> Unit = {}) {
                         else pending += InlineText(element.attr("alt"))
                     }
                 }
-                "p", "div", "section", "article", "details", "summary", "figure", "figcaption", "h1", "h2", "h3", "h4", "h5", "h6" -> {
+                "h1", "h2", "h3", "h4" -> {
+                    flush()
+                    val title = element.text().trim()
+                    if (title.isNotBlank()) {
+                        val anchor = element.id().ifBlank { "$headingPrefix-${headingOrdinal++}" }
+                        output += CookedBlock.Heading(element.normalName().last().digitToInt(), title, anchor)
+                    }
+                }
+                "p", "div", "section", "article", "details", "summary", "figure", "figcaption", "h5", "h6" -> {
                     flush()
                     output += blocks(element.childNodes())
                 }

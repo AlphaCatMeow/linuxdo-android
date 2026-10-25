@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 备用原版自适应图标配置 (调用 ic_launcher_foreground_blue_original) -->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@android:color/white" />
+    <foreground android:drawable="@drawable/ic_launcher_foreground_blue_original" />
+    <monochrome android:drawable="@drawable/ic_launcher_foreground_blue_original" />
+</adaptive-icon>

@@ -19,6 +19,8 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.foundation.relocation.BringIntoViewRequester
+import androidx.compose.foundation.relocation.bringIntoViewRequester
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.InlineTextContent
 import androidx.compose.foundation.text.appendInlineContent
@@ -27,6 +29,13 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Text
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.Button
+import androidx.compose.material3.Checkbox
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.rememberModalBottomSheetState
+import androidx.compose.material3.RadioButton
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.material3.pulltorefresh.rememberPullToRefreshState
 import androidx.compose.runtime.*
@@ -35,6 +44,8 @@ import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
 import org.linuxdo.android.data.TopicNotificationLevel
 import org.linuxdo.android.data.AttachedMedia
+import org.linuxdo.android.data.AvatarCache
+import org.linuxdo.android.ui.UnreadDotPosition
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -101,6 +112,7 @@ import androidx.compose.animation.core.MutableTransitionState
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkHorizontally
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
@@ -129,7 +141,11 @@ import coil.compose.SubcomposeAsyncImageContent
 import coil.request.ImageRequest
 import coil.size.Size
 import java.io.File
+import java.nio.ByteBuffer
+import java.nio.charset.CodingErrorAction
+import java.nio.charset.StandardCharsets
 import java.net.URLDecoder
+import org.jsoup.Jsoup
 import kotlin.math.min
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -139,10 +155,12 @@ import okhttp3.Request
 import org.linuxdo.android.App
 import org.linuxdo.android.Config
 import org.linuxdo.android.data.Post
+import org.linuxdo.android.data.Boost
 import org.linuxdo.android.data.PostFlagReason
 import org.linuxdo.android.data.effectiveReplyToPostNumber
 import org.linuxdo.android.data.flatPostRows
 import org.linuxdo.android.data.BoostLength
+import org.linuxdo.android.data.UserCardData
 import org.linuxdo.android.data.measureBoost
 import org.linuxdo.android.data.avatarUrlOf
 import org.linuxdo.android.data.TreePost
@@ -159,9 +177,74 @@ import org.linuxdo.android.ui.format.RelativeTime
 import org.linuxdo.android.ui.html.CookedBlock
 import org.linuxdo.android.ui.html.CookedParser
 import org.linuxdo.android.ui.html.InlineText
+import org.linuxdo.android.net.IMAGE_AUTO_RETRY_LIMIT
+import org.linuxdo.android.net.awaitImageRetrySlot
+import org.linuxdo.android.net.isTransientImageError
 
 private val LocalOpenTopic = compositionLocalOf<((Long, String, Int?) -> Unit)?> { null }
 private val LocalSelectionResetKey = compositionLocalOf { 0 }
+private val LocalOpenExternalUrl = compositionLocalOf<(String) -> Unit> { {} }
+private val LocalVotePoll = compositionLocalOf<(Long, String, List<String>) -> Unit> { { _, _, _ -> } }
+private val LocalPollBusy = compositionLocalOf<(Long) -> Boolean> { { false } }
+private val LocalPollError = compositionLocalOf<(Long) -> String?> { { null } }
+private val LocalDecryptSelection = compositionLocalOf<(String) -> Unit> { {} }
+private val LocalTocTarget = compositionLocalOf<String?> { null }
+
+private data class TocEntry(
+    val postId: Long,
+    val postNumber: Int,
+    val level: Int,
+    val title: String,
+    val anchor: String,
+)
+
+private data class AuthorFilterItem(
+    val userId: Long,
+    val username: String,
+    val avatarTemplate: String?,
+    val isOp: Boolean,
+    val postCount: Int,
+)
+
+private class CopyInterceptingTextToolbar(
+    private val delegate: androidx.compose.ui.platform.TextToolbar,
+    private val onCopied: () -> Unit,
+) : androidx.compose.ui.platform.TextToolbar {
+    override val status: TextToolbarStatus get() = delegate.status
+
+    override fun showMenu(
+        rect: Rect,
+        onCopyRequested: (() -> Unit)?,
+        onPasteRequested: (() -> Unit)?,
+        onCutRequested: (() -> Unit)?,
+        onSelectAllRequested: (() -> Unit)?,
+    ) {
+        delegate.showMenu(
+            rect,
+            onCopyRequested?.let { copy -> { copy(); onCopied() } },
+            onPasteRequested,
+            onCutRequested,
+            onSelectAllRequested,
+        )
+    }
+
+    override fun hide() = delegate.hide()
+}
+
+@Composable
+private fun DecryptableSelection(content: @Composable () -> Unit) {
+    val delegate = LocalTextToolbar.current
+    val clipboard = LocalClipboardManager.current
+    val onSelectionCopied = LocalDecryptSelection.current
+    val toolbar = remember(delegate, clipboard, onSelectionCopied) {
+        CopyInterceptingTextToolbar(delegate) {
+            clipboard.getText()?.text?.takeIf { it.isNotBlank() }?.let(onSelectionCopied)
+        }
+    }
+    CompositionLocalProvider(LocalTextToolbar provides toolbar) {
+        SelectionContainer(content = content)
+    }
+}
 
 private data class BoostTarget(
     val postId: Long,
@@ -184,6 +267,8 @@ fun TopicDetailScreen(
     onReact: (Long, String) -> Unit,
     onBoost: (Long, String) -> Unit,
     onDeleteBoost: (Long, Long) -> Unit,
+    onFlagBoost: (Long, Long, Int, String?) -> Unit = { _, _, _, _ -> },
+    onOpenUser: (String, String?, String?, String?) -> Unit = { _, _, _, _ -> },
     onRefreshPost: (Long) -> Unit,
     onSolution: (Long) -> Unit,
     composer: ComposerUiState,
@@ -201,6 +286,8 @@ fun TopicDetailScreen(
     onOpenTopic: (Long, String, Int?) -> Unit = { _, _, _ -> },
     active: Boolean = true,
     signedIn: Boolean = false,
+    showUnreadDot: Boolean = true,
+    unreadDotPosition: UnreadDotPosition = UnreadDotPosition.Avatar,
     initialPostNumber: Int? = null,
     onPostsVisible: (List<Int>) -> Unit = {},
     onOverlayActive: (Boolean) -> Unit = {},
@@ -210,7 +297,11 @@ fun TopicDetailScreen(
     onCloseFlagDialog: () -> Unit = {},
     onSubmitFlag: (Long, Int, String?) -> Unit = { _, _, _ -> },
     onRemoveComposerAttachment: (String) -> Unit = {},
+    onSetFilterUser: (Long?) -> Unit = {},
+    onVotePoll: (Long, String, List<String>) -> Unit = { _, _, _ -> },
+    onOpenExternalLink: (String) -> Unit = {},
     trailing: @Composable () -> Unit = {},
+    blockedUsernames: Set<String> = emptySet(),
 ) {
     val list = rememberLazyListState()
     val pullState = rememberPullToRefreshState()
@@ -227,6 +318,25 @@ fun TopicDetailScreen(
     var boostTarget by remember { mutableStateOf<BoostTarget?>(null) }
     var boostDraft by rememberSaveable { mutableStateOf("") }
     var noticeToast by remember { mutableStateOf<String?>(null) }
+    var authorMenuExpanded by remember { mutableStateOf(false) }
+    var showToc by remember { mutableStateOf(false) }
+    var tocTarget by remember { mutableStateOf<String?>(null) }
+    var pendingTocJump by remember { mutableStateOf<TocEntry?>(null) }
+    var decryptInput by remember { mutableStateOf<String?>(null) }
+    var showDecryptSheet by remember { mutableStateOf(false) }
+    var scannedCryptoResults by remember { mutableStateOf<List<DecodedResult>>(emptyList()) }
+    var showCryptoPill by remember(topicId) { mutableStateOf(true) }
+    LaunchedEffect(state.topic?.postStream?.posts, state.topic?.title) {
+        val posts = state.topic?.postStream?.posts.orEmpty()
+        val title = state.topic?.title
+        if (posts.isNotEmpty()) {
+            val results = withContext(Dispatchers.Default) {
+                PostCryptoScanner.scanPosts(posts, title)
+            }
+            scannedCryptoResults = results
+        }
+    }
+    var browserUrl by remember { mutableStateOf<String?>(null) }
     LaunchedEffect(noticeToast) {
         if (noticeToast != null) {
             delay(2000)
@@ -247,15 +357,61 @@ fun TopicDetailScreen(
     DisposableEffect(Unit) {
         onDispose { onOverlayActive(false) }
     }
-    val topicAuthorUsername = remember(state.posts) {
-        state.posts.firstOrNull { it.postNumber == 1 }?.username
+    val topicAuthor = remember(state.posts) {
+        state.posts.firstOrNull { it.postNumber == 1 }
     }
-    val rows = remember(state.posts, treeView, collapsed, expanded, state.descending) {
-        if (treeView) {
-            threadRows(state.posts, collapsed.toSet(), expanded.toSet(), descending = state.descending)
-        } else {
-            flatPostRows(state.posts, descending = state.descending)
+    val topicAuthorUsername = topicAuthor?.username
+    val displayedPosts = remember(state.posts, state.filterUserId, blockedUsernames) {
+        val filtered = state.filterUserId?.let { userId ->
+            state.posts.filter { it.postNumber == 1 || it.userId == userId }
+        } ?: state.posts
+        if (blockedUsernames.isEmpty()) filtered
+        else filtered.filterNot { post ->
+            post.postNumber > 1 && post.username.lowercase() in blockedUsernames
         }
+    }
+    val rows = remember(displayedPosts, treeView, collapsed, expanded, state.descending) {
+        if (treeView) {
+            threadRows(displayedPosts, collapsed.toSet(), expanded.toSet(), descending = state.descending)
+        } else {
+            flatPostRows(displayedPosts, descending = state.descending)
+        }
+    }
+    val tocEntries = remember(state.posts) {
+        state.posts.sortedBy { it.postNumber }.flatMap { post ->
+            fun headings(blocks: List<CookedBlock>): List<CookedBlock.Heading> = blocks.flatMap { block ->
+                when (block) {
+                    is CookedBlock.Heading -> listOf(block)
+                    is CookedBlock.Quote -> headings(block.blocks)
+                    is CookedBlock.ListBlock -> block.entries.flatMap(::headings)
+                    else -> emptyList()
+                }
+            }
+            headings(CookedParser.parsePostCached(post)).map { heading ->
+                TocEntry(post.id, post.postNumber, heading.level, heading.title, heading.anchor)
+            }
+        }
+    }
+    val authorFilterItems = remember(state.posts, topicAuthorUsername) {
+        val validPosts = state.posts.filter { it.userId != null }
+        val counts = validPosts.groupingBy { it.userId!! }.eachCount()
+        val firstMap = validPosts.associateBy { it.userId!! }
+        counts.mapNotNull { (userId, count) ->
+            val post = firstMap[userId] ?: return@mapNotNull null
+            AuthorFilterItem(
+                userId = userId,
+                username = post.username,
+                avatarTemplate = post.avatarTemplate,
+                isOp = post.username == topicAuthorUsername,
+                postCount = count,
+            )
+        }.sortedWith(
+            compareByDescending<AuthorFilterItem> { it.isOp }
+                .thenByDescending { it.postCount }
+        )
+    }
+    val filterAuthors = remember(authorFilterItems) {
+        authorFilterItems.map { it.userId to it.username }
     }
     LaunchedEffect(highlightedPost) {
         if (highlightedPost != null) {
@@ -278,10 +434,24 @@ fun TopicDetailScreen(
     val currentPostNumber by remember(rows, visiblePostNumbers) { derivedStateOf {
         visiblePostNumbers.maxOrNull()
     } }
+    val firstPostId = remember(rows) { rows.firstOrNull { it.post.postNumber == 1 }?.post?.id }
+    val firstPostVisible by remember(list, firstPostId) {
+        derivedStateOf { firstPostId != null && list.layoutInfo.visibleItemsInfo.any { it.key == firstPostId } }
+    }
     LaunchedEffect(visiblePostNumbers) {
         if (visiblePostNumbers.isNotEmpty()) {
             onPostsVisible(visiblePostNumbers)
         }
+    }
+    // 本次打开期间已看过的楼层:仅本地内存,与阅读进度上报解耦,不产生任何请求。
+    var sessionReadPosts by remember(topicId) { mutableStateOf(emptySet<Int>()) }
+    LaunchedEffect(visiblePostNumbers, active, showUnreadDot) {
+        if (!active || !showUnreadDot) return@LaunchedEffect
+        val pending = visiblePostNumbers.filter { it !in sessionReadPosts }
+        if (pending.isEmpty()) return@LaunchedEffect
+        // 停留一小会儿才算读过,避免飞速滑过时蓝点一闪而没、用户根本没看清。
+        delay(UNREAD_DOT_DWELL_MS)
+        sessionReadPosts = sessionReadPosts + pending
     }
     val totalPosts = state.topic?.postStream?.stream?.size ?: 0
     val firstPostLoaded = state.posts.any { it.postNumber == 1 }
@@ -325,6 +495,28 @@ fun TopicDetailScreen(
         return 1 + topErrorCount + orderBarBefore + gapBefore + rowIndex
     }
 
+    LaunchedEffect(pendingTocJump, rows) {
+        val target = pendingTocJump ?: return@LaunchedEffect
+        val index = rows.indexOfFirst { it.post.id == target.postId }
+        if (index >= 0) {
+            tocTarget = target.anchor
+            list.animateScrollToItem(lazyIndexOf(index))
+            withFrameNanos { }
+        } else {
+            // 目标楼层可能折叠着或还没加载进来。先尝试按楼层号就近定位，
+            // 仍然找不到就放弃本次跳转——绝不把 pendingTocJump 留在原地，
+            // 否则抽屉不关、界面看起来像卡死。
+            val byNumber = rows.indexOfFirst { it.post.postNumber == target.postNumber }
+            if (byNumber >= 0) {
+                tocTarget = target.anchor
+                list.animateScrollToItem(lazyIndexOf(byNumber))
+                withFrameNanos { }
+            }
+        }
+        pendingTocJump = null
+        showToc = false
+    }
+
     val onJumpToPostAction: (Int) -> Unit = { targetNum ->
         val targetIndex = rows.indexOfFirst { it.post.postNumber == targetNum }
         if (targetIndex >= 0) {
@@ -349,9 +541,16 @@ fun TopicDetailScreen(
 
     LaunchedEffect(active, initialPostNumber, state.posts, rows, treeView, state.loading, state.error, located, state.previousIds.isNotEmpty(), state.locateVersion) {
         if (active && !located && !state.loading && state.error == null && initialPostNumber != null) {
-            val targetPost = state.posts.firstOrNull { it.postNumber == initialPostNumber } ?: return@LaunchedEffect
+            // 目标楼层可能已被删除(抽楼)或超出当前加载范围。此时不能直接 return，
+            // 否则 located 永远为 false，会连带锁死倒序切换等依赖它的逻辑。
+            // 降级为「第一个不小于目标楼层的可见楼层」，再不行就按帖子顺序找最近的一层。
+            val target = state.posts.firstOrNull { it.postNumber == initialPostNumber }
+                ?: state.posts.firstOrNull { it.postNumber >= initialPostNumber }
+                ?: state.posts.minByOrNull { kotlin.math.abs(it.postNumber - initialPostNumber) }
+                ?: run { located = true; return@LaunchedEffect }
+            val anchorPostNumber = target.postNumber
             if (treeView) {
-                val ancestors = postAncestorIds(state.posts, initialPostNumber)
+                val ancestors = postAncestorIds(state.posts, anchorPostNumber)
                 val needUncollapse = collapsed.any { it in ancestors }
                 val needExpand = ancestors.any { it !in expanded }
                 if (needUncollapse || needExpand) {
@@ -363,16 +562,17 @@ fun TopicDetailScreen(
                 }
             }
             // 展开或无需展开，继续执行滚动定位（不论是否展开过父楼层）
-            val index = rows.indexOfFirst { it.post.postNumber == initialPostNumber }
+            val index = rows.indexOfFirst { it.post.postNumber == anchorPostNumber }
             if (index >= 0) {
                 list.scrollToItem(lazyIndexOf(index))
                 withFrameNanos { }
-                if (list.layoutInfo.visibleItemsInfo.none { it.key == targetPost.id }) {
+                if (list.layoutInfo.visibleItemsInfo.none { it.key == target.id }) {
                     list.scrollToItem(lazyIndexOf(index))
                 }
-                highlightedPost = targetPost.id
-                located = true
+                highlightedPost = target.id
             }
+            // 无论是否滚动成功都终结定位，避免状态悬挂。
+            located = true
         }
     }
 
@@ -449,6 +649,8 @@ fun TopicDetailScreen(
     fun RenderPostEntry(row: TreePost) {
         val post = row.post
         val isTopicAuthor = topicAuthorUsername != null && post.username == topicAuthorUsername
+        val unreadDotVisible = showUnreadDot && signedIn && !post.yours && !post.read &&
+            post.postNumber !in sessionReadPosts
         if (!treeView || row.depth == 0) {
             val hasExpandedSubtree = treeView && row.subtreeSize > 0 && post.id !in collapsed
             val unloadedTargetId = row.unloadedCandidateIds.firstOrNull { it !in state.completedReplies }
@@ -460,6 +662,8 @@ fun TopicDetailScreen(
                     isTopicAuthor = isTopicAuthor,
                     compactBottom = hasExpandedSubtree || showCollapsedSubtreeBar,
                     showReplyToHint = !treeView,
+                    unreadDotVisible = unreadDotVisible,
+                    unreadDotPosition = unreadDotPosition,
                     onPicture = { orig, thumb -> picture = orig to thumb },
                     onUnknownTag = onUnknownTag,
                     reactions = state.topic?.validReactions.orEmpty(),
@@ -470,6 +674,8 @@ fun TopicDetailScreen(
                     onReact = { onReact(post.id, it) },
                     onOpenBoost = { boostTarget = BoostTarget(post.id, post.postNumber, post.username) },
                     onDeleteBoost = { onDeleteBoost(post.id, it) },
+                    onFlagBoost = { boostId, reasonId, message -> onFlagBoost(post.id, boostId, reasonId, message) },
+                    onOpenUser = onOpenUser,
                     onRefresh = { onRefreshPost(post.id) },
                     onSolution = { onSolution(post.id) },
                     highlighted = highlightedPost == post.id,
@@ -550,6 +756,8 @@ fun TopicDetailScreen(
                     SubReplyRow(
                         row = row,
                         isTopicAuthor = isTopicAuthor,
+                        unreadDotVisible = unreadDotVisible,
+                        unreadDotPosition = unreadDotPosition,
                         onPicture = { orig, thumb -> picture = orig to thumb },
                         onUnknownTag = onUnknownTag,
                         reactions = state.topic?.validReactions.orEmpty(),
@@ -560,6 +768,8 @@ fun TopicDetailScreen(
                         onReact = { onReact(post.id, it) },
                         onOpenBoost = { boostTarget = BoostTarget(post.id, post.postNumber, post.username) },
                         onDeleteBoost = { onDeleteBoost(post.id, it) },
+                        onFlagBoost = { boostId, reasonId, message -> onFlagBoost(post.id, boostId, reasonId, message) },
+                        onOpenUser = onOpenUser,
                         onRefresh = { onRefreshPost(post.id) },
                         highlighted = highlightedPost == post.id,
                         canReply = canReply,
@@ -679,6 +889,18 @@ fun TopicDetailScreen(
     CompositionLocalProvider(
         LocalOpenTopic provides onOpenTopic,
         LocalSelectionResetKey provides selectionResetKey,
+        LocalOpenExternalUrl provides { browserUrl = it },
+        LocalVotePoll provides onVotePoll,
+        LocalPollBusy provides { postId -> postId in state.reactingPosts },
+        LocalPollError provides { postId -> state.reactionErrors[postId] },
+        LocalDecryptSelection provides { selected ->
+            val text = selected.trim()
+            if (text.isNotBlank()) {
+                decryptInput = text
+                showDecryptSheet = true
+            }
+        },
+        LocalTocTarget provides tocTarget,
     ) {
         Box(
             Modifier
@@ -745,17 +967,121 @@ fun TopicDetailScreen(
                             item("title") {
                                 Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                     Text(state.topic?.title ?: title, style = IosTheme.type.title3)
+                                    // ── 药丸工具栏（分类固定靠左，功能按键整体靠右，不散漫且防误触） ──
                                     Row(
                                         modifier = Modifier.fillMaxWidth(),
-                                        horizontalArrangement = Arrangement.SpaceBetween,
                                         verticalAlignment = Alignment.CenterVertically,
                                     ) {
-                                        state.category?.let { CategoryTag(it) } ?: Spacer(Modifier.width(1.dp))
-                                        TopicNotificationSelector(
-                                            currentLevel = state.notificationLevel,
-                                            onSelectLevel = onSetNotificationLevel,
-                                            enabled = signedIn && state.topic != null && !state.notificationLevelUpdating,
-                                        )
+                                        // 1. 分类标签（位置不动，稳定居左）
+                                        state.category?.let { CategoryTag(it) }
+
+                                        // 弹性占位：将后续功能按键组整体推向右端
+                                        Spacer(Modifier.weight(1f))
+
+                                        // 2. 功能按键组（整体靠右聚集，间距适度不散，热区舒适防误触）
+                                        Row(
+                                            modifier = Modifier.horizontalScroll(rememberScrollState()),
+                                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                            verticalAlignment = Alignment.CenterVertically,
+                                        ) {
+                                            // 目录药丸（仅当真正有目录时动态出现，保证绝对不重叠）
+                                            if (tocEntries.isNotEmpty()) {
+                                                Row(
+                                                    modifier = Modifier
+                                                        .clip(RoundedCornerShape(12.dp))
+                                                        .background(if (showToc) Color(0xFFEDE9FE) else Color(0xFFF5F3FF))
+                                                        .then(if (showToc) Modifier.border(1.2.dp, Color(0xFF7E57C2), RoundedCornerShape(12.dp)) else Modifier)
+                                                        .clickable {
+                                                            showToc = !showToc
+                                                            authorMenuExpanded = false
+                                                        }
+                                                        .padding(horizontal = 9.dp, vertical = 5.dp),
+                                                    verticalAlignment = Alignment.CenterVertically,
+                                                    horizontalArrangement = Arrangement.spacedBy(3.dp),
+                                                ) {
+                                                    Text("📖", fontSize = 11.sp)
+                                                    Text(
+                                                        text = if (showToc) "目录 ▴" else "目录 ▾",
+                                                        style = IosTheme.type.footnote,
+                                                        color = Color(0xFF7E57C2),
+                                                        fontWeight = FontWeight.SemiBold,
+                                                        maxLines = 1,
+                                                        softWrap = false,
+                                                    )
+                                                }
+                                            }
+
+                                            // 解密药丸
+                                            Row(
+                                                modifier = Modifier
+                                                    .clip(RoundedCornerShape(12.dp))
+                                                    .background(if (scannedCryptoResults.isNotEmpty()) IosTheme.colors.accent.copy(alpha = 0.12f) else Color(0xFFFFF1F0))
+                                                    .clickable { showDecryptSheet = true }
+                                                    .padding(horizontal = 9.dp, vertical = 5.dp),
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.spacedBy(3.dp),
+                                            ) {
+                                                Text("🔑", fontSize = 11.sp)
+                                                Text(
+                                                    text = if (scannedCryptoResults.isNotEmpty()) "解密 (${scannedCryptoResults.size})" else "解密",
+                                                    style = IosTheme.type.footnote,
+                                                    color = if (scannedCryptoResults.isNotEmpty()) IosTheme.colors.accent else Color(0xFFE53935),
+                                                    fontWeight = FontWeight.Medium,
+                                                    maxLines = 1,
+                                                    softWrap = false,
+                                                )
+                                            }
+
+                                            // 筛选药丸 (展开态与筛选态高亮)
+                                            if (authorFilterItems.isNotEmpty()) {
+                                                val isFiltered = state.filterUserId != null
+                                                val pillBg = when {
+                                                    authorMenuExpanded -> Color(0xFFE0F2FE)
+                                                    isFiltered -> IosTheme.colors.accent.copy(alpha = 0.12f)
+                                                    IosTheme.colors.isDark -> Color(0xFF2C2C2E)
+                                                    else -> IosTheme.colors.fieldBackground
+                                                }
+                                                val pillTextColor = when {
+                                                    authorMenuExpanded || isFiltered -> Color(0xFF0284C7)
+                                                    IosTheme.colors.isDark -> Color(0xFFE5E5EA)
+                                                    else -> IosTheme.colors.label
+                                                }
+                                                Row(
+                                                    modifier = Modifier
+                                                        .clip(RoundedCornerShape(12.dp))
+                                                        .background(pillBg)
+                                                        .then(if (authorMenuExpanded) Modifier.border(1.5.dp, Color(0xFF0284C7), RoundedCornerShape(12.dp)) else Modifier)
+                                                        .clickable {
+                                                            authorMenuExpanded = !authorMenuExpanded
+                                                            showToc = false
+                                                        }
+                                                        .padding(horizontal = 9.dp, vertical = 5.dp),
+                                                    verticalAlignment = Alignment.CenterVertically,
+                                                    horizontalArrangement = Arrangement.spacedBy(3.dp),
+                                                ) {
+                                                    val selectedName = authorFilterItems.firstOrNull { it.userId == state.filterUserId }?.username
+                                                    Text(
+                                                        text = when {
+                                                            selectedName != null -> "只看 $selectedName ${if (authorMenuExpanded) "▴" else "▾"}"
+                                                            authorMenuExpanded -> "筛选 ▴"
+                                                            else -> "筛选 ▾"
+                                                        },
+                                                        style = IosTheme.type.footnote,
+                                                        color = pillTextColor,
+                                                        fontWeight = if (authorMenuExpanded || isFiltered) FontWeight.SemiBold else FontWeight.Medium,
+                                                        maxLines = 1,
+                                                        softWrap = false,
+                                                    )
+                                                }
+                                            }
+
+                                            // 关注/通知级别药丸
+                                            TopicNotificationSelector(
+                                                currentLevel = state.notificationLevel,
+                                                onSelectLevel = onSetNotificationLevel,
+                                                enabled = signedIn && state.topic != null && !state.notificationLevelUpdating,
+                                            )
+                                        }
                                     }
                                 }
                             }
@@ -802,7 +1128,7 @@ fun TopicDetailScreen(
                             }
                         }
                         // 左下角放阅读进度胶囊，右下角放回复按钮，配合列表底部 76dp 留白，彻底避免遮挡最后一条评论的操作栏。
-                        if (currentPostNumber != null && totalPosts > 1) {
+                        if (currentPostNumber != null && currentPostNumber!! > 20 && totalPosts > 20 && !firstPostVisible) {
                             ReadingProgressPill(
                                 current = currentPostNumber ?: 1,
                                 total = totalPosts,
@@ -831,6 +1157,36 @@ fun TopicDetailScreen(
                                     .border(1.dp, Color(0xFF34C759).copy(alpha = 0.4f), RoundedCornerShape(10.dp))
                                     .padding(horizontal = 12.dp, vertical = 10.dp),
                             )
+                        }
+                        if (scannedCryptoResults.isNotEmpty() && showCryptoPill) {
+                            Row(
+                                modifier = Modifier
+                                    .align(Alignment.BottomEnd)
+                                    .padding(horizontal = 16.dp, vertical = 72.dp)
+                                    .clip(RoundedCornerShape(20.dp))
+                                    .background(IosTheme.colors.card.copy(alpha = 0.95f))
+                                    .border(1.dp, IosTheme.colors.accent.copy(alpha = 0.6f), RoundedCornerShape(20.dp))
+                                    .clickable { showDecryptSheet = true }
+                                    .padding(horizontal = 14.dp, vertical = 9.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                Text("🔍", style = IosTheme.type.footnote)
+                                Text(
+                                    "发现 ${scannedCryptoResults.size} 处加密内容",
+                                    style = IosTheme.type.footnote,
+                                    color = IosTheme.colors.accent,
+                                    fontWeight = FontWeight.Medium,
+                                )
+                                Text(
+                                    "✕",
+                                    style = IosTheme.type.caption,
+                                    color = IosTheme.colors.secondaryLabel,
+                                    modifier = Modifier
+                                        .clickable { showCryptoPill = false }
+                                        .padding(start = 4.dp),
+                                )
+                            }
                         }
                     }
                 }
@@ -866,6 +1222,325 @@ fun TopicDetailScreen(
         }
     }
     picture?.let { (orig, thumb) -> ImageViewer(orig, thumb) { picture = null } }
+    browserUrl?.let { url ->
+        InAppBrowserSheet(url = url, onDismiss = { browserUrl = null })
+    }
+    if (showDecryptSheet || decryptInput != null) {
+        DecryptBottomSheet(
+            selectedText = decryptInput,
+            scannedResults = scannedCryptoResults,
+            onOpenUrl = { url ->
+                showDecryptSheet = false
+                decryptInput = null
+                browserUrl = url
+            },
+            onDismiss = {
+                showDecryptSheet = false
+                decryptInput = null
+            },
+        )
+    }
+    if (showToc) {
+        Dialog(
+            onDismissRequest = { showToc = false },
+            properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false),
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .clickable(
+                        interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() },
+                        indication = null,
+                        onClick = { showToc = false },
+                    )
+                    .padding(top = 96.dp, start = 20.dp, end = 20.dp),
+                contentAlignment = Alignment.TopCenter,
+            ) {
+                Column(
+                    modifier = Modifier
+                        .widthIn(max = 320.dp)
+                        .fillMaxWidth()
+                        .shadow(elevation = 16.dp, shape = RoundedCornerShape(16.dp))
+                        .clip(RoundedCornerShape(16.dp))
+                        .background(IosTheme.colors.card)
+                        .clickable(interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }, indication = null) {}
+                        .padding(horizontal = 16.dp, vertical = 14.dp),
+                ) {
+                    // Header: 文章目录 + 关闭 ✕
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            text = "文章目录",
+                            style = IosTheme.type.headline,
+                            fontWeight = FontWeight.Bold,
+                            color = IosTheme.colors.label,
+                        )
+                        Box(
+                            modifier = Modifier
+                                .size(28.dp)
+                                .clip(CircleShape)
+                                .clickable { showToc = false },
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Text("✕", fontSize = 14.sp, color = IosTheme.colors.secondaryLabel)
+                        }
+                    }
+
+                    Spacer(Modifier.height(8.dp))
+                    IosDivider()
+                    Spacer(Modifier.height(4.dp))
+
+                    // 目录项列表
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 360.dp)
+                            .verticalScroll(rememberScrollState()),
+                    ) {
+                        tocEntries.forEachIndexed { index, entry ->
+                            val isCurrent = entry.anchor == tocTarget || (pendingTocJump == null && index == 0)
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .clickable {
+                                        onSetFilterUser(null)
+                                        pendingTocJump = entry
+                                        showToc = false
+                                    }
+                                    .padding(vertical = 10.dp, horizontal = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                if (isCurrent) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(6.dp)
+                                            .background(IosTheme.colors.accent, CircleShape),
+                                    )
+                                    Spacer(Modifier.width(6.dp))
+                                }
+                                Text(
+                                    text = "${index + 1}. ${entry.title}",
+                                    style = IosTheme.type.body.copy(fontSize = 14.sp),
+                                    fontWeight = if (isCurrent) FontWeight.Bold else FontWeight.Normal,
+                                    color = if (isCurrent) IosTheme.colors.accent else IosTheme.colors.label,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.weight(1f),
+                                )
+                                Spacer(Modifier.width(8.dp))
+                                Text(
+                                    text = "→",
+                                    fontSize = 13.sp,
+                                    color = IosTheme.colors.tertiaryLabel,
+                                )
+                            }
+                            if (index < tocEntries.lastIndex) {
+                                IosDivider(modifier = Modifier.padding(vertical = 1.dp))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (authorMenuExpanded) {
+        Dialog(
+            onDismissRequest = { authorMenuExpanded = false },
+            properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false),
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .clickable(
+                        interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() },
+                        indication = null,
+                        onClick = { authorMenuExpanded = false },
+                    )
+                    .padding(top = 96.dp, start = 20.dp, end = 20.dp),
+                contentAlignment = Alignment.TopCenter,
+            ) {
+                Column(
+                    modifier = Modifier
+                        .widthIn(max = 320.dp)
+                        .fillMaxWidth()
+                        .shadow(elevation = 16.dp, shape = RoundedCornerShape(16.dp))
+                        .clip(RoundedCornerShape(16.dp))
+                        .background(IosTheme.colors.card)
+                        .clickable(interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }, indication = null) {}
+                        .padding(horizontal = 16.dp, vertical = 14.dp),
+                ) {
+                    // Header: 筛选发言者 + 关闭 ✕
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            text = "筛选发言者",
+                            style = IosTheme.type.headline,
+                            fontWeight = FontWeight.Bold,
+                            color = IosTheme.colors.label,
+                        )
+                        Box(
+                            modifier = Modifier
+                                .size(28.dp)
+                                .clip(CircleShape)
+                                .clickable { authorMenuExpanded = false },
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Text("✕", fontSize = 14.sp, color = IosTheme.colors.secondaryLabel)
+                        }
+                    }
+
+                    Spacer(Modifier.height(8.dp))
+                    IosDivider()
+                    Spacer(Modifier.height(4.dp))
+
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 380.dp)
+                            .verticalScroll(rememberScrollState()),
+                    ) {
+                        // 首项: 全部作者
+                        val isAllSelected = state.filterUserId == null
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(8.dp))
+                                .clickable {
+                                    authorMenuExpanded = false
+                                    onSetFilterUser(null)
+                                }
+                                .padding(vertical = 10.dp, horizontal = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(28.dp)
+                                    .clip(CircleShape)
+                                    .background(IosTheme.colors.fieldBackground),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Text("👥", fontSize = 13.sp)
+                            }
+                            Spacer(Modifier.width(10.dp))
+                            Text(
+                                text = "全部楼层",
+                                style = IosTheme.type.body.copy(fontSize = 14.sp),
+                                fontWeight = if (isAllSelected) FontWeight.SemiBold else FontWeight.Normal,
+                                color = IosTheme.colors.label,
+                                modifier = Modifier.weight(1f),
+                            )
+                            if (isAllSelected) {
+                                Text("✓", fontSize = 15.sp, fontWeight = FontWeight.Bold, color = IosTheme.colors.accent)
+                            }
+                        }
+
+                        IosDivider(modifier = Modifier.padding(vertical = 1.dp))
+
+                        // 各发言者项
+                        authorFilterItems.forEachIndexed { idx, item ->
+                            val isSelected = state.filterUserId == item.userId
+                            val avatarUrl = item.avatarTemplate?.let { org.linuxdo.android.data.avatarUrlOf(it, size = 96) }
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .clickable {
+                                        authorMenuExpanded = false
+                                        onSetFilterUser(item.userId)
+                                    }
+                                    .padding(vertical = 8.dp, horizontal = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                // 头像
+                                if (!avatarUrl.isNullOrBlank()) {
+                                    AsyncImage(
+                                        model = avatarUrl,
+                                        contentDescription = item.username,
+                                        contentScale = androidx.compose.ui.layout.ContentScale.Crop,
+                                        modifier = Modifier
+                                            .size(28.dp)
+                                            .clip(CircleShape)
+                                            .background(IosTheme.colors.fieldBackground),
+                                    )
+                                } else {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(28.dp)
+                                            .clip(CircleShape)
+                                            .background(Color(0xFFE1F0FF)),
+                                        contentAlignment = Alignment.Center,
+                                    ) {
+                                        Text(
+                                            text = item.username.firstOrNull()?.uppercase() ?: "U",
+                                            fontSize = 13.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            color = IosTheme.colors.accent,
+                                        )
+                                    }
+                                }
+
+                                Spacer(Modifier.width(10.dp))
+
+                                // 用户名与楼主标识
+                                Row(
+                                    modifier = Modifier.weight(1f),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                ) {
+                                    Text(
+                                        text = item.username,
+                                        style = IosTheme.type.body.copy(fontSize = 14.sp),
+                                        fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal,
+                                        color = if (isSelected) IosTheme.colors.accent else IosTheme.colors.label,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                    if (item.isOp) {
+                                        Box(
+                                            modifier = Modifier
+                                                .clip(RoundedCornerShape(4.dp))
+                                                .background(Color(0xFFE0F2FE))
+                                                .padding(horizontal = 5.dp, vertical = 1.dp),
+                                        ) {
+                                            Text(
+                                                text = "楼主",
+                                                style = IosTheme.type.caption.copy(fontSize = 10.sp, fontWeight = FontWeight.SemiBold),
+                                                color = Color(0xFF0284C7),
+                                            )
+                                        }
+                                    }
+                                }
+
+                                // 发帖数胶囊
+                                Box(
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(6.dp))
+                                        .background(IosTheme.colors.fieldBackground)
+                                        .padding(horizontal = 7.dp, vertical = 2.dp),
+                                ) {
+                                    Text(
+                                        text = "${item.postCount} 帖",
+                                        style = IosTheme.type.caption.copy(fontSize = 11.sp),
+                                        color = IosTheme.colors.secondaryLabel,
+                                    )
+                                }
+                            }
+                            if (idx < authorFilterItems.lastIndex) {
+                                IosDivider(modifier = Modifier.padding(vertical = 1.dp))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     manageTarget?.let { post ->
         PostManageDialog(post, onDismiss = { manageTarget = null },
             onEdit = {
@@ -1831,7 +2506,7 @@ private fun ComposerSheet(
     val busy = composer.submitting || composer.uploading
 
     BackHandler(enabled = true) {
-        if (!busy) onClose()
+        onClose()
     }
 
     Box(
@@ -1846,7 +2521,7 @@ private fun ComposerSheet(
                 .clickable(
                     interactionSource = remember { MutableInteractionSource() },
                     indication = null,
-                    onClick = { if (!busy) onClose() },
+                    onClick = { onClose() },
                 ),
         )
         // 底部抽屉面板
@@ -1883,7 +2558,7 @@ private fun ComposerSheet(
                     modifier = Modifier
                         .size(32.dp)
                         .clip(CircleShape)
-                        .clickable(enabled = !busy) { onClose() },
+                        .clickable { onClose() },
                     contentAlignment = Alignment.Center,
                 ) {
                     Canvas(Modifier.size(12.dp)) {
@@ -2185,6 +2860,30 @@ private fun AuthorBadge() {
     }
 }
 
+/** 未读蓝点停留多久才算"读过"并开始淡出。 */
+private const val UNREAD_DOT_DWELL_MS = 1_200L
+
+/**
+ * 楼层号右侧的未读小蓝点。变为已读时淡出并收起宽度,
+ * 让楼层号仍然贴着右边距,不留空位。
+ */
+@Composable
+private fun UnreadDot(visible: Boolean) {
+    AnimatedVisibility(
+        visible = visible,
+        enter = fadeIn(tween(200)),
+        exit = fadeOut(tween(500)) + shrinkHorizontally(tween(500)),
+    ) {
+        Box(
+            Modifier
+                .padding(start = 4.dp)
+                .size(6.dp)
+                .clip(CircleShape)
+                .background(IosTheme.colors.accent),
+        )
+    }
+}
+
 @Composable
 @OptIn(ExperimentalFoundationApi::class)
 private fun PostRow(
@@ -2192,6 +2891,8 @@ private fun PostRow(
     isTopicAuthor: Boolean = false,
     compactBottom: Boolean = false,
     showReplyToHint: Boolean = true,
+    unreadDotVisible: Boolean = false,
+    unreadDotPosition: UnreadDotPosition = UnreadDotPosition.Avatar,
     onPicture: (String, String) -> Unit,
     onUnknownTag: (String) -> Unit,
     reactions: List<String>,
@@ -2202,6 +2903,8 @@ private fun PostRow(
     onReact: (String) -> Unit,
     onOpenBoost: () -> Unit,
     onDeleteBoost: (Long) -> Unit,
+    onFlagBoost: (Long, Int, String?) -> Unit = { _, _, _ -> },
+    onOpenUser: (String, String?, String?, String?) -> Unit = { _, _, _, _ -> },
     onRefresh: () -> Unit,
     onSolution: () -> Unit,
     canReply: Boolean,
@@ -2218,7 +2921,7 @@ private fun PostRow(
     signedIn: Boolean = false,
     canFlag: Boolean = !post.yours,
 ) {
-    val blocks = remember(post.cooked) { CookedParser.parseCached(post.cooked, onUnknownTag) }
+    val blocks = remember(post) { CookedParser.parsePostCached(post, onUnknownTag) }
     val background = if (highlighted) IosTheme.colors.accent.copy(alpha = 0.12f) else IosTheme.colors.card
     val canManage = post.canEdit || post.canDelete
     Column(
@@ -2239,22 +2942,56 @@ private fun PostRow(
             ),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            val postAvatarUrl = avatarUrlOf(post.avatarTemplate, post.animatedAvatar)
+            val postAvatarUrl = avatarUrlOf(post.avatarTemplate, post.animatedAvatar, username = post.username)
             val staticAvatarUrl = avatarUrlOf(post.avatarTemplate, null)
-            UserAvatar(
-                avatarUrl = postAvatarUrl,
-                fallbackUrl = staticAvatarUrl,
-                username = post.username,
-                modifier = Modifier.size(32.dp),
-                cornerRadius = 4.dp,
-            )
+            val displayName = post.displayName.ifBlank { post.username }
+            Box {
+                UserAvatar(
+                    avatarUrl = postAvatarUrl,
+                    fallbackUrl = staticAvatarUrl,
+                    username = post.username,
+                    modifier = Modifier.size(32.dp).clickable {
+                        AvatarCache.record(post.username, post.animatedAvatar)
+                        onOpenUser(post.username, postAvatarUrl, staticAvatarUrl, displayName)
+                    },
+                    cornerRadius = 4.dp,
+                )
+                if (unreadDotVisible && unreadDotPosition == UnreadDotPosition.Avatar) {
+                    Box(
+                        Modifier
+                            .size(7.dp)
+                            .align(Alignment.TopEnd)
+                            .offset(x = 1.dp, y = (-1).dp)
+                            .clip(CircleShape)
+                            .background(IosTheme.colors.card)
+                            .padding(1.dp)
+                            .clip(CircleShape)
+                            .background(IosTheme.colors.accent),
+                    )
+                }
+            }
             Column(Modifier.weight(1f).padding(start = 10.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    val displayName = post.displayName.ifBlank { post.username }
-                    Text(displayName, style = IosTheme.type.subheadline, fontWeight = FontWeight.SemiBold)
+                    Text(
+                        displayName,
+                        style = IosTheme.type.subheadline,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.clickable {
+                            AvatarCache.record(post.username, post.animatedAvatar)
+                            onOpenUser(post.username, postAvatarUrl, staticAvatarUrl, displayName)
+                        },
+                    )
                     if (!post.name.isNullOrBlank() && post.name != post.username) {
                         Spacer(Modifier.width(4.dp))
-                        Text("@${post.username}", style = IosTheme.type.caption, color = IosTheme.colors.secondaryLabel)
+                        Text(
+                            "@${post.username}",
+                            style = IosTheme.type.caption,
+                            color = IosTheme.colors.secondaryLabel,
+                            modifier = Modifier.clickable {
+                                AvatarCache.record(post.username, post.animatedAvatar)
+                                onOpenUser(post.username, postAvatarUrl, staticAvatarUrl, displayName)
+                            },
+                        )
                     }
                     if (isTopicAuthor) {
                         Spacer(Modifier.width(4.dp))
@@ -2289,10 +3026,15 @@ private fun PostRow(
                 }
                 Text(RelativeTime.format(post.createdAt), style = IosTheme.type.caption, color = IosTheme.colors.secondaryLabel)
             }
-            Text("#${post.postNumber}", style = IosTheme.type.footnote, color = IosTheme.colors.secondaryLabel)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("#${post.postNumber}", style = IosTheme.type.footnote, color = IosTheme.colors.secondaryLabel)
+                if (unreadDotPosition == UnreadDotPosition.FloorRight) {
+                    UnreadDot(unreadDotVisible)
+                }
+            }
         }
         if (post.acceptedAnswer) Text("✓ 解决方案", style = IosTheme.type.footnote, color = Color(0xFF30B85B))
-        CookedContent(blocks, onPicture)
+        CookedContent(blocks, onPicture, pollPost = post)
         PostActions(
             post = post,
             reactions = reactions,
@@ -2303,6 +3045,8 @@ private fun PostRow(
             onReact = onReact,
             onOpenBoost = onOpenBoost,
             onDeleteBoost = onDeleteBoost,
+            onFlagBoost = onFlagBoost,
+            onOpenUser = onOpenUser,
             onRefresh = onRefresh,
             onSolution = onSolution,
             canReply = canReply,
@@ -2327,6 +3071,8 @@ private fun PostRow(
 private fun SubReplyRow(
     row: TreePost,
     isTopicAuthor: Boolean,
+    unreadDotVisible: Boolean = false,
+    unreadDotPosition: UnreadDotPosition = UnreadDotPosition.Avatar,
     onPicture: (String, String) -> Unit,
     onUnknownTag: (String) -> Unit,
     reactions: List<String>,
@@ -2337,6 +3083,8 @@ private fun SubReplyRow(
     onReact: (String) -> Unit,
     onOpenBoost: () -> Unit,
     onDeleteBoost: (Long) -> Unit,
+    onFlagBoost: (Long, Int, String?) -> Unit = { _, _, _ -> },
+    onOpenUser: (String, String?, String?, String?) -> Unit = { _, _, _, _ -> },
     onRefresh: () -> Unit,
     highlighted: Boolean,
     canReply: Boolean,
@@ -2354,7 +3102,7 @@ private fun SubReplyRow(
     canFlag: Boolean = !row.post.yours,
 ) {
     val post = row.post
-    val blocks = remember(post.cooked) { CookedParser.parseCached(post.cooked, onUnknownTag) }
+    val blocks = remember(post) { CookedParser.parsePostCached(post, onUnknownTag) }
     val canManage = post.canEdit || post.canDelete
     val bg = if (highlighted) IosTheme.colors.accent.copy(alpha = 0.14f) else Color.Transparent
     Column(
@@ -2373,24 +3121,47 @@ private fun SubReplyRow(
             ),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            val subAvatarUrl = avatarUrlOf(post.avatarTemplate, post.animatedAvatar)
+            val subAvatarUrl = avatarUrlOf(post.avatarTemplate, post.animatedAvatar, username = post.username)
             val subStaticAvatarUrl = avatarUrlOf(post.avatarTemplate, null)
-            UserAvatar(
-                avatarUrl = subAvatarUrl,
-                fallbackUrl = subStaticAvatarUrl,
-                username = post.username,
-                modifier = Modifier.size(20.dp),
-                cornerRadius = 3.dp,
-            )
+            val subDisplayName = post.displayName.ifBlank { post.username }
+            Box {
+                UserAvatar(
+                    avatarUrl = subAvatarUrl,
+                    fallbackUrl = subStaticAvatarUrl,
+                    username = post.username,
+                    modifier = Modifier.size(20.dp).clickable {
+                        AvatarCache.record(post.username, post.animatedAvatar)
+                        onOpenUser(post.username, subAvatarUrl, subStaticAvatarUrl, subDisplayName)
+                    },
+                    cornerRadius = 3.dp,
+                )
+                if (unreadDotVisible && unreadDotPosition == UnreadDotPosition.Avatar) {
+                    Box(
+                        Modifier
+                            .size(6.dp)
+                            .align(Alignment.TopEnd)
+                            .offset(x = 1.dp, y = (-1).dp)
+                            .clip(CircleShape)
+                            .background(IosTheme.colors.card)
+                            .padding(1.dp)
+                            .clip(CircleShape)
+                            .background(IosTheme.colors.accent),
+                    )
+                }
+            }
             Row(
                 Modifier.weight(1f).padding(start = 6.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
-                    text = post.displayName.ifBlank { post.username },
+                    text = subDisplayName,
                     style = IosTheme.type.footnote,
                     fontWeight = FontWeight.SemiBold,
                     color = IosTheme.colors.secondaryLabel,
+                    modifier = Modifier.clickable {
+                        AvatarCache.record(post.username, post.animatedAvatar)
+                        onOpenUser(post.username, subAvatarUrl, subStaticAvatarUrl, subDisplayName)
+                    },
                 )
                 if (isTopicAuthor) AuthorBadge()
                 row.replyToUsername?.takeIf { it.isNotBlank() }?.let { targetUser ->
@@ -2404,17 +3175,23 @@ private fun SubReplyRow(
                         style = IosTheme.type.footnote,
                         fontWeight = FontWeight.SemiBold,
                         color = IosTheme.colors.secondaryLabel,
+                        modifier = Modifier.clickable { onOpenUser(targetUser, null, null, null) },
                     )
                 }
             }
-            Text(
-                text = "${RelativeTime.format(post.createdAt)} · #${post.postNumber}",
-                style = IosTheme.type.caption,
-                color = IosTheme.colors.tertiaryLabel,
-            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = "${RelativeTime.format(post.createdAt)} · #${post.postNumber}",
+                    style = IosTheme.type.caption,
+                    color = IosTheme.colors.tertiaryLabel,
+                )
+                if (unreadDotPosition == UnreadDotPosition.FloorRight) {
+                    UnreadDot(unreadDotVisible)
+                }
+            }
         }
         if (post.acceptedAnswer) Text("✓ 解决方案", style = IosTheme.type.caption, color = Color(0xFF30B85B))
-        CookedContent(blocks, onPicture, subReply = true)
+        CookedContent(blocks, onPicture, subReply = true, pollPost = post)
         PostActions(
             post = post,
             reactions = reactions,
@@ -2425,6 +3202,8 @@ private fun SubReplyRow(
             onReact = onReact,
             onOpenBoost = onOpenBoost,
             onDeleteBoost = onDeleteBoost,
+            onFlagBoost = onFlagBoost,
+            onOpenUser = onOpenUser,
             onRefresh = onRefresh,
             onSolution = {},
             canReply = canReply,
@@ -2465,6 +3244,8 @@ private fun PostActions(
     onReact: (String) -> Unit,
     onOpenBoost: () -> Unit,
     onDeleteBoost: (Long) -> Unit,
+    onFlagBoost: (Long, Int, String?) -> Unit = { _, _, _ -> },
+    onOpenUser: (String, String?, String?, String?) -> Unit = { _, _, _, _ -> },
     onRefresh: () -> Unit,
     onSolution: () -> Unit,
     canReply: Boolean,
@@ -2481,6 +3262,9 @@ private fun PostActions(
     var chooseReaction by remember { mutableStateOf(false) }
     var visibleBoosts by rememberSaveable(post.id) { mutableIntStateOf(8) }
     var deleteId by remember { mutableStateOf<Long?>(null) }
+    var boostActionTarget by remember { mutableStateOf<Boost?>(null) }
+    val clipboardManager = LocalClipboardManager.current
+    val context = LocalContext.current
     if (post.reactions.any { it.count > 0 }) {
         Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             post.reactions.filter { it.count > 0 }.forEach { reaction ->
@@ -2666,9 +3450,13 @@ private fun PostActions(
                 val content = remember(boost.cooked) { CookedParser.parseCached(boost.cooked) }
                 Row(Modifier.widthIn(max = 260.dp).clip(RoundedCornerShape(50))
                     .background(chipBg)
-                    .combinedClickable(enabled = boost.canDelete && !busy, onClick = {}, onLongClick = { deleteId = boost.id })
+                    .combinedClickable(
+                        enabled = !busy,
+                        onClick = { boostActionTarget = boost },
+                        onLongClick = if (boost.canDelete) ({ deleteId = boost.id }) else null,
+                    )
                     .padding(horizontal = 5.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-                    val boostAvatarUrl = avatarUrlOf(boost.user?.avatarTemplate, boost.user?.animatedAvatar)
+                    val boostAvatarUrl = avatarUrlOf(boost.user?.avatarTemplate, boost.user?.animatedAvatar, username = boost.user?.username)
                     val boostStaticAvatarUrl = avatarUrlOf(boost.user?.avatarTemplate, null)
                     UserAvatar(
                         avatarUrl = boostAvatarUrl,
@@ -2686,6 +3474,31 @@ private fun PostActions(
       }
         if (visibleBoosts < post.boosts.size) IosTextAction("更多简评 (${post.boosts.size - visibleBoosts})", textStyle = IosTheme.type.caption) { visibleBoosts += 20 }
         else if (visibleBoosts > 8) IosTextAction("收起简评", textStyle = IosTheme.type.caption) { visibleBoosts = 8 }
+    }
+    boostActionTarget?.let { boost ->
+        BoostActionSheet(
+            boost = boost,
+            onDismiss = { boostActionTarget = null },
+            onOpenAuthor = { username ->
+                boostActionTarget = null
+                AvatarCache.record(boost.user?.username, boost.user?.animatedAvatar)
+                val bAvatar = avatarUrlOf(boost.user?.avatarTemplate, boost.user?.animatedAvatar, username = boost.user?.username)
+                val bStatic = avatarUrlOf(boost.user?.avatarTemplate, null)
+                onOpenUser(username, bAvatar, bStatic, boost.user?.name)
+            },
+            onCopy = { text ->
+                clipboardManager.setText(AnnotatedString(text))
+                Toast.makeText(context, "简评已复制", Toast.LENGTH_SHORT).show()
+            },
+            onFlag = { reasonId, message ->
+                boostActionTarget = null
+                onFlagBoost(boost.id, reasonId, message)
+            },
+            onDelete = {
+                boostActionTarget = null
+                deleteId = boost.id
+            },
+        )
     }
     deleteId?.let { id -> Dialog(onDismissRequest = { deleteId = null }) {
         Column(
@@ -2741,6 +3554,246 @@ private fun PostActions(
             }
         }
     } }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun BoostActionSheet(
+    boost: Boost,
+    onDismiss: () -> Unit,
+    onOpenAuthor: (String) -> Unit,
+    onCopy: (String) -> Unit,
+    onFlag: (Int, String?) -> Unit,
+    onDelete: () -> Unit,
+) {
+    val author = boost.user
+    val cookedText = remember(boost.cooked) {
+        val doc = Jsoup.parse(boost.cooked)
+        doc.select("img").forEach { img ->
+            val emojiCode = img.attr("title").ifBlank { img.attr("alt") }
+            img.replaceWith(org.jsoup.nodes.TextNode(emojiCode))
+        }
+        android.text.Html.fromHtml(doc.body().html(), android.text.Html.FROM_HTML_MODE_COMPACT)
+            .toString()
+            .replace("\uFFFC", "")
+            .replace("\uFFFD", "")
+            .trim()
+    }
+    var showFlagDialog by remember(boost.id) { mutableStateOf(false) }
+    var selectedReason by remember(boost.id) { mutableStateOf(PostFlagReason.Spam) }
+    var message by rememberSaveable(boost.id) { mutableStateOf("") }
+
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = sheetState,
+        containerColor = IosTheme.colors.card,
+    ) {
+        Column(
+            Modifier
+                .fillMaxWidth()
+                .sheetScrollable()
+                .padding(horizontal = 20.dp, vertical = 8.dp)
+                .navigationBarsPadding(),
+            verticalArrangement = Arrangement.spacedBy(14.dp),
+        ) {
+            val identity = remember(author) {
+                UserCardData(
+                    id = author?.id ?: 0L,
+                    username = author?.username.orEmpty().ifBlank { "unknown" },
+                    name = author?.name?.takeIf { it.isNotBlank() } ?: "简评作者",
+                    avatarTemplate = author?.avatarTemplate,
+                    animatedAvatar = author?.animatedAvatar,
+                    trustLevel = author?.trustLevel,
+                )
+            }
+            CompactUserIdentityHeader(
+                user = identity,
+                modifier = Modifier.clickable(enabled = !author?.username.isNullOrBlank()) {
+                    author?.username?.let(onOpenAuthor)
+                },
+            )
+            Text(
+                cookedText.ifBlank { "（无文本内容）" },
+                style = IosTheme.type.body.copy(fontSize = 17.sp, lineHeight = 25.sp),
+                color = IosTheme.colors.label,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            IosDivider(startIndent = 0.dp)
+            author?.username?.let { username ->
+                BoostActionCard(
+                    label = "查看作者资料",
+                    icon = "person",
+                    onClick = { onOpenAuthor(username) },
+                )
+            }
+            BoostActionCard(
+                label = "复制简评文本",
+                icon = "copy",
+                emphasized = true,
+                showsChevron = false,
+                onClick = { onCopy(cookedText) },
+            )
+            if (boost.canFlag) {
+                BoostActionCard(
+                    label = "举报此简评",
+                    icon = "warning",
+                    destructive = true,
+                    showsChevron = false,
+                    onClick = { showFlagDialog = true },
+                )
+            }
+            if (boost.canDelete) {
+                BoostActionCard(
+                    label = "删除简评",
+                    icon = "delete",
+                    destructive = true,
+                    showsChevron = false,
+                    onClick = onDelete,
+                )
+            }
+            Spacer(Modifier.height(6.dp))
+        }
+    }
+
+    if (showFlagDialog) Dialog(onDismissRequest = { showFlagDialog = false }) {
+        Column(
+            Modifier.fillMaxWidth().widthIn(max = 380.dp).clip(RoundedCornerShape(12.dp))
+                .background(IosTheme.colors.card).padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text("举报简评", style = IosTheme.type.headline, color = IosTheme.colors.label)
+            PostFlagReason.entries.forEach { reason ->
+                Row(
+                    Modifier.fillMaxWidth().clickable { selectedReason = reason }.padding(vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    RadioButton(selected = selectedReason == reason, onClick = { selectedReason = reason })
+                    Column {
+                        Text(reason.title, style = IosTheme.type.subheadline)
+                        Text(reason.description, style = IosTheme.type.caption, color = IosTheme.colors.secondaryLabel)
+                    }
+                }
+            }
+            if (selectedReason.requiresMessage) {
+                OutlinedTextField(
+                    value = message,
+                    onValueChange = { message = it.take(500) },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("补充说明") },
+                    minLines = 2,
+                    maxLines = 4,
+                )
+            }
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                TextButton(onClick = { showFlagDialog = false }) { Text("取消") }
+                TextButton(
+                    enabled = !selectedReason.requiresMessage || message.isNotBlank(),
+                    onClick = {
+                        showFlagDialog = false
+                        onFlag(selectedReason.id, message.takeIf { selectedReason.requiresMessage })
+                    },
+                ) { Text("提交") }
+            }
+        }
+    }
+}
+
+@Composable
+private fun BoostActionCard(
+    label: String,
+    icon: String,
+    onClick: () -> Unit,
+    emphasized: Boolean = false,
+    destructive: Boolean = false,
+    showsChevron: Boolean = true,
+) {
+    val isDark = IosTheme.colors.isDark
+    val foreground = when {
+        destructive -> IosTheme.colors.destructive
+        emphasized -> if (isDark) Color(0xFFD8EEFF) else Color(0xFF145A8D)
+        else -> IosTheme.colors.label
+    }
+    val background = when {
+        destructive -> if (isDark) Color(0xFF301E22) else Color(0xFFFFF0F0)
+        emphasized -> if (isDark) Color(0xFF224562) else Color(0xFFE0F1FF)
+        else -> if (isDark) Color(0xFF24262D) else Color(0xFFF5F7FA)
+    }
+    val border = when {
+        destructive -> IosTheme.colors.destructive.copy(alpha = if (isDark) 0.58f else 0.38f)
+        emphasized -> if (isDark) Color(0xFF5A9EC8) else Color(0xFF9CCAE8)
+        else -> IosTheme.colors.separator.copy(alpha = 0.65f)
+    }
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(58.dp)
+            .clip(RoundedCornerShape(14.dp))
+            .background(background)
+            .border(1.dp, border, RoundedCornerShape(14.dp))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 18.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        BoostActionGlyph(icon = icon, tint = foreground, modifier = Modifier.size(28.dp))
+        Text(
+            text = label,
+            fontSize = 17.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = foreground,
+            modifier = Modifier.padding(start = 16.dp).weight(1f),
+        )
+        if (showsChevron) {
+            Text(
+                text = "›",
+                fontSize = 34.sp,
+                lineHeight = 28.sp,
+                color = IosTheme.colors.secondaryLabel,
+            )
+        }
+    }
+}
+
+@Composable
+private fun BoostActionGlyph(icon: String, tint: Color, modifier: Modifier = Modifier) {
+    Canvas(modifier) {
+        val stroke = Stroke(width = size.minDimension * 0.09f, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        val width = size.width
+        val height = size.height
+        when (icon) {
+            "person" -> {
+                drawCircle(tint, radius = width * 0.19f, center = Offset(width * 0.5f, height * 0.3f))
+                val body = Path().apply {
+                    moveTo(width * 0.17f, height * 0.84f)
+                    cubicTo(width * 0.2f, height * 0.57f, width * 0.8f, height * 0.57f, width * 0.83f, height * 0.84f)
+                    close()
+                }
+                drawPath(body, tint)
+            }
+            "copy" -> {
+                drawRoundRect(
+                    color = tint,
+                    topLeft = Offset(width * 0.27f, height * 0.2f),
+                    size = androidx.compose.ui.geometry.Size(width * 0.52f, height * 0.62f),
+                    cornerRadius = CornerRadius(width * 0.08f, width * 0.08f),
+                    style = stroke,
+                )
+                drawRoundRect(
+                    color = tint,
+                    topLeft = Offset(width * 0.39f, height * 0.1f),
+                    size = androidx.compose.ui.geometry.Size(width * 0.22f, height * 0.16f),
+                    cornerRadius = CornerRadius(width * 0.05f, width * 0.05f),
+                    style = stroke,
+                )
+            }
+            "warning", "delete" -> {
+                drawCircle(tint, radius = width * 0.36f)
+                drawLine(Color.White, Offset(width * 0.5f, height * 0.3f), Offset(width * 0.5f, height * 0.58f), strokeWidth = width * 0.1f, cap = StrokeCap.Round)
+                drawCircle(Color.White, radius = width * 0.055f, center = Offset(width * 0.5f, height * 0.73f))
+            }
+            else -> Unit
+        }
+    }
 }
 
 /** 向上弹出气泡的 Shape，底部带有指向下方锚点图标的倒三角形指针 */
@@ -3356,15 +4409,20 @@ private fun CookedContent(
     onPicture: (String, String) -> Unit,
     compact: Boolean = false,
     subReply: Boolean = false,
+    pollPost: Post? = null,
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(if (compact || subReply) 6.dp else 10.dp)) {
         blocks.forEach { block ->
             when (block) {
                 is CookedBlock.Paragraph -> RichParagraph(block.runs, compact = compact, subReply = subReply)
+                is CookedBlock.Heading -> CookedHeading(block)
+                is CookedBlock.Video -> VideoCard(block)
+                is CookedBlock.Onebox -> OneboxCard(block)
+                is CookedBlock.Poll -> PollCard(block, pollPost?.id)
                 is CookedBlock.Code -> {
                     val codeResetKey = LocalSelectionResetKey.current
                     key(codeResetKey) {
-                        SelectionContainer {
+                        DecryptableSelection {
                             Text(block.text, fontFamily = FontFamily.Monospace, style = IosTheme.type.footnote,
                                 modifier = Modifier.fillMaxWidth().background(
                                     if (subReply) IosTheme.colors.card else IosTheme.colors.fieldBackground,
@@ -3379,7 +4437,7 @@ private fun CookedContent(
                 ) {
                     Box(Modifier.width(3.dp).height(28.dp).background(IosTheme.colors.separator))
                     Box(Modifier.weight(1f).padding(10.dp)) {
-                        CookedContent(block.blocks, onPicture, compact = compact, subReply = subReply)
+                        CookedContent(block.blocks, onPicture, compact = compact, subReply = subReply, pollPost = pollPost)
                     }
                 }
                 is CookedBlock.Picture -> {
@@ -3409,6 +4467,16 @@ private fun CookedContent(
                     var isError by remember(block.url) { mutableStateOf(false) }
                     var isLoading by remember(block.url) { mutableStateOf(true) }
                     var retryCount by remember(block.url) { mutableIntStateOf(0) }
+                    var autoRetryCount by remember(block.url) { mutableIntStateOf(0) }
+                    var pendingAutoRetry by remember(block.url) { mutableStateOf(false) }
+                    if (pendingAutoRetry) {
+                        LaunchedEffect(autoRetryCount) {
+                            awaitImageRetrySlot(autoRetryCount)
+                            pendingAutoRetry = false
+                            autoRetryCount++
+                            retryCount++
+                        }
+                    }
 
                     val context = LocalContext.current
                     val imageRequest = remember(currentUrl, retryCount) {
@@ -3444,7 +4512,10 @@ private fun CookedContent(
                             onError = { errorState ->
                                 val err = errorState.result.throwable
                                 android.util.Log.w("CookedContent", "Failed to load image: $currentUrl, reason: ${err.message}")
-                                if (currentUrl == block.url && block.url != block.originalUrl) {
+                                if (isTransientImageError(err) && autoRetryCount < IMAGE_AUTO_RETRY_LIMIT) {
+                                    // 门禁冷却 / 429 / 网络抖动：换原图只会再撞一次，原地等冷却结束后重试同一地址
+                                    pendingAutoRetry = true
+                                } else if (currentUrl == block.url && block.url != block.originalUrl) {
                                     // 缩略图拉取失败（如 Discourse 未生成或 404/超时），自动透明降级尝试原图！
                                     currentUrl = block.originalUrl
                                     isLoading = true
@@ -3490,11 +4561,12 @@ private fun CookedContent(
                     Row {
                         Text(
                             text = block.start?.let { "${it + index}. " } ?: "• ",
-                            style = if (subReply) IosTheme.type.subheadline else IosTheme.type.body,
+                            style = if (subReply) IosTheme.type.subheadline.copy(fontSize = 14.sp, lineHeight = 19.5.sp)
+                                    else IosTheme.type.body.copy(fontSize = 15.5.sp, lineHeight = 22.sp),
                             modifier = Modifier.widthIn(min = 22.dp),
                         )
                         Box(Modifier.weight(1f)) {
-                            CookedContent(entry, onPicture, compact = compact, subReply = subReply)
+                            CookedContent(entry, onPicture, compact = compact, subReply = subReply, pollPost = pollPost)
                         }
                     }
                 }
@@ -3505,15 +4577,153 @@ private fun CookedContent(
 }
 
 @Composable
+@OptIn(ExperimentalFoundationApi::class)
+private fun CookedHeading(heading: CookedBlock.Heading) {
+    val requester = remember(heading.anchor) { BringIntoViewRequester() }
+    val target = LocalTocTarget.current
+    LaunchedEffect(target, heading.anchor) {
+        if (target == heading.anchor) requester.bringIntoView()
+    }
+    Text(
+        text = heading.title,
+        style = when (heading.level) {
+            1 -> IosTheme.type.title3
+            2 -> IosTheme.type.title3
+            else -> IosTheme.type.headline
+        },
+        color = IosTheme.colors.label,
+        modifier = Modifier.fillMaxWidth().bringIntoViewRequester(requester).padding(vertical = 4.dp),
+    )
+}
+
+@Composable
+private fun VideoCard(video: CookedBlock.Video) {
+    val openUrl = LocalOpenExternalUrl.current
+    Box(
+        Modifier.fillMaxWidth().height(180.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .background(IosTheme.colors.fieldBackground)
+            .clickable { openUrl(video.url) },
+        contentAlignment = Alignment.Center,
+    ) {
+        video.posterUrl?.let { url ->
+            AsyncImage(url, video.title, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
+        }
+        Column(
+            Modifier.align(Alignment.Center).clip(RoundedCornerShape(8.dp))
+                .background(Color.Black.copy(alpha = 0.66f)).padding(horizontal = 14.dp, vertical = 9.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(3.dp),
+        ) {
+            Text("▶", color = Color.White, style = IosTheme.type.title3)
+            Text(video.title.ifBlank { "播放视频" }, color = Color.White, style = IosTheme.type.caption)
+        }
+    }
+}
+
+@Composable
+private fun OneboxCard(onebox: CookedBlock.Onebox) {
+    val openUrl = LocalOpenExternalUrl.current
+    Column(
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp))
+            .background(IosTheme.colors.fieldBackground)
+            .clickable { openUrl(onebox.url) }
+            .padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(5.dp),
+    ) {
+        Text(onebox.title, style = IosTheme.type.subheadline, fontWeight = FontWeight.SemiBold, color = IosTheme.colors.label)
+        onebox.description?.let {
+            Text(it, style = IosTheme.type.footnote, color = IosTheme.colors.secondaryLabel, maxLines = 3, overflow = TextOverflow.Ellipsis)
+        }
+        Text(Uri.parse(onebox.url).host.orEmpty(), style = IosTheme.type.caption, color = IosTheme.colors.accent, maxLines = 1)
+    }
+}
+
+@Composable
+private fun PollCard(poll: CookedBlock.Poll, postId: Long?) {
+    var selected by remember(poll.name, poll.userVotes) { mutableStateOf(poll.userVotes) }
+    val busy = postId?.let(LocalPollBusy.current) == true
+    val error = postId?.let(LocalPollError.current)
+    val voter = LocalVotePoll.current
+    val isMultiple = poll.type == "multiple"
+    val canVote = postId != null && poll.status == "open" && poll.type in setOf("regular", "multiple") && !busy
+    val showResults = when (poll.results) {
+        "always" -> true
+        "on_vote" -> poll.userVotes.isNotEmpty()
+        "on_close" -> poll.status == "closed"
+        else -> false
+    }
+    val totalVotes = maxOf(poll.voters, poll.options.sumOf { it.votes })
+
+    androidx.compose.material3.Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(8.dp),
+        colors = androidx.compose.material3.CardDefaults.cardColors(containerColor = IosTheme.colors.fieldBackground),
+    ) {
+        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(poll.title, style = IosTheme.type.subheadline, fontWeight = FontWeight.SemiBold, color = IosTheme.colors.label, modifier = Modifier.weight(1f))
+                Text(if (isMultiple) "多选" else if (poll.type == "regular") "单选" else poll.type, style = IosTheme.type.caption, color = IosTheme.colors.secondaryLabel)
+            }
+            poll.options.forEach { option ->
+                val checked = option.id in selected
+                Row(
+                    Modifier.fillMaxWidth().then(
+                        if (canVote) Modifier.clickable {
+                            selected = if (isMultiple) {
+                                if (checked) selected - option.id else selected + option.id
+                            } else setOf(option.id)
+                        } else Modifier,
+                    ),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    if (isMultiple) Checkbox(checked = checked, onCheckedChange = { value ->
+                        if (canVote) selected = if (value) selected + option.id else selected - option.id
+                    }, enabled = canVote)
+                    else RadioButton(selected = checked, onClick = {
+                        if (canVote) selected = setOf(option.id)
+                    }, enabled = canVote)
+                    Column(Modifier.weight(1f).padding(vertical = 4.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Text(option.title, style = IosTheme.type.footnote, color = IosTheme.colors.label, modifier = Modifier.weight(1f))
+                            if (showResults) {
+                                val percent = if (totalVotes == 0) 0 else option.votes * 100 / totalVotes
+                                Text("$percent%", style = IosTheme.type.caption, color = IosTheme.colors.secondaryLabel)
+                            }
+                        }
+                        if (showResults) {
+                            val fraction = if (totalVotes == 0) 0f else option.votes.toFloat() / totalVotes
+                            Box(Modifier.fillMaxWidth().height(4.dp).clip(CircleShape).background(IosTheme.colors.separator)) {
+                                Box(Modifier.fillMaxWidth(fraction.coerceIn(0f, 1f)).fillMaxHeight().background(IosTheme.colors.accent))
+                            }
+                        }
+                    }
+                }
+            }
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text("${poll.voters} 人参与", style = IosTheme.type.caption, color = IosTheme.colors.secondaryLabel, modifier = Modifier.weight(1f))
+                if (canVote) {
+                    Button(enabled = selected.isNotEmpty(), onClick = { postId?.let { voter(it, poll.name, selected.toList()) } }) {
+                        Text(if (busy) "提交中" else "投票")
+                    }
+                }
+            }
+            error?.let { Text(it, style = IosTheme.type.caption, color = Color(0xFFFF3B30)) }
+        }
+    }
+}
+
+@Composable
 private fun RichParagraph(runs: List<InlineText>, compact: Boolean = false, subReply: Boolean = false) {
     val colors = IosTheme.colors
     val context = LocalContext.current
-    val uriHandler = LocalUriHandler.current
     val openTopic = LocalOpenTopic.current
     val updatedOpenTopic by rememberUpdatedState(openTopic)
+    val openExternal = LocalOpenExternalUrl.current
+    val updatedOpenExternal by rememberUpdatedState(openExternal)
     val scope = rememberCoroutineScope()
     val resetKey = LocalSelectionResetKey.current
-    val annotated = remember(runs, colors, uriHandler, context) {
+    val annotated = remember(runs, colors, context, openExternal) {
         buildAnnotatedString {
             runs.forEach { run ->
                 val emoji = run.emojiUrl
@@ -3557,7 +4767,13 @@ private fun RichParagraph(runs: List<InlineText>, compact: Boolean = false, subR
                                     }
                                     opener(internalTarget.topicId, titleHint, internalTarget.postNumber)
                                 } else {
-                                    runCatching { uriHandler.openUri(link) }
+                                    val uri = runCatching { android.net.Uri.parse(link) }.getOrNull()
+                                    val host = uri?.host?.lowercase()?.trimEnd('.').orEmpty()
+                                    if (host.isNotBlank() && host !in TRUSTED_FORUM_HOSTS) {
+                                        openExternal(context, link)
+                                    } else {
+                                        updatedOpenExternal(link)
+                                    }
                                 }
                             }
                         },
@@ -3569,8 +4785,8 @@ private fun RichParagraph(runs: List<InlineText>, compact: Boolean = false, subR
     val inline = runs.mapNotNull { it.emojiUrl }.distinct().associateWith { url ->
         val size = when {
             compact -> 14.sp
-            subReply -> 17.sp
-            else -> 20.sp
+            subReply -> 16.5.sp
+            else -> 18.5.sp
         }
         InlineTextContent(Placeholder(size, size, PlaceholderVerticalAlign.TextCenter)) {
             AsyncImage(url, "表情", modifier = Modifier.fillMaxSize())
@@ -3579,8 +4795,621 @@ private fun RichParagraph(runs: List<InlineText>, compact: Boolean = false, subR
     key(resetKey) {
         when {
             compact -> Text(annotated, style = IosTheme.type.caption, inlineContent = inline)
-            subReply -> SelectionContainer { Text(annotated, style = IosTheme.type.subheadline, inlineContent = inline) }
-            else -> SelectionContainer { Text(annotated, style = IosTheme.type.body, inlineContent = inline) }
+            subReply -> DecryptableSelection {
+                Text(
+                    annotated,
+                    style = IosTheme.type.subheadline.copy(fontSize = 14.sp, lineHeight = 19.5.sp),
+                    inlineContent = inline,
+                )
+            }
+            else -> DecryptableSelection {
+                Text(
+                    annotated,
+                    style = IosTheme.type.body.copy(fontSize = 15.5.sp, lineHeight = 22.sp),
+                    inlineContent = inline,
+                )
+            }
+        }
+    }
+}
+
+data class DecodedResult(
+    val rawMatched: String,
+    val cleanedBase64: String,
+    val plainText: String,
+    val confidence: Int,
+    val method: String = "Base64",
+    val postNumber: Int = 1,
+)
+
+object PostCryptoScanner {
+    private val COMMON_HANZI_REGEX = Regex("[\\u4e00-\\u9fa5]{2,}")
+    private val HIGH_VALUE_PREFIX = Regex("^(https?://|magnet:\\?xt=|ed2k://|tg://|weixin://|ftp://|[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,})", RegexOption.IGNORE_CASE)
+    private val COMMON_NETDISK_REGEX = Regex("(pan\\.baidu\\.com|aliyun(drive)?|quark|115\\.com|lanzou|123pan|t\\.me/|提取码|解压码|车牌号)", RegexOption.IGNORE_CASE)
+    private val CONTEXT_HINT_REGEX = Regex("(base64|b64|解码|解密|加密|神秘代码|车牌|提取码|密码|卡密|口令|key|token|pass|clinepass|cookie|福利|自取|兑换码|激活码)", RegexOption.IGNORE_CASE)
+    private val BRACKET_NOISE_REGEX = Regex("(\\([^)]*[\\u4e00-\\u9fa5]+[^)]*\\))|（.*?）|【.*?】|\\[[^\\]]*[\\u4e00-\\u9fa5]+[^\\]]*\\]")
+    private val DYNAMIC_RULE_REGEX = Regex("(?:去掉|删掉|删除|去除)[所有一切中间的\\s]*[\"'“‘【\\[]?([a-zA-Z0-9]{1,8})[\"'”’】\\]]?")
+    private val CODE_KEYWORDS_REGEX = Regex("\\b(function|import|val|var|public|private|def|class|return|const|interface)\\b")
+    // 匹配常规 Base64 以及跨换行/空格连接的 Base64 连续块
+    private val MULTILINE_BASE64_REGEX = Regex("""[A-Za-z0-9+/=_-]{4,}(?:\s+[A-Za-z0-9+/=_-]{2,})+""")
+    private val CANDIDATE_REGEX = Regex("""[A-Za-z0-9+/=_-]{4,}(?:[^A-Za-z0-9+/=_-]{1,4}[A-Za-z0-9+/=_-]{2,})+|[A-Za-z0-9+/=_-]{8,}""")
+
+    fun stripBracketsAndNoise(text: String): String {
+        val withoutBrackets = BRACKET_NOISE_REGEX.replace(text, "")
+        return withoutBrackets.replace(Regex("[^A-Za-z0-9+/=_-]"), "")
+    }
+
+    fun scanPosts(posts: List<Post>, topicTitle: String? = null): List<DecodedResult> {
+        if (posts.isEmpty()) return emptyList()
+        val results = mutableListOf<DecodedResult>()
+        val sortedPosts = posts.sortedBy { if (it.postNumber == 1) 0 else it.postNumber }
+
+        for (post in sortedPosts) {
+            val cooked = post.cooked.takeIf { it.isNotBlank() } ?: continue
+            val doc = runCatching { Jsoup.parse(cooked) }.getOrNull() ?: continue
+
+            // 1. 区域隔离与预处理
+            doc.select("a, img").remove()
+            doc.select("pre, code").forEach { el ->
+                val codeText = el.text()
+                if (CODE_KEYWORDS_REGEX.containsMatchIn(codeText) || codeText.lines().size > 3) {
+                    el.remove()
+                }
+            }
+
+            val postText = doc.text()
+            val hasContextHint = CONTEXT_HINT_REGEX.containsMatchIn(postText) ||
+                (topicTitle != null && CONTEXT_HINT_REGEX.containsMatchIn(topicTitle))
+
+            val dynamicNoises = DYNAMIC_RULE_REGEX.findAll(postText)
+                .map { it.groupValues[1] }
+                .filter { it.isNotEmpty() }
+                .toSet()
+
+            val wholeText = doc.wholeText()
+
+            // 收集所有候选 Base64 字串集合：
+            // A. 跨换行/空格拆分的 Base64 连续块（支持换行折叠，如 76 字符换行）
+            val rawCandidates = mutableSetOf<String>()
+            MULTILINE_BASE64_REGEX.findAll(wholeText).forEach { match ->
+                val compact = match.value.filterNot(Char::isWhitespace)
+                if (compact.length >= 8) {
+                    rawCandidates.add(compact)
+                }
+            }
+
+            // B. 逐行提取（常规行内模式以及动态去混淆模式）
+            for (line in wholeText.lines()) {
+                val lineTrimmed = line.trim()
+                if (lineTrimmed.length < 8) continue
+
+                var processedLine = BRACKET_NOISE_REGEX.replace(lineTrimmed, "")
+                for (noise in dynamicNoises) {
+                    processedLine = processedLine.replace(noise, "")
+                }
+
+                for (match in CANDIDATE_REGEX.findAll(processedLine)) {
+                    val raw = match.value
+                    if (raw.startsWith("http", ignoreCase = true) || raw.all { it.isDigit() }) continue
+                    rawCandidates.add(raw)
+                }
+
+                // URL 编码候选识别
+                val urlEncodedRegex = Regex("(?:%[0-9a-fA-F]{2}){2,}")
+                urlEncodedRegex.findAll(processedLine).forEach { match ->
+                    val raw = match.value
+                    val decoded = runCatching { URLDecoder.decode(raw, StandardCharsets.UTF_8.name()) }.getOrNull()
+                    if (decoded != null && decoded != raw && isHumanReadableStrict(decoded)) {
+                        val score = evaluatePlainText(decoded, hasContextHint, raw.length)
+                        if (score >= 40) {
+                            results.add(
+                                DecodedResult(
+                                    rawMatched = raw,
+                                    cleanedBase64 = raw,
+                                    plainText = decoded,
+                                    confidence = score,
+                                    method = "URL解码",
+                                    postNumber = post.postNumber,
+                                )
+                            )
+                        }
+                    }
+                }
+            }
+
+            // 对所有 Base64 候选字串进行严格 UTF-8 解密与打分
+            for (raw in rawCandidates) {
+                val cleaned = raw.replace(Regex("[^A-Za-z0-9+/=_-]"), "")
+                if (cleaned.length < 8) continue
+
+                // 纯 Hex 校验，若是纯 Hex 且较长，优先尝试 Hex 还原
+                if (cleaned.length >= 16 && cleaned.length % 2 == 0 &&
+                    cleaned.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }) {
+                    val hexBytes = runCatching {
+                        ByteArray(cleaned.length / 2) { i ->
+                            cleaned.substring(i * 2, i * 2 + 2).toInt(16).toByte()
+                        }
+                    }.getOrNull()
+                    if (hexBytes != null) {
+                        val decodedHex = decodeUtf8Strict(hexBytes)
+                        if (decodedHex != null && isHumanReadableStrict(decodedHex)) {
+                            val score = evaluatePlainText(decodedHex, hasContextHint, cleaned.length)
+                            if (score >= 40) {
+                                results.add(
+                                    DecodedResult(
+                                        rawMatched = raw,
+                                        cleanedBase64 = cleaned,
+                                        plainText = decodedHex,
+                                        confidence = score,
+                                        method = "Hex",
+                                        postNumber = post.postNumber,
+                                    )
+                                )
+                                continue
+                            }
+                        }
+                    }
+                }
+
+                val plainText = tryStrictDecodeBase64(cleaned) ?: continue
+                val score = evaluatePlainText(plainText, hasContextHint, cleaned.length)
+                if (score >= 40) {
+                    results.add(
+                        DecodedResult(
+                            rawMatched = raw,
+                            cleanedBase64 = cleaned,
+                            plainText = plainText,
+                            confidence = score,
+                            method = if (raw != cleaned) "Base64 (去混淆)" else "Base64",
+                            postNumber = post.postNumber,
+                        )
+                    )
+                }
+            }
+        }
+
+        return results.distinctBy { it.plainText }
+    }
+
+    private fun tryStrictDecodeBase64(input: String): String? {
+        var normalized = input.replace('-', '+').replace('_', '/').trimEnd('=')
+        if (normalized.length % 4 == 1) return null
+        while (normalized.length % 4 != 0) {
+            normalized += "="
+        }
+
+        val decodedBytes = try {
+            android.util.Base64.decode(normalized, android.util.Base64.DEFAULT)
+        } catch (_: Exception) {
+            return null
+        }
+        if (decodedBytes.size < 4) return null
+
+        val decoder = StandardCharsets.UTF_8.newDecoder()
+            .onMalformedInput(CodingErrorAction.REPORT)
+            .onUnmappableCharacter(CodingErrorAction.REPORT)
+
+        val decodedStr = try {
+            decoder.decode(ByteBuffer.wrap(decodedBytes)).toString().trim()
+        } catch (_: Exception) {
+            return null
+        }
+
+        if (decodedStr.any { (it.code < 0x20 && it != '\n' && it != '\r' && it != '\t') || it.code == 0x7F }) {
+            return null
+        }
+        if (decodedStr == input) return null
+
+        return decodedStr
+    }
+
+    private fun isHumanReadableStrict(text: String): Boolean {
+        if (text.isBlank() || text.contains('\uFFFD')) return false
+        return !text.any { (it.code < 0x20 && it != '\n' && it != '\r' && it != '\t') || it.code == 0x7F }
+    }
+
+    fun evaluatePlainText(plain: String, hasContextHint: Boolean, cipherLength: Int = 0): Int {
+        var score = 0
+        if (HIGH_VALUE_PREFIX.containsMatchIn(plain)) score += 80
+        if (COMMON_NETDISK_REGEX.containsMatchIn(plain)) score += 60
+        if (COMMON_HANZI_REGEX.containsMatchIn(plain)) score += 50
+        if (hasContextHint) score += 35
+
+        // 识别常见 Token、API Key、JSON、账号密码等凭据特征
+        val isJson = (plain.startsWith("{") && plain.endsWith("}")) || (plain.startsWith("[") && plain.endsWith("]"))
+        if (isJson) score += 60
+
+        val tokenPattern = Regex("""(?i)\b(sk-[a-zA-Z0-9]{20,}|gh[pousr]_[a-zA-Z0-9]{20,}|ey[A-Za-z0-9_-]{10,}|[a-zA-Z0-9_-]{16,}:[a-zA-Z0-9_-]+|bearer\s+|clinepass|[a-f0-9]{32,64})""")
+        if (tokenPattern.containsMatchIn(plain)) score += 60
+
+        val keyValuePattern = Regex("""(?i)\b(key|token|password|pass|secret|code|auth|cookie|session)[=:][^\s]{3,}""")
+        if (keyValuePattern.containsMatchIn(plain)) score += 50
+
+        val domainPattern = Regex("""(?i)\b[a-z0-9-]+\.(com|cn|org|net|io|me|cc|top|xyz|do)\b""")
+        if (domainPattern.containsMatchIn(plain)) score += 50
+
+        val readableCount = plain.count {
+            it.isLetterOrDigit() || it in '\u4e00'..'\u9fa5' || it in ":/?.=&_-+~#%@!$,;\"'{}[]()<>"
+        }
+        val readableRatio = readableCount.toFloat() / plain.length
+
+        // 可读性与密文长度加分：
+        // 只要解码后为纯有效可读文本（>=85%且无控制字符），长度达标即赋予基础置信度
+        if (readableRatio >= 0.85f && plain.length >= 6) {
+            score += 40
+            if (cipherLength >= 16 || plain.length >= 12) {
+                score += 25
+            }
+        } else if (readableRatio < 0.65f) {
+            score -= 50
+        }
+
+        return score
+    }
+}
+
+private fun decodeUtf8Strict(bytes: ByteArray): String? = runCatching {
+    val decoder = StandardCharsets.UTF_8.newDecoder()
+        .onMalformedInput(CodingErrorAction.REPORT)
+        .onUnmappableCharacter(CodingErrorAction.REPORT)
+    decoder.decode(ByteBuffer.wrap(bytes)).toString()
+}.getOrNull()
+
+private fun isHumanReadable(text: String): Boolean {
+    if (text.isBlank() || text.contains('\uFFFD')) return false
+    var printable = 0
+    for (ch in text) {
+        if (ch == '\n' || ch == '\r' || ch == '\t') {
+            printable++
+        } else {
+            val type = Character.getType(ch)
+            if (type != Character.CONTROL.toInt() && type != Character.SURROGATE.toInt() && type != Character.UNASSIGNED.toInt()) {
+                printable++
+            }
+        }
+    }
+    return (printable.toFloat() / text.length) >= 0.85f
+}
+
+private fun decodeCandidates(source: String): List<Pair<String, String>> {
+    if (source.isBlank()) return emptyList()
+    val results = mutableListOf<Pair<String, String>>()
+    val compact = source.filterNot(Char::isWhitespace)
+
+    // 1. 标准 Base64
+    runCatching {
+        val bytes = android.util.Base64.decode(compact, android.util.Base64.DEFAULT)
+        decodeUtf8Strict(bytes)
+    }.getOrNull()?.takeIf { it != null && isHumanReadable(it) && it != source }?.let { results += "Base64" to it }
+
+    // 2. 剥离中文和括号后的 Base64
+    val cleaned = PostCryptoScanner.stripBracketsAndNoise(compact)
+    if (cleaned != compact && cleaned.length >= 8) {
+        runCatching {
+            var norm = cleaned.replace('-', '+').replace('_', '/').trimEnd('=')
+            while (norm.length % 4 != 0) norm += "="
+            val bytes = android.util.Base64.decode(norm, android.util.Base64.DEFAULT)
+            decodeUtf8Strict(bytes)
+        }.getOrNull()?.takeIf { it != null && isHumanReadable(it) && it != source }?.let {
+            results += "Base64 (剥离干扰后)" to it
+        }
+    }
+
+    // 3. URL 编码
+    runCatching { URLDecoder.decode(source, StandardCharsets.UTF_8.name()) }
+        .getOrNull()?.takeIf { isHumanReadable(it) && it != source }?.let { results += "URL解码" to it }
+
+    // 4. Hex
+    val hex = compact.removePrefix("0x").removePrefix("0X").replace(":", "").replace("-", "")
+    if (hex.length >= 8 && hex.length % 2 == 0 && hex.matches(Regex("[0-9a-fA-F]+"))) {
+        runCatching {
+            val bytes = ByteArray(hex.length / 2) { index -> hex.substring(index * 2, index * 2 + 2).toInt(16).toByte() }
+            decodeUtf8Strict(bytes)
+        }.getOrNull()?.takeIf { it != null && isHumanReadable(it) }?.let { results += "Hex" to it }
+    }
+
+    // 5. Unicode
+    val unicodePattern = Regex("\\\\u([0-9a-fA-F]{4})")
+    val unicodeDecoded = unicodePattern.replace(source) { match -> match.groupValues[1].toInt(16).toChar().toString() }
+    if (unicodeDecoded != source && isHumanReadable(unicodeDecoded)) {
+        results += "Unicode" to unicodeDecoded
+    }
+
+    return results.distinctBy { it.second }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun DecryptBottomSheet(
+    selectedText: String? = null,
+    scannedResults: List<DecodedResult> = emptyList(),
+    onOpenUrl: (String) -> Unit = {},
+    onDismiss: () -> Unit,
+) {
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    val clipboard = LocalClipboardManager.current
+    val context = LocalContext.current
+
+    var selectedScannedIndex by remember(scannedResults) {
+        mutableIntStateOf(0)
+    }
+
+    var source by remember(selectedText, scannedResults) {
+        mutableStateOf(
+            selectedText?.takeIf { it.isNotBlank() }
+                ?: scannedResults.getOrNull(selectedScannedIndex)?.rawMatched.orEmpty()
+        )
+    }
+    var noise by remember { mutableStateOf("") }
+    var showWorkbench by remember(scannedResults, selectedText) {
+        mutableStateOf(scannedResults.isEmpty() || !selectedText.isNullOrBlank())
+    }
+
+    val manualResults = remember(source) { decodeCandidates(source) }
+
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = sheetState,
+        containerColor = IosTheme.colors.card,
+    ) {
+        Column(
+            Modifier
+                .fillMaxWidth()
+                .heightIn(min = 380.dp, max = 720.dp)
+                .verticalScroll(rememberScrollState())
+                .navigationBarsPadding()
+                .padding(horizontal = 16.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text("文本解码", style = IosTheme.type.headline)
+                    if (scannedResults.isNotEmpty()) {
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(IosTheme.colors.accent.copy(alpha = 0.15f))
+                                .padding(horizontal = 6.dp, vertical = 2.dp)
+                        ) {
+                            Text(
+                                "发现 ${scannedResults.size} 处",
+                                style = IosTheme.type.caption,
+                                color = IosTheme.colors.accent,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+                }
+                TextButton(onClick = onDismiss) {
+                    Text("关闭", color = IosTheme.colors.secondaryLabel)
+                }
+            }
+
+            if (scannedResults.isNotEmpty()) {
+                if (scannedResults.size > 1) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        scannedResults.forEachIndexed { index, res ->
+                            val isSelected = index == selectedScannedIndex
+                            Box(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(16.dp))
+                                    .background(
+                                        if (isSelected) IosTheme.colors.accent.copy(alpha = 0.18f)
+                                        else IosTheme.colors.fieldBackground
+                                    )
+                                    .border(
+                                        1.dp,
+                                        if (isSelected) IosTheme.colors.accent else Color.Transparent,
+                                        RoundedCornerShape(16.dp)
+                                    )
+                                    .clickable {
+                                        selectedScannedIndex = index
+                                        source = res.rawMatched
+                                    }
+                                    .padding(horizontal = 10.dp, vertical = 6.dp)
+                            ) {
+                                Text(
+                                    "第 ${res.postNumber} 楼 (${res.confidence}分)",
+                                    style = IosTheme.type.caption,
+                                    color = if (isSelected) IosTheme.colors.accent else IosTheme.colors.label,
+                                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
+                                )
+                            }
+                        }
+                    }
+                }
+
+                val currentScanned = scannedResults.getOrNull(selectedScannedIndex) ?: scannedResults.first()
+                Column(
+                    Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(IosTheme.colors.fieldBackground)
+                        .padding(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Text(
+                                currentScanned.method,
+                                style = IosTheme.type.subheadline,
+                                fontWeight = FontWeight.Bold,
+                                color = IosTheme.colors.accent
+                            )
+                            Text(
+                                "· 第 ${currentScanned.postNumber} 楼 · 置信度 ${currentScanned.confidence}%",
+                                style = IosTheme.type.caption,
+                                color = IosTheme.colors.secondaryLabel
+                            )
+                        }
+                    }
+
+                    SelectionContainer {
+                        Text(
+                            text = currentScanned.plainText,
+                            style = IosTheme.type.body,
+                            color = IosTheme.colors.label,
+                            fontWeight = FontWeight.Medium,
+                        )
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        TextButton(
+                            onClick = {
+                                clipboard.setText(AnnotatedString(currentScanned.plainText))
+                                Toast.makeText(context, "已复制明文", Toast.LENGTH_SHORT).show()
+                            }
+                        ) {
+                            Text("复制明文", color = IosTheme.colors.accent)
+                        }
+
+                        val plainTrimmed = currentScanned.plainText.trim()
+                        if (plainTrimmed.startsWith("http://", ignoreCase = true) || plainTrimmed.startsWith("https://", ignoreCase = true)) {
+                            TextButton(
+                                onClick = { onOpenUrl(plainTrimmed) }
+                            ) {
+                                Text("打开网页", color = IosTheme.colors.accent, fontWeight = FontWeight.SemiBold)
+                            }
+                        }
+
+                        if (plainTrimmed.startsWith("magnet:?xt=", ignoreCase = true)) {
+                            TextButton(
+                                onClick = {
+                                    clipboard.setText(AnnotatedString(plainTrimmed))
+                                    Toast.makeText(context, "已复制磁力链", Toast.LENGTH_SHORT).show()
+                                }
+                            ) {
+                                Text("复制磁链", color = IosTheme.colors.accent)
+                            }
+                        }
+
+                        Spacer(Modifier.weight(1f))
+                        TextButton(onClick = {
+                            source = currentScanned.rawMatched
+                            showWorkbench = true
+                        }) {
+                            Text("填入工作台", style = IosTheme.type.caption, color = IosTheme.colors.secondaryLabel)
+                        }
+                    }
+                }
+            }
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { showWorkbench = !showWorkbench }
+                    .padding(vertical = 4.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    "手动解码工作台 / 划词分析",
+                    style = IosTheme.type.subheadline,
+                    color = IosTheme.colors.secondaryLabel,
+                    fontWeight = FontWeight.Medium
+                )
+                Text(
+                    if (showWorkbench) "收起 ▴" else "展开 ▾",
+                    style = IosTheme.type.caption,
+                    color = IosTheme.colors.accent
+                )
+            }
+
+            if (showWorkbench) {
+                OutlinedTextField(
+                    value = source,
+                    onValueChange = { source = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("待测文本") },
+                    minLines = 2,
+                    maxLines = 5,
+                )
+
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    TextButton(onClick = {
+                        val clip = clipboard.getText()?.text?.trim().orEmpty()
+                        if (clip.isNotBlank()) {
+                            source = clip
+                            Toast.makeText(context, "已粘贴剪贴板", Toast.LENGTH_SHORT).show()
+                        } else {
+                            Toast.makeText(context, "剪贴板为空", Toast.LENGTH_SHORT).show()
+                        }
+                    }) { Text("粘贴剪贴板") }
+
+                    TextButton(onClick = { source = source.filterNot(Char::isWhitespace) }) { Text("去空格换行") }
+
+                    TextButton(onClick = {
+                        source = PostCryptoScanner.stripBracketsAndNoise(source)
+                    }) { Text("剥离中文与括号") }
+
+                    TextButton(
+                        enabled = noise.isNotEmpty(),
+                        onClick = { source = source.replace(noise, "") },
+                    ) { Text("剔除指定词") }
+                }
+
+                OutlinedTextField(
+                    value = noise,
+                    onValueChange = { noise = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("待剔除的干扰文本 (例如 666 或 abc)") },
+                    singleLine = true,
+                )
+
+                if (manualResults.isEmpty() && source.isNotBlank()) {
+                    Text("暂未识别出有效明文", style = IosTheme.type.footnote, color = IosTheme.colors.secondaryLabel)
+                }
+
+                manualResults.forEach { (method, value) ->
+                    Column(
+                        Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(IosTheme.colors.fieldBackground)
+                            .padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            Text(method, style = IosTheme.type.subheadline, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+                            val valTrimmed = value.trim()
+                            if (valTrimmed.startsWith("http://", ignoreCase = true) || valTrimmed.startsWith("https://", ignoreCase = true)) {
+                                TextButton(onClick = { onOpenUrl(valTrimmed) }) { Text("打开网页") }
+                            }
+                            TextButton(onClick = {
+                                clipboard.setText(AnnotatedString(value))
+                                Toast.makeText(context, "已复制", Toast.LENGTH_SHORT).show()
+                            }) { Text("复制") }
+                        }
+                        SelectionContainer {
+                            Text(value, style = IosTheme.type.footnote, color = IosTheme.colors.secondaryLabel)
+                        }
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(16.dp))
         }
     }
 }
@@ -3953,9 +5782,9 @@ private fun TopicNotificationSelector(
                 .clip(RoundedCornerShape(12.dp))
                 .background(pillBg)
                 .clickable(enabled = enabled) { expanded = true }
-                .padding(horizontal = 10.dp, vertical = 5.dp),
+                .padding(horizontal = 8.dp, vertical = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(5.dp),
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
         ) {
             val dotColor = when (currentLevel) {
                 TopicNotificationLevel.Watching -> Color(0xFF007AFF) // 蓝
@@ -3963,12 +5792,14 @@ private fun TopicNotificationSelector(
                 TopicNotificationLevel.Regular -> Color(0xFF8E8E93)  // 灰
                 TopicNotificationLevel.Muted -> Color(0xFFFF3B30)    // 红
             }
-            Box(Modifier.size(7.dp).background(dotColor, CircleShape))
+            Box(Modifier.size(6.dp).background(dotColor, CircleShape))
             Text(
-                text = "通知: ${currentLevel.badgeLabel} ▾",
+                text = "${currentLevel.badgeLabel} ▾",
                 style = IosTheme.type.footnote,
                 color = pillTextColor,
                 fontWeight = FontWeight.Medium,
+                maxLines = 1,
+                softWrap = false,
             )
         }
 

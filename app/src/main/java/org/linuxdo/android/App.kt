@@ -13,6 +13,9 @@ import coil.disk.DiskCache
 import coil.memory.MemoryCache
 import java.io.File
 import org.linuxdo.android.data.Diagnostics
+import org.linuxdo.android.data.AccountManager
+import org.linuxdo.android.data.DraftStore
+import org.linuxdo.android.data.HistoryStore
 import org.linuxdo.android.data.ReadingStore
 import org.linuxdo.android.data.SessionStore
 import org.linuxdo.android.net.BrowserSession
@@ -69,10 +72,11 @@ class App : Application(), ImageLoaderFactory {
                         override fun getNotificationScope(): org.linuxdo.android.push.PushNotificationScope =
                             org.linuxdo.android.push.PushNotificationScope.fromRaw(store.getNotificationScope().code)
                         override fun getCustomRealtimeSeconds(): Int = store.getCustomRealtimeSeconds()
+                        override fun setNotificationTransportHealthyAtMillis(timestamp: Long) {}
                     }
                 },
                 logger = { key, message, force ->
-                    container.diagnostics.logThrottled(key, message, force)
+                    // container.diagnostics.logThrottled(key, message, force)
                 }
             )
         )
@@ -83,9 +87,14 @@ class App : Application(), ImageLoaderFactory {
 
 class AppContainer(context: Context) {
     val preferences = context.getSharedPreferences("display_preferences", Context.MODE_PRIVATE)
-    val diagnostics = Diagnostics(File(context.filesDir, "diagnostics.log"))
+    val diagnostics = Diagnostics(File(context.filesDir, "diagnostics.log")).also {
+        org.linuxdo.android.net.NetDiagnostics.sink = it
+    }
     val sessionStore = SessionStore(context)
     val reading = ReadingStore(context)
+    val accountManager = AccountManager(context)
+    val draftStore = DraftStore(context)
+    val historyStore = HistoryStore(context)
     val userAgent: String = resolveUserAgent(context, sessionStore)
     val browser = BrowserSession(context, userAgent, sessionStore, diagnostics)
 
@@ -154,19 +163,63 @@ class AppContainer(context: Context) {
         .crossfade(true)
         .build()
 
-    private val okHttpTransport: OkHttpTransport = OkHttpTransport(sessionStore, browser, dohCoordinator.currentClient, diagnostics)
+    private val okHttpTransport: OkHttpTransport = OkHttpTransport(
+        sessionStore,
+        browser,
+        dohCoordinator.currentClient,
+        diagnostics,
+        epochLabel(dohCoordinator.currentEpoch.get()),
+    )
     private val webViewTransport: WebViewFetchTransport = WebViewFetchTransport(browser, diagnostics)
+
+    /** 最近一次退到后台的时间（elapsedRealtime）；0 表示当前在前台或尚未退过后台。 */
+    @Volatile private var backgroundSince = 0L
 
     init {
         dohCoordinator.onEpochChanged = { epoch ->
-            okHttpTransport.updateClient(epoch.client)
+            val label = epochLabel(epoch)
+            okHttpTransport.updateClient(epoch.client, label)
             userApiKeyAuthService.updateClient(epoch.client)
+            diagnostics.log("网络链路: 切换到 $label")
         }
+        networkMonitor.onDefaultNetworkChanged = {
+            diagnostics.log("网络链路: 默认网络已切换，回收连接")
+            dohCoordinator.recycleConnections("默认网络切换")
+        }
+    }
+
+    fun onAppBackground() {
+        backgroundSince = android.os.SystemClock.elapsedRealtime()
+    }
+
+    /**
+     * 后台久置后回前台：期间 NAT 表项可能已过期，池里的旧连接复用会一路超时，先整体回收。
+     * 必须在回前台的首批请求发出之前调用。
+     */
+    fun onAppForeground() {
+        val since = backgroundSince
+        backgroundSince = 0L
+        if (since == 0L) return
+        val idleMs = android.os.SystemClock.elapsedRealtime() - since
+        if (idleMs < STALE_CONNECTION_IDLE_MS) return
+        diagnostics.log("网络链路: 后台 ${idleMs / 60_000L} 分钟后回前台，回收连接")
+        dohCoordinator.recycleConnections("后台久置回前台")
     }
 
     fun transport(path: NetworkPath): Transport = when (path) {
         NetworkPath.OKHTTP -> okHttpTransport
         NetworkPath.WEBVIEW -> webViewTransport
+    }
+
+    val topicRepository: org.linuxdo.android.data.TopicRepository by lazy {
+        org.linuxdo.android.data.TopicRepository(
+            transportProvider = { transport(NetworkPath.OKHTTP) },
+            diagnostics = diagnostics,
+            reading = reading,
+            sessionStore = sessionStore,
+            fallbackTransportProvider = { transport(NetworkPath.WEBVIEW) },
+            httpClientProvider = { httpClient },
+        )
     }
 
     /**
@@ -177,6 +230,12 @@ class AppContainer(context: Context) {
     }
 
     companion object {
+        /** 与共享连接池的 keep-alive 对齐：后台超过这么久，池里的连接就不再可信。 */
+        private const val STALE_CONNECTION_IDLE_MS = 5 * 60_000L
+
+        private fun epochLabel(epoch: org.linuxdo.android.net.TransportEpoch): String =
+            "gen=${epoch.generation} " + if (epoch.transport != null) "原生直连(${epoch.server.name})" else "系统网络"
+
         /**
          * 全应用共用同一个 UA。首次运行时由系统 WebView 的默认 UA 规整成 Chrome 移动端的形态
          * (去掉 "; wv" 与 "Version/4.0"),并持久化——WebView 升级也不改变它,

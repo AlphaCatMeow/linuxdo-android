@@ -25,6 +25,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        // 先回收后台久置的旧连接，再放行下面的未读刷新等首批请求。
+        (application as App).container.onAppForeground()
         val sessionStore = (application as App).container.sessionStore
         sessionStore.setAppInForeground(true)
         // 回到前台后由前台服务的协程轮询接管，撤掉最小化兜底闹钟
@@ -45,6 +47,7 @@ class MainActivity : ComponentActivity() {
         super.onStop()
         val appContext = applicationContext
         val sessionStore = (application as App).container.sessionStore
+        (application as App).container.onAppBackground()
         sessionStore.setAppInForeground(false)
         // 退回桌面（最小化）时立即触发一次即时后台未读检查，不留时间空隙
         org.linuxdo.android.service.NotificationWorker.triggerImmediate(appContext)

@@ -24,10 +24,12 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.SolidColor
@@ -38,6 +40,7 @@ import androidx.compose.ui.graphics.drawscope.scale
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
@@ -48,6 +51,7 @@ import org.linuxdo.android.data.SearchOrder
 import org.linuxdo.android.ui.SearchUiState
 import org.linuxdo.android.ui.design.*
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun SearchScreen(
     state: SearchUiState,
@@ -58,6 +62,9 @@ fun SearchScreen(
     active: Boolean = true,
     scrollToTopRequest: Int = 0,
     trailing: @Composable () -> Unit = {},
+    searchHistory: List<String> = emptyList(),
+    onSelectHistory: (String) -> Unit = {},
+    onClearHistory: () -> Unit = {},
 ) {
     val list = rememberLazyListState()
     ScrollToTopOnRequest(list, scrollToTopRequest)
@@ -83,11 +90,43 @@ fun SearchScreen(
         }
     }
 
+    val isDark = IosTheme.colors.isDark
+    val glassBg = if (isDark) {
+        Brush.verticalGradient(
+            listOf(
+                Color(0xFF232630).copy(alpha = 0.68f),
+                Color(0xFF171920).copy(alpha = 0.52f),
+            )
+        )
+    } else {
+        Brush.verticalGradient(
+            listOf(
+                Color.White.copy(alpha = 0.88f),
+                Color.White.copy(alpha = 0.70f),
+            )
+        )
+    }
+    val glassBorder = if (isDark) {
+        Brush.verticalGradient(
+            listOf(
+                Color.White.copy(alpha = 0.22f),
+                Color.White.copy(alpha = 0.06f),
+            )
+        )
+    } else {
+        Brush.verticalGradient(
+            listOf(
+                Color.White.copy(alpha = 0.95f),
+                Color(0xFFE2E4E8).copy(alpha = 0.65f),
+            )
+        )
+    }
+
     Column(Modifier.fillMaxSize().background(IosTheme.colors.groupedBackground)) {
         // 顶部大标题栏
         IosNavBar(title = "搜索", trailing = trailing)
 
-        // 搜索输入栏 (胶囊式圆角矩形 + 放大镜 Icon + 右侧取消)
+        // 搜索输入栏 (透明玻璃胶囊 + 放大镜 Icon + 右侧取消)
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -97,9 +136,16 @@ fun SearchScreen(
             Row(
                 modifier = Modifier
                     .weight(1f)
-                    .clip(RoundedCornerShape(50))
-                    .background(IosTheme.colors.fieldBackground)
-                    .padding(horizontal = 12.dp, vertical = 9.dp),
+                    .shadow(
+                        elevation = 2.dp,
+                        shape = CircleShape,
+                        ambientColor = Color.Black.copy(alpha = 0.04f),
+                        spotColor = Color.Black.copy(alpha = 0.08f),
+                    )
+                    .clip(CircleShape)
+                    .background(glassBg)
+                    .border(1.dp, glassBorder, CircleShape)
+                    .padding(horizontal = 14.dp, vertical = 9.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 SearchLoupeIcon(
@@ -111,10 +157,13 @@ fun SearchScreen(
                     value = state.query,
                     onValueChange = onQuery,
                     singleLine = true,
-                    textStyle = IosTheme.type.body.copy(color = IosTheme.colors.label),
+                    textStyle = IosTheme.type.body.copy(color = IosTheme.colors.label, fontSize = 14.5.sp),
                     cursorBrush = SolidColor(IosTheme.colors.accent),
                     keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
-                    keyboardActions = KeyboardActions(onSearch = { focusManager.clearFocus() }),
+                    keyboardActions = KeyboardActions(onSearch = {
+                        focusManager.clearFocus()
+                        if (state.query.isNotBlank()) onSelectHistory(state.query.trim())
+                    }),
                     modifier = Modifier
                         .weight(1f)
                         .focusRequester(focusRequester)
@@ -124,7 +173,7 @@ fun SearchScreen(
                             if (state.query.isEmpty()) {
                                 Text(
                                     "输入关键词查找话题",
-                                    style = IosTheme.type.body,
+                                    style = IosTheme.type.body.copy(fontSize = 14.5.sp),
                                     color = IosTheme.colors.secondaryLabel,
                                 )
                             }
@@ -145,20 +194,26 @@ fun SearchScreen(
                     }
                 }
             }
+            val hasQuery = state.query.isNotBlank()
             Text(
-                text = "取消",
-                style = IosTheme.type.body,
-                color = IosTheme.colors.accent,
+                text = if (hasQuery) "搜索" else "取消",
+                style = IosTheme.type.body.copy(fontSize = 14.5.sp, fontWeight = if (hasQuery) FontWeight.Medium else FontWeight.Normal),
+                color = if (hasQuery) IosTheme.colors.label else IosTheme.colors.secondaryLabel,
                 modifier = Modifier
                     .clickable {
-                        onQuery("")
-                        focusManager.clearFocus()
+                        if (hasQuery) {
+                            onSelectHistory(state.query)
+                            focusManager.clearFocus()
+                        } else {
+                            onQuery("")
+                            focusManager.clearFocus()
+                        }
                     }
                     .padding(start = 12.dp, top = 6.dp, bottom = 6.dp),
             )
         }
 
-        // 筛选标签栏 (横向滚动胶囊，第一项为当前排序)
+        // 筛选标签栏 (排序依据 + 透明玻璃胶囊)
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -169,14 +224,21 @@ fun SearchScreen(
         ) {
             Text(
                 text = "排序依据",
-                style = IosTheme.type.footnote,
+                style = IosTheme.type.footnote.copy(fontSize = 12.sp),
                 color = IosTheme.colors.secondaryLabel,
             )
-            // 当前排序胶囊 (高亮浅蓝底 + 蓝色文字与箭头)
+            // 当前排序胶囊 (透明玻璃质感)
             Row(
                 modifier = Modifier
-                    .clip(RoundedCornerShape(50))
-                    .background(IosTheme.colors.accent.copy(alpha = 0.12f))
+                    .shadow(
+                        elevation = 1.dp,
+                        shape = CircleShape,
+                        ambientColor = Color.Black.copy(alpha = 0.03f),
+                        spotColor = Color.Black.copy(alpha = 0.06f),
+                    )
+                    .clip(CircleShape)
+                    .background(glassBg)
+                    .border(1.dp, glassBorder, CircleShape)
                     .clickable {
                         focusManager.clearFocus()
                         showSort = true
@@ -187,55 +249,140 @@ fun SearchScreen(
             ) {
                 Text(
                     text = state.order.label,
-                    style = IosTheme.type.footnote,
+                    style = IosTheme.type.footnote.copy(fontSize = 12.sp),
                     fontWeight = FontWeight.Medium,
-                    color = IosTheme.colors.accent,
+                    color = IosTheme.colors.label,
                 )
                 Text(
                     text = "⌄",
-                    style = IosTheme.type.footnote,
-                    fontWeight = FontWeight.SemiBold,
-                    color = IosTheme.colors.accent,
+                    style = IosTheme.type.footnote.copy(fontSize = 12.sp),
+                    fontWeight = FontWeight.Medium,
+                    color = IosTheme.colors.secondaryLabel,
                 )
             }
         }
 
         Spacer(Modifier.height(4.dp))
 
-        // 搜索结果卡片列表
-        LazyColumn(
-            state = list,
-            modifier = Modifier.weight(1f),
-            contentPadding = PaddingValues(vertical = 4.dp),
-        ) {
-            if (state.results.initialLoading) item("loading") { IosLoadingBox() }
-            state.results.error?.let { message ->
-                item("error") { ErrorNotice(message) { onQuery(state.query) } }
-            }
-            if (state.query.isNotBlank() && !state.results.initialLoading && state.results.error == null && state.results.items.isEmpty()) {
-                item("empty") { EmptyNotice() }
-            }
-            itemsIndexed(state.results.items, key = { _, item -> item.topic.id }) { index, item ->
-                Column(Modifier.background(IosTheme.colors.card)) {
-                    val topicWithExcerpt = remember(item, state.excerpts[item.topic.id]) {
-                        if (state.excerpts[item.topic.id] != null) {
-                            item.copy(topic = item.topic.copy(excerpt = state.excerpts[item.topic.id]))
-                        } else item
+        val showHistory = state.query.isBlank() && state.results.items.isEmpty() && !state.results.initialLoading
+
+        if (showHistory) {
+            // 搜索历史模块 (参考图 3：标题 + 垃圾桶图标 + 流式玻璃药丸标签)
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
+                    .padding(horizontal = 16.dp, vertical = 8.dp)
+            ) {
+                if (searchHistory.isNotEmpty()) {
+                    Column(modifier = Modifier.fillMaxWidth()) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 10.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                text = "历史搜索",
+                                style = IosTheme.type.body.copy(fontSize = 15.sp),
+                                fontWeight = FontWeight.Bold,
+                                color = IosTheme.colors.label,
+                            )
+                            Box(
+                                modifier = Modifier
+                                    .size(28.dp)
+                                    .clip(CircleShape)
+                                    .clickable(onClick = onClearHistory),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                SearchTrashIcon(tint = IosTheme.colors.secondaryLabel)
+                            }
+                        }
+
+                        Spacer(Modifier.height(4.dp))
+
+                        FlowRow(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                            verticalArrangement = Arrangement.spacedBy(10.dp),
+                        ) {
+                            searchHistory.forEach { keyword ->
+                                Box(
+                                    modifier = Modifier
+                                        .shadow(
+                                            elevation = 1.dp,
+                                            shape = CircleShape,
+                                            ambientColor = Color.Black.copy(alpha = 0.03f),
+                                            spotColor = Color.Black.copy(alpha = 0.06f),
+                                        )
+                                        .clip(CircleShape)
+                                        .background(glassBg)
+                                        .border(1.dp, glassBorder, CircleShape)
+                                        .clickable {
+                                            onQuery(keyword)
+                                            onSelectHistory(keyword)
+                                            focusManager.clearFocus()
+                                        }
+                                        .padding(horizontal = 14.dp, vertical = 7.dp),
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    Text(
+                                        text = keyword,
+                                        style = IosTheme.type.body.copy(fontSize = 13.5.sp, fontWeight = FontWeight.Normal),
+                                        color = IosTheme.colors.label,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                }
+                            }
+                        }
                     }
-                    TopicRow(
-                        item = topicWithExcerpt,
-                        query = state.query,
-                        onClick = {
-                            focusManager.clearFocus()
-                            onOpenTopic(item.topic)
-                        },
-                    )
-                    if (index < state.results.items.lastIndex) {
-                        IosDivider(startIndent = IosMetrics.screenPadding)
-                    }
+                } else {
+                    // 空状态
+                    SearchHistoryEmptyView()
                 }
             }
-            if (state.results.loadingMore) item("more") { IosLoadingBox() }
+        } else {
+            // 搜索结果卡片列表 (全宽扁平纯平流式排版：直抵屏幕边缘，呼吸留白 16dp，移除悬浮外边距与硬描边)
+            LazyColumn(
+                state = list,
+                modifier = Modifier.weight(1f),
+                contentPadding = PaddingValues(top = 4.dp, bottom = 64.dp),
+            ) {
+                if (state.results.initialLoading) item("loading") { IosLoadingBox() }
+                state.results.error?.let { message ->
+                    item("error") { ErrorNotice(message) { onQuery(state.query) } }
+                }
+                if (state.query.isNotBlank() && !state.results.initialLoading && state.results.error == null && state.results.items.isEmpty()) {
+                    item("empty") { EmptyNotice() }
+                }
+                itemsIndexed(state.results.items, key = { _, item -> item.topic.id }) { index, item ->
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(IosTheme.colors.card),
+                    ) {
+                        val topicWithExcerpt = remember(item, state.excerpts[item.topic.id]) {
+                            if (state.excerpts[item.topic.id] != null) {
+                                item.copy(topic = item.topic.copy(excerpt = state.excerpts[item.topic.id]))
+                            } else item
+                        }
+                        TopicRow(
+                            item = topicWithExcerpt,
+                            query = state.query,
+                            onClick = {
+                                focusManager.clearFocus()
+                                onOpenTopic(item.topic)
+                            },
+                        )
+                        if (index < state.results.items.lastIndex) {
+                            IosDivider(startIndent = 16.dp)
+                        }
+                    }
+                }
+                if (state.results.loadingMore) item("more") { IosLoadingBox() }
+            }
         }
     }
 
@@ -490,6 +637,98 @@ private fun SearchOrderIcon(order: SearchOrder, isSelected: Boolean) {
                 }
             }
         }
+    }
+}
+
+/** 搜索历史空状态优雅插图与提示文案 */
+@Composable
+private fun SearchHistoryEmptyView() {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = 56.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center,
+    ) {
+        val loupeColor = if (IosTheme.colors.isDark) Color(0xFFA0A5B0) else Color(0xFF6B7280)
+        Canvas(Modifier.size(68.dp)) {
+            val stroke = 2.dp.toPx()
+            val tint = Color(0xFFC4C9D3)
+            // 绘制圆角文档
+            val docWidth = size.width * 0.52f
+            val docHeight = size.height * 0.68f
+            val docLeft = size.width * 0.14f
+            val docTop = size.height * 0.14f
+            drawRoundRect(
+                color = tint.copy(alpha = 0.35f),
+                topLeft = Offset(docLeft, docTop),
+                size = androidx.compose.ui.geometry.Size(docWidth, docHeight),
+                cornerRadius = androidx.compose.ui.geometry.CornerRadius(6.dp.toPx(), 6.dp.toPx()),
+                style = Stroke(stroke),
+            )
+            // 文档内容线
+            drawLine(tint.copy(alpha = 0.5f), Offset(docLeft + 8.dp.toPx(), docTop + 14.dp.toPx()), Offset(docLeft + docWidth - 8.dp.toPx(), docTop + 14.dp.toPx()), strokeWidth = 1.8.dp.toPx(), cap = StrokeCap.Round)
+            drawLine(tint.copy(alpha = 0.5f), Offset(docLeft + 8.dp.toPx(), docTop + 24.dp.toPx()), Offset(docLeft + docWidth - 14.dp.toPx(), docTop + 24.dp.toPx()), strokeWidth = 1.8.dp.toPx(), cap = StrokeCap.Round)
+            // 放大镜
+            val loupeCenter = Offset(size.width * 0.72f, size.height * 0.68f)
+            val loupeRadius = size.width * 0.19f
+            drawCircle(
+                color = loupeColor,
+                radius = loupeRadius,
+                center = loupeCenter,
+                style = Stroke(stroke * 1.2f),
+            )
+            drawLine(
+                color = loupeColor,
+                start = Offset(loupeCenter.x + loupeRadius * 0.7f, loupeCenter.y + loupeRadius * 0.7f),
+                end = Offset(size.width * 0.94f, size.height * 0.94f),
+                strokeWidth = stroke * 1.4f,
+                cap = StrokeCap.Round,
+            )
+        }
+        Spacer(Modifier.height(18.dp))
+        Text(
+            text = "暂无搜索历史",
+            style = IosTheme.type.body.copy(fontSize = 15.sp, fontWeight = FontWeight.SemiBold),
+            color = IosTheme.colors.label,
+        )
+        Spacer(Modifier.height(6.dp))
+        Text(
+            text = "输入关键词搜索感兴趣的话题、技术或用户",
+            style = IosTheme.type.footnote,
+            color = IosTheme.colors.secondaryLabel,
+        )
+    }
+}
+
+/** 历史搜索区域轻盈精细的垃圾桶图标 (对齐参考图 3) */
+@Composable
+private fun SearchTrashIcon(tint: Color, modifier: Modifier = Modifier) {
+    Canvas(modifier.size(15.dp)) {
+        val stroke = Stroke(width = 1.4f, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        // 桶盖横线
+        drawLine(tint, Offset(2.5f, 4f), Offset(12.5f, 4f), strokeWidth = 1.4f, cap = StrokeCap.Round)
+        // 桶盖手柄
+        val handle = Path().apply {
+            moveTo(5.5f, 4f)
+            lineTo(5.5f, 2.2f)
+            lineTo(9.5f, 2.2f)
+            lineTo(9.5f, 4f)
+        }
+        drawPath(handle, tint, style = stroke)
+        // 桶身
+        val body = Path().apply {
+            moveTo(3.8f, 4.2f)
+            lineTo(4.4f, 12.8f)
+            cubicTo(4.4f, 13.6f, 5f, 14.2f, 5.8f, 14.2f)
+            lineTo(9.2f, 14.2f)
+            cubicTo(10f, 14.2f, 10.6f, 13.6f, 10.6f, 12.8f)
+            lineTo(11.2f, 4.2f)
+        }
+        drawPath(body, tint, style = stroke)
+        // 桶身竖条纹
+        drawLine(tint, Offset(6.2f, 6.5f), Offset(6.2f, 11.5f), strokeWidth = 1.2f, cap = StrokeCap.Round)
+        drawLine(tint, Offset(8.8f, 6.5f), Offset(8.8f, 11.5f), strokeWidth = 1.2f, cap = StrokeCap.Round)
     }
 }
 

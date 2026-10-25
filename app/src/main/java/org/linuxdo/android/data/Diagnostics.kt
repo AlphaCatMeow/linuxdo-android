@@ -55,6 +55,19 @@ class Diagnostics(private val logFile: File) {
         }
     }
 
+    fun clear() {
+        synchronized(lock) {
+            recentEvents.clear()
+            runCatching {
+                if (logFile.exists()) {
+                    logFile.writeText("", Charsets.UTF_8)
+                }
+            }
+        }
+        _lines.value = emptyList()
+        _stats.update { DiagnosticsStats() }
+    }
+
     /** 相同后台状态每分钟最多记录一次，状态变化和手动检查立即记录。 */
     fun logThrottled(key: String, message: String, force: Boolean = false) {
         val shouldLog = synchronized(lock) {

@@ -32,6 +32,9 @@ object IosTheme {
     val colors: IosColors
         @Composable @ReadOnlyComposable get() = LocalIosColors.current
 
+    val skin: AppSkin
+        @Composable @ReadOnlyComposable get() = LocalAppSkin.current
+
     val type: IosTypography
         @Composable @ReadOnlyComposable get() = LocalIosTypography.current
 }
@@ -39,9 +42,11 @@ object IosTheme {
 @Composable
 fun IosTheme(
     dark: Boolean = isSystemInDarkTheme(),
+    skinPreset: SkinPreset = SkinPreset.CLASSIC,
     content: @Composable () -> Unit,
 ) {
-    val colors = if (dark) DarkIosColors else LightIosColors
+    val skin = resolveAppSkin(skinPreset, isDark = dark)
+    val colors = skin.colors
     val view = LocalView.current
     SideEffect {
         (view.context as? Activity)?.window?.let { window ->
@@ -57,6 +62,7 @@ fun IosTheme(
     }
     CompositionLocalProvider(
         LocalIosColors provides colors,
+        LocalAppSkin provides skin,
         LocalIosTypography provides DefaultIosTypography,
         // 全局换掉 Material 水波纹。这是"像不像安卓"最直接的破绽,必须在主题层一次性解决,
         // 而不是指望每个可点击组件都记得传 indication = null。

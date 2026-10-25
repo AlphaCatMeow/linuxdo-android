@@ -63,11 +63,35 @@ fun avatarShape(username: String?, avatarUrl: String? = null, cornerRadius: Dp =
 }
 
 /**
+ * 构建支持高刷动图（GIF / 动态 WebP / APNG）并强制无限循环、禁用 Crossfade 冻结的 ImageRequest。
+ * 对齐 FluxDO 的 NativeAnimatedImageProvider 链路逻辑。
+ */
+@Composable
+fun rememberAnimatedImageRequest(data: Any?): coil.request.ImageRequest? {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    return androidx.compose.runtime.remember(data) {
+        if (data == null || (data is String && data.isBlank())) null
+        else {
+            val builder = coil.request.ImageRequest.Builder(context)
+                .data(data)
+                .crossfade(false)
+                .memoryCachePolicy(coil.request.CachePolicy.ENABLED)
+                .diskCachePolicy(coil.request.CachePolicy.ENABLED)
+            if (android.os.Build.VERSION.SDK_INT >= 28) {
+                builder.setParameter("coil#repeat_count", -1, memoryCacheKey = null)
+            }
+            builder.build()
+        }
+    }
+}
+
+/**
  * 统一的用户头像组件：
  * 1. 优先加载动图/高优头像 avatarUrl（如 GIF 动画头像），对齐 fluxdo；
- * 2. 若动图加载失败或无动图，自动无缝降级加载静态头像 fallbackUrl；
- * 3. 若均无法加载或 URL 为空，优雅展示带用户名首字母的大写占位图，绝不出现空白方块；
- * 4. 自动应用站长 neo 方形角与普通用户圆形裁切。
+ * 2. 底层垫底静态 fallbackUrl，在动图解码或网络返回时不白屏、不露灰色底，彻底杜绝闪烁；
+ * 3. 若动图加载失败或无动图，自动无缝降级加载静态头像 fallbackUrl；
+ * 4. 若均无法加载或 URL 为空，优雅展示带用户名首字母的大写占位图，绝不出现空白方块；
+ * 5. 自动应用站长 neo 方形角与普通用户圆形裁切。
  */
 @Composable
 fun UserAvatar(
@@ -83,18 +107,40 @@ fun UserAvatar(
     val effectiveUrl = if (failedPrimary || avatarUrl.isNullOrBlank()) fallbackUrl else avatarUrl
     val shape = avatarShape(username, effectiveUrl ?: avatarUrl, cornerRadius)
 
+    // 记录当前已成功渲染或已知有效的图片 URL（按用户名隔离生命周期）。
+    // 只要有任何一帧呈现过图片，在新图片/新尺寸下载或解码期间，它就始终在底层稳固显示，绝不露出灰色背景！
+    var displayedUrl by remember(username?.takeIf { it.isNotBlank() } ?: avatarUrl) {
+        mutableStateOf(fallbackUrl?.takeIf { it.isNotBlank() } ?: avatarUrl?.takeIf { it.isNotBlank() })
+    }
+
     Box(
         modifier = modifier
             .clip(shape)
             .background(IosTheme.colors.fieldBackground),
         contentAlignment = Alignment.Center,
     ) {
-        if (!effectiveUrl.isNullOrBlank() && !failedFallback) {
+        // 1. 底层静止/过渡头像垫底：在新图/新尺寸下载或解码期间保持显示，彻底杜绝变灰闪烁
+        if (!displayedUrl.isNullOrBlank()) {
+            val baseRequest = rememberAnimatedImageRequest(displayedUrl)
             AsyncImage(
-                model = effectiveUrl,
+                model = baseRequest ?: displayedUrl,
+                contentDescription = null,
+                modifier = Modifier.fillMaxSize(),
+                contentScale = contentScale,
+            )
+        }
+
+        // 2. 顶层主图：当前目标图片（加载成功后平滑更新 displayedUrl）
+        if (!effectiveUrl.isNullOrBlank() && !failedFallback) {
+            val imageRequest = rememberAnimatedImageRequest(effectiveUrl)
+            AsyncImage(
+                model = imageRequest ?: effectiveUrl,
                 contentDescription = username,
                 modifier = Modifier.fillMaxSize(),
                 contentScale = contentScale,
+                onSuccess = {
+                    displayedUrl = effectiveUrl
+                },
                 onError = {
                     if (!failedPrimary && !fallbackUrl.isNullOrBlank() && fallbackUrl != avatarUrl) {
                         failedPrimary = true
@@ -103,7 +149,7 @@ fun UserAvatar(
                     }
                 },
             )
-        } else {
+        } else if (displayedUrl.isNullOrBlank()) {
             val initial = username?.trimStart('@')?.firstOrNull()?.uppercase() ?: "★"
             Text(
                 text = initial,

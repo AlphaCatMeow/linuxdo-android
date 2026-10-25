@@ -17,6 +17,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonPrimitive
 import org.linuxdo.android.Config
 
@@ -49,7 +50,7 @@ enum class TopicSortOrder(val label: String, val apiValue: String?) {
     }
 }
 
-/** 辅助悬浮球支持的快捷动作类型。最多配置 5 项，用户可调整顺序与开启状态。 */
+/** 辅助悬浮球支持的快捷动作类型。最多配置 8 项，用户可调整顺序与开启状态。 */
 enum class FloatingAction(
     val id: String,
     val title: String,
@@ -57,29 +58,57 @@ enum class FloatingAction(
     val description: String,
 ) {
     CreateTopic("create_topic", "发帖", "发帖", "快速发布新话题"),
+    Connect("connect", "等级积分", "等级积分", "查看升级进度与我的积分"),
+    History("history", "历史", "历史", "查看阅读历史记录"),
+    Chat("chat", "聊天", "聊天", "进入实时聊天室"),
     Sort("sort", "排序", "排序", "切换话题列表排序"),
     Drafts("drafts", "草稿", "草稿", "查看与编辑草稿"),
     Search("search", "搜索", "搜索", "全站快捷搜索"),
     Categories("categories", "分类", "分类", "浏览全部话题分类");
 
     companion object {
-        val DEFAULT_ACTIONS = listOf(CreateTopic, Sort, Drafts, Search, Categories)
+        val DEFAULT_ACTIONS = listOf(CreateTopic, Connect, History, Chat, Sort)
+        private const val OLD_DEFAULT_SERIALIZED = "create_topic,sort,drafts,search,categories"
 
         fun fromId(id: String?): FloatingAction? =
             entries.firstOrNull { it.id.equals(id, ignoreCase = true) || it.name.equals(id, ignoreCase = true) }
 
         fun parseActions(serialized: String?): List<FloatingAction> {
-            if (serialized.isNullOrBlank()) return DEFAULT_ACTIONS
+            if (serialized.isNullOrBlank() || serialized == OLD_DEFAULT_SERIALIZED) return DEFAULT_ACTIONS
             val list = serialized.split(",")
                 .mapNotNull { fromId(it.trim()) }
                 .distinct()
-            return if (list.isEmpty()) DEFAULT_ACTIONS else list.take(5)
+            return if (list.isEmpty()) DEFAULT_ACTIONS else list.take(8)
         }
 
         fun serializeActions(actions: List<FloatingAction>): String =
-            actions.distinct().take(5).joinToString(",") { it.id }
+            actions.distinct().take(8).joinToString(",") { it.id }
     }
 }
+
+/** 用户在社区的回复历史数据项。 */
+data class UserReplyItem(
+    val id: String,
+    val topicId: Long,
+    val postNumber: Int?,
+    val title: String,
+    val categoryId: Long?,
+    val categoryName: String?,
+    val categoryColor: String?,
+    val createdAt: String?,
+    val commentExcerpt: String,
+    val username: String,
+    val avatarUrl: String?,
+)
+
+data class UserRepliesUiState(
+    val items: List<UserReplyItem> = emptyList(),
+    val loading: Boolean = false,
+    val initialLoading: Boolean = true,
+    val hasMore: Boolean = false,
+    val cursor: Int = 0,
+    val error: String? = null,
+)
 
 /**
  * linux.do 的 tags 下发的是对象数组(`[{"id":444,"name":"人工智能"}]`),
@@ -108,6 +137,7 @@ data class Topic(
     val slug: String? = null,
     @SerialName("posts_count") val postsCount: Int = 0,
     @SerialName("reply_count") val replyCount: Int = 0,
+    @SerialName("last_read_post_number") val lastReadPostNumber: Int? = null,
     val views: Int = 0,
     @SerialName("like_count") val likeCount: Int = 0,
     @SerialName("category_id") val categoryId: Int? = null,
@@ -119,6 +149,7 @@ data class Topic(
     val unseen: Boolean = false,
     val excerpt: String? = null,
     @SerialName("image_url") val imageUrl: String? = null,
+    val thumbnails: List<TopicThumbnail>? = null,
     val tags: List<@Serializable(with = TagNameSerializer::class) String> = emptyList(),
     @SerialName("last_poster_username") val lastPosterUsername: String? = null,
     val posters: List<Poster> = emptyList(),
@@ -132,6 +163,57 @@ data class Topic(
      * 取两者较大值兜住个别端点不下发 posts_count 的情况。
      */
     val totalReplies: Int get() = (postsCount - 1).coerceAtLeast(replyCount).coerceAtLeast(0)
+}
+
+/** Discourse 列表接口随话题下发的服务端缩略图。 */
+@Serializable
+data class TopicThumbnail(
+    @SerialName("max_width") val maxWidth: Int? = null,
+    @SerialName("max_height") val maxHeight: Int? = null,
+    val width: Int? = null,
+    val height: Int? = null,
+    val url: String? = null,
+)
+
+/**
+ * 选取列表所需的服务端派生缩略图，避免将 `/original/` 原图作为常规列表资源。
+ * 只有服务端没下发派生图时，才回退到原图 URL。
+ */
+fun Topic.thumbnailUrlForList(targetWidth: Int = 400): String? {
+    val valid = thumbnails.orEmpty().mapNotNull { thumbnail ->
+        val url = normalizeTopicImageUrl(thumbnail.url) ?: return@mapNotNull null
+        val width = thumbnail.maxWidth ?: thumbnail.width
+        ThumbnailCandidate(
+            url = url,
+            width = width,
+            isDerived = thumbnail.maxWidth != null,
+        )
+    }
+    val derived = valid.filter { it.isDerived && it.width != null }
+    val candidates = if (derived.isNotEmpty()) derived else valid.filter { it.width != null }
+    val selected = candidates.minByOrNull { candidate ->
+        kotlin.math.abs(candidate.width!! - targetWidth)
+    }
+    return selected?.url ?: normalizeTopicImageUrl(imageUrl)
+}
+
+/** 仅用于缩略图拉取失败时的最后回退，正常列表路径优先 [thumbnailUrlForList]。 */
+fun Topic.originalImageUrl(): String? = normalizeTopicImageUrl(imageUrl)
+
+private data class ThumbnailCandidate(
+    val url: String,
+    val width: Int?,
+    val isDerived: Boolean,
+)
+
+private fun normalizeTopicImageUrl(rawUrl: String?): String? {
+    val url = rawUrl?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+    return when {
+        url.startsWith("https://", ignoreCase = true) || url.startsWith("http://", ignoreCase = true) -> url
+        url.startsWith("//") -> "https:$url"
+        url.startsWith("/") -> Config.BASE_URL + url
+        else -> "${Config.BASE_URL}/$url"
+    }
 }
 
 @Serializable
@@ -448,10 +530,14 @@ data class Post(
     val blurb: String = "",
     @SerialName("reply_to_post_number") val replyToPostNumber: Int? = null,
     @SerialName("reply_count") val replyCount: Int = 0,
+    @SerialName("user_id") val userId: Long? = null,
+    val polls: List<DiscoursePoll> = emptyList(),
+    @SerialName("polls_votes") val pollsVotes: Map<String, List<String>> = emptyMap(),
     val boosts: List<Boost> = emptyList(),
     val reactions: List<Reaction> = emptyList(),
     @SerialName("current_user_reaction") val currentUserReaction: Reaction? = null,
     val yours: Boolean = false,
+    @SerialName("read") val read: Boolean = false,
     @SerialName("can_boost") val canBoost: Boolean = false,
     @SerialName("can_accept_answer") val canAcceptAnswer: Boolean = false,
     @SerialName("can_unaccept_answer") val canUnacceptAnswer: Boolean = false,
@@ -468,6 +554,148 @@ data class Post(
         get() = name?.trim()?.takeIf { it.isNotEmpty() } ?: username
 }
 
+@Serializable
+data class DiscoursePollOption(
+    val id: String,
+    val html: String = "",
+    val votes: Int = 0,
+)
+
+@Serializable
+data class DiscoursePoll(
+    val id: Long = 0L,
+    val name: String,
+    val type: String = "regular",
+    val status: String = "open",
+    val results: String = "always",
+    val options: List<DiscoursePollOption> = emptyList(),
+    val voters: Int = 0,
+    @SerialName("chart_type") val chartType: String? = null,
+    val title: String? = null,
+)
+
+@Serializable
+data class UserCardData(
+    val id: Long = 0L,
+    val username: String,
+    val name: String? = null,
+    @SerialName("avatar_template") val avatarTemplate: String? = null,
+    @SerialName("animated_avatar") val animatedAvatar: String? = null,
+    @SerialName("profile_background_upload_url") val profileBackgroundUploadUrl: String? = null,
+    @SerialName("card_background_upload_url") val cardBackgroundUploadUrl: String? = null,
+    @SerialName("trust_level") val trustLevel: Int? = null,
+    @SerialName("created_at") val createdAt: String? = null,
+    @SerialName("last_seen_at") val lastSeenAt: String? = null,
+    @SerialName("bio_excerpt") val bioExcerpt: String? = null,
+    @SerialName("post_count") val postCount: Int = 0,
+    @SerialName("likes_received") val likesReceived: Int = 0,
+    @SerialName("topic_count") val topicCount: Int = 0,
+    @SerialName("topic_post_count") val rawTopicPostCount: JsonElement? = null,
+    @SerialName("can_follow") val canFollow: Boolean = false,
+    val following: Boolean = false,
+    val badges: List<SummaryBadgeItem> = emptyList(),
+) {
+    /** 与 FluxDO 一致：优先个人主页背景，其次资料卡背景。 */
+    val backgroundUrl: String?
+        get() {
+            val path = profileBackgroundUploadUrl?.trim()?.takeIf { it.isNotEmpty() }
+                ?: cardBackgroundUploadUrl?.trim()?.takeIf { it.isNotEmpty() }
+                ?: return null
+            return when {
+                path.startsWith("//") -> "https:$path"
+                path.startsWith("https://", ignoreCase = true) || path.startsWith("http://", ignoreCase = true) -> path
+                else -> Config.BASE_URL + "/" + path.trimStart('/')
+            }
+        }
+
+    val topicPostCount: Int?
+        get() = when (val elem = rawTopicPostCount) {
+            is JsonPrimitive -> elem.intOrNull
+            is JsonObject -> elem.values.firstOrNull()?.jsonPrimitive?.intOrNull
+            else -> null
+        }
+
+    val cleanDisplayName: String
+        get() {
+            val raw = name?.trim()
+            val valid = raw?.filterNot {
+                it.isWhitespace() ||
+                    it in '\u2000'..'\u200F' ||
+                    it in '\u2028'..'\u202F' ||
+                    it in '\uFE00'..'\uFE0F' ||
+                    it == '\uFEFF' ||
+                    it == '\u00A0'
+            }
+            return if (!valid.isNullOrBlank()) raw else username
+        }
+}
+
+@Serializable
+data class FollowUser(
+    val username: String,
+    val name: String? = null,
+    @SerialName("avatar_template") val avatarTemplate: String? = null,
+    @SerialName("animated_avatar") val animatedAvatar: String? = null,
+    @SerialName("trust_level") val trustLevel: Int? = null,
+    @SerialName("last_seen_at") val lastSeenAt: String? = null,
+)
+
+@Serializable
+data class BlockedUser(
+    val username: String,
+    val name: String? = null,
+    @SerialName("avatar_template") val avatarTemplate: String? = null,
+    @SerialName("trust_level") val trustLevel: Int? = null,
+    @SerialName("blocked_at") val blockedAt: Long = System.currentTimeMillis(),
+)
+
+@Serializable
+data class ChatChannelSummary(
+    val id: Long,
+    val title: String? = null,
+    @SerialName("chatable_type") val chatableType: String = "Category",
+    @SerialName("category_name") val categoryName: String? = null,
+    @SerialName("unread_count") val unreadCount: Int = 0,
+    @SerialName("last_message") val lastMessage: ChatMessageSummary? = null,
+    @SerialName("current_user_membership") val membership: ChatMembership? = null,
+    val dmUsers: List<ChatUserSummary> = emptyList(),
+) {
+    val isDirectMessage: Boolean get() = chatableType == "DirectMessage"
+    val isOneOnOneDm: Boolean get() = isDirectMessage && dmUsers.size == 1
+    val displayTitle: String get() = title?.takeIf { it.isNotBlank() }
+        ?: if (isDirectMessage) (dmUsers.firstOrNull()?.let { it.name ?: it.username } ?: "私聊")
+        else (categoryName ?: "聊天频道")
+}
+
+@Serializable
+data class ChatMembership(
+    val following: Boolean = false,
+    val muted: Boolean = false,
+    @SerialName("last_read_message_id") val lastReadMessageId: Long? = null,
+)
+
+@Serializable
+data class ChatMessageSummary(
+    val id: Long,
+    @SerialName("channel_id") val channelId: Long = 0L,
+    val message: String = "",
+    val cooked: String = "",
+    @SerialName("created_at") val createdAt: String? = null,
+    val user: ChatUserSummary? = null,
+)
+
+@Serializable
+data class ChatUserSummary(
+    val username: String = "",
+    val name: String? = null,
+    @SerialName("avatar_template") val avatarTemplate: String? = null,
+)
+
+@Serializable
+data class ChatMessagesPage(
+    val messages: List<ChatMessageSummary> = emptyList(),
+)
+
 enum class PostFlagReason(val id: Int, val title: String, val description: String) {
     Spam(8, "垃圾信息", "广告、推销或垃圾信息"),
     Inappropriate(4, "不当内容", "冒犯性、攻击性或违规内容"),
@@ -478,8 +706,15 @@ enum class PostFlagReason(val id: Int, val title: String, val description: Strin
 }
 
 @Serializable
-data class Boost(val id: Long, val cooked: String = "", val user: DiscourseUser? = null,
-    @SerialName("can_delete") val canDelete: Boolean = false)
+data class Boost(
+    val id: Long,
+    val cooked: String = "",
+    val user: DiscourseUser? = null,
+    @SerialName("can_delete") val canDelete: Boolean = false,
+    @SerialName("can_flag") val canFlag: Boolean = false,
+    @SerialName("user_flag_status") val userFlagStatus: Int? = null,
+    @SerialName("available_flags") val availableFlags: List<String> = emptyList(),
+)
 
 /**
  * 简评的长度。discourse-boosts 对"可见字符"和"表情"分别设限,任一项超了都会被服务端拒掉,
@@ -618,6 +853,7 @@ object UploadLimits {
 
 /** 一次上传的结果。short_url 是 Discourse 的内部短链,要原样写进正文 raw。 */
 data class UploadedFile(
+    val id: Long? = null,
     val shortUrl: String,
     val fileName: String,
     val width: Int = 0,
@@ -640,6 +876,7 @@ data class AttachedMedia(
     val uploaded: UploadedFile,
     val isImage: Boolean = true,
 ) {
+    val uploadId: Long? get() = uploaded.id
     fun toMarkdown(): String = uploaded.toMarkdown()
 }
 
@@ -845,6 +1082,7 @@ data class TopicDetail(
     val id: Long,
     val title: String,
     @SerialName("posts_count") val postsCount: Int = 0,
+    @SerialName("last_read_post_number") val lastReadPostNumber: Int? = null,
     @SerialName("category_id") val categoryId: Int? = null,
     @SerialName("post_stream") val postStream: PostStream = PostStream(),
     @SerialName("valid_reactions") val validReactions: List<String> = emptyList(),
@@ -954,6 +1192,169 @@ data class ProfilePage(
 )
 
 /**
+ * 全局用户头像与动图缓存：
+ * Discourse 服务端的 /u/{username}/card.json（UserCardSerializer）不带 animated_avatar 字段，
+ * 只有 basic_user 和 post 返回动图。
+ * 因此客户端全局缓存所感知到的所有 animated_avatar，在打开个人资料卡与个人主页时自动回填，
+ * 保证话题列表到个人信息页面的头像始终保持无限循环高刷动图播放。
+ */
+fun isAnimatedAvatarPath(path: String?): Boolean {
+    if (path.isNullOrBlank()) return false
+    val clean = path.substringBefore('?').substringBefore('#').trim().lowercase()
+    return clean.endsWith(".gif") || clean.endsWith(".webp") || clean.contains("animated")
+}
+
+object AvatarCache {
+    private const val MAX_ENTRIES = 512
+    /** 标记值：已探测确认无动图头像，避免重复发起网络请求。 */
+    private const val NON_ANIMATED_SENTINEL = "__non_animated__"
+    private val lock = Any()
+    private val cache = java.util.LinkedHashMap<String, String>(MAX_ENTRIES, 0.75f, true)
+
+    private fun keyOf(username: String?): String? = username
+        ?.trim()
+        ?.removePrefix("@")
+        ?.lowercase()
+        ?.takeIf { it.isNotEmpty() }
+
+    private fun trimLocked() {
+        while (cache.size > MAX_ENTRIES) {
+            val iterator = cache.entries.iterator()
+            if (!iterator.hasNext()) return
+            iterator.next()
+            iterator.remove()
+        }
+    }
+
+    fun record(username: String?, animatedAvatar: String?) {
+        val key = keyOf(username) ?: return
+        val url = animatedAvatar?.trim()?.takeIf { it.isNotEmpty() && isAnimatedAvatarPath(it) } ?: return
+        synchronized(lock) {
+            cache[key] = url
+            trimLocked()
+        }
+    }
+
+    /** 列表只提供已解析地址，主地址与静态回退地址不同时才记录为动图候选。 */
+    fun recordIfDistinct(username: String?, avatarUrl: String?, staticAvatarUrl: String?) {
+        val primary = avatarUrl?.trim()?.takeIf { it.isNotEmpty() } ?: return
+        if (primary == staticAvatarUrl?.trim()) return
+        record(username, primary)
+    }
+
+    /**
+     * 写入"已确认无动图"负缓存，避免后续重复探测同一用户。
+     * 若该用户已有正向动图记录，则忽略此调用。
+     */
+    fun recordNonAnimated(username: String?) {
+        val key = keyOf(username) ?: return
+        synchronized(lock) {
+            if (cache[key]?.let { it != NON_ANIMATED_SENTINEL && isAnimatedAvatarPath(it) } == true) return
+            cache[key] = NON_ANIMATED_SENTINEL
+            trimLocked()
+        }
+    }
+
+    /** 返回是否已确认该用户无动图（负缓存命中）。 */
+    fun isNonAnimated(username: String?): Boolean {
+        val key = keyOf(username) ?: return false
+        return synchronized(lock) { cache[key] == NON_ANIMATED_SENTINEL }
+    }
+
+    fun get(username: String?): String? {
+        val key = keyOf(username) ?: return null
+        val value = synchronized(lock) { cache[key] }
+        return if (value == NON_ANIMATED_SENTINEL) null else value
+    }
+
+    fun clear() {
+        synchronized(lock) { cache.clear() }
+    }
+}
+
+object ExcerptCache {
+    private const val MAX_ENTRIES = 500
+    private val excerptMap = androidx.compose.runtime.mutableStateMapOf<Long, String>()
+    private val coverMap = androidx.compose.runtime.mutableStateMapOf<Long, String>()
+    private var opStore: TopicOpStore? = null
+
+    fun initialize(store: TopicOpStore) {
+        opStore = store
+    }
+
+    fun record(topicId: Long, plainText: String?, coverImageUrl: String? = null) {
+        if (topicId <= 0L) return
+        val text = plainText?.trim()?.takeIf { it.isNotEmpty() }
+        val image = coverImageUrl?.trim()?.takeIf { it.isNotEmpty() }
+        if (text == null && image == null) return
+
+        if (text != null) {
+            if (excerptMap.size > MAX_ENTRIES) {
+                val firstKey = excerptMap.keys.firstOrNull()
+                if (firstKey != null) excerptMap.remove(firstKey)
+            }
+            excerptMap[topicId] = text
+        }
+        if (image != null) {
+            if (coverMap.size > MAX_ENTRIES) {
+                val firstKey = coverMap.keys.firstOrNull()
+                if (firstKey != null) coverMap.remove(firstKey)
+            }
+            coverMap[topicId] = image
+        }
+        opStore?.put(topicId, text ?: excerptMap[topicId], image ?: coverMap[topicId])
+    }
+
+    fun get(topicId: Long): String? {
+        if (topicId <= 0L) return null
+        excerptMap[topicId]?.let { return it }
+        val record = opStore?.get(topicId)
+        if (record != null) {
+            record.excerpt?.let { excerptMap[topicId] = it }
+            record.coverImageUrl?.let { coverMap[topicId] = it }
+            return record.excerpt
+        }
+        return null
+    }
+
+    /** 只读内存态、不碰本地库；在组合中读取可订阅后续 [record] 写入，适合每次重组都调用。 */
+    fun peekCoverImage(topicId: Long): String? = coverMap[topicId]
+
+    fun getCoverImage(topicId: Long): String? {
+        if (topicId <= 0L) return null
+        coverMap[topicId]?.let { return it }
+        val record = opStore?.get(topicId)
+        if (record != null) {
+            record.excerpt?.let { excerptMap[topicId] = it }
+            record.coverImageUrl?.let { coverMap[topicId] = it }
+            return record.coverImageUrl
+        }
+        return null
+    }
+
+    /**
+     * 批量从本地持久库载入内存，用于列表刷新后 0ms 瞬间把历史正文和首图直接填满内存 Compose State。
+     */
+    fun loadBatchFromStore(topicIds: Collection<Long>) {
+        val store = opStore ?: return
+        val records = store.getAll(topicIds)
+        records.forEach { (id, record) ->
+            if (record.excerpt != null && !excerptMap.containsKey(id)) {
+                excerptMap[id] = record.excerpt
+            }
+            if (record.coverImageUrl != null && !coverMap.containsKey(id)) {
+                coverMap[id] = record.coverImageUrl
+            }
+        }
+    }
+
+    fun clear() {
+        excerptMap.clear()
+        coverMap.clear()
+    }
+}
+
+/**
  * 头像地址解析：优先使用动图 animated_avatar（针对四级用户及管理组），对齐 fluxdo；
  * 静态 avatar_template 形如 `/user_avatar/linux.do/foo/{size}/123_2.png`，
  * 替换 {size} 并补全为绝对地址。默认尺寸使用标准 120。
@@ -962,9 +1363,22 @@ fun avatarUrlOf(
     template: String?,
     animatedAvatar: String? = null,
     size: Int = 120,
+    username: String? = null,
 ): String? {
-    if (!animatedAvatar.isNullOrBlank()) {
-        val replaced = animatedAvatar.replace("{size}", size.toString())
+    if (!username.isNullOrBlank() && !animatedAvatar.isNullOrBlank()) {
+        AvatarCache.record(username, animatedAvatar)
+    }
+    val candidateAnim = if (!animatedAvatar.isNullOrBlank()) animatedAvatar else AvatarCache.get(username)
+    val effectiveAnim = candidateAnim?.takeIf { isAnimatedAvatarPath(it) }
+    if (!effectiveAnim.isNullOrBlank()) {
+        val safeAnimSize = when {
+            size <= 48 -> 48
+            size <= 64 -> 64
+            size <= 96 -> 96
+            size <= 120 -> 120
+            else -> 144
+        }
+        val replaced = effectiveAnim.replace("{size}", safeAnimSize.toString())
         val animPath = if (replaced.startsWith("//")) "https:$replaced" else replaced
         return if (animPath.startsWith("http", ignoreCase = true)) animPath
         else Config.BASE_URL + (if (animPath.startsWith("/")) animPath else "/$animPath")
@@ -977,3 +1391,110 @@ fun avatarUrlOf(
 }
 
 fun avatarUrlOf(template: String?, size: Int): String? = avatarUrlOf(template, null, size)
+fun avatarUrlOf(template: String?, size: Int, username: String?): String? = avatarUrlOf(template, null, size, username)
+
+data class SummaryTopicItem(
+    val id: Long,
+    val title: String,
+    val likeCount: Int = 0,
+    val createdAt: String? = null,
+    val categoryId: Long? = null,
+)
+
+data class SummaryReplyItem(
+    val topicId: Long,
+    val postNumber: Int,
+    val title: String,
+    val likeCount: Int = 0,
+    val createdAt: String? = null,
+)
+
+data class SummaryLinkItem(
+    val url: String,
+    val title: String?,
+    val clicks: Int = 0,
+    val postNumber: Int? = null,
+    val topicId: Long? = null,
+    val topicTitle: String? = null,
+)
+
+data class SummaryUserItem(
+    val id: Long,
+    val username: String,
+    val avatarTemplate: String?,
+    val count: Int = 0,
+)
+
+data class SummaryCategoryItem(
+    val id: Long,
+    val name: String,
+    val color: String?,
+    val topicCount: Int = 0,
+    val postCount: Int = 0,
+)
+
+@Serializable
+data class SummaryBadgeItem(
+    val id: Long,
+    val name: String,
+    val description: String?,
+    val icon: String?,
+    val badgeTypeId: Int = 0,
+)
+
+@Serializable
+data class UserBadgeItem(
+    val id: Long,
+    val badgeId: Long,
+    val name: String,
+    val description: String?,
+    val icon: String?,
+    val imageUrl: String?,
+    val badgeTypeId: Int, // 1: Gold, 2: Silver, 3: Bronze
+    val badgeGroupingId: Int = 0,
+    val grantCount: Int = 0,
+    val grantedAt: String? = null,
+    val count: Int = 1,
+    val isEarned: Boolean = true,
+)
+
+data class UserSummaryData(
+    val daysVisited: Int = 0,
+    val postsReadCount: Int = 0,
+    val likesReceived: Int = 0,
+    val likesGiven: Int = 0,
+    val topicCount: Int = 0,
+    val postCount: Int = 0,
+    val timeRead: Int = 0,
+    val bookmarkCount: Int = 0,
+    val topicsEntered: Int = 0,
+    val topTopics: List<SummaryTopicItem> = emptyList(),
+    val topReplies: List<SummaryReplyItem> = emptyList(),
+    val topLinks: List<SummaryLinkItem> = emptyList(),
+    val mostRepliedToUsers: List<SummaryUserItem> = emptyList(),
+    val mostLikedByUsers: List<SummaryUserItem> = emptyList(),
+    val mostLikedUsers: List<SummaryUserItem> = emptyList(),
+    val topCategories: List<SummaryCategoryItem> = emptyList(),
+    val badges: List<SummaryBadgeItem> = emptyList(),
+)
+
+@Serializable
+data class LdcUserInfo(
+    val id: Long = 0L,
+    val username: String = "",
+    val nickname: String = "",
+    @SerialName("trust_level") val trustLevel: Int = 0,
+    @SerialName("avatar_url") val avatarUrl: String = "",
+    @SerialName("total_receive") val totalReceive: String = "0",
+    @SerialName("total_payment") val totalPayment: String = "0",
+    @SerialName("total_transfer") val totalTransfer: String = "0",
+    @SerialName("total_community") val totalCommunity: String = "0",
+    @SerialName("community_balance") val communityBalance: String = "0",
+    @SerialName("available_balance") val availableBalance: String = "0",
+    @SerialName("pay_score") val payScore: Int = 0,
+    @SerialName("is_pay_key") val isPayKey: Boolean = false,
+    @SerialName("is_admin") val isAdmin: Boolean = false,
+    @SerialName("remain_quota") val remainQuota: String = "0",
+    @SerialName("pay_level") val payLevel: Int = 0,
+    @SerialName("daily_limit") val dailyLimit: Int = 0,
+)
